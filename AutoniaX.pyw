@@ -30158,6 +30158,34 @@ def valider_correspondance(texte: str) -> tuple:
     return resultat, avertissements
 
 
+PROMPT_CORRESPONDANCE_IA = (
+    "Tu vas corriger un JSON de correspondance pour une application.\n"
+    "FORMAT EXIGÉ : un objet JSON plat { \"nom_profil_local\": \"email@domaine.com\" }.\n"
+    "- Chaque clé est un nom de profil local : recopie-la EXACTEMENT telle quelle (même casse, mêmes "
+    "caractères). Ne renomme, n'ajoute et ne supprime aucune clé.\n"
+    "- Chaque valeur est l'adresse e-mail complète du compte (avec @), jamais vide. Les valeurs vides "
+    "\"\" sont à compléter ; corrige aussi celles qui sont fausses.\n"
+    "- Deux clés ne doivent jamais avoir la même valeur.\n"
+    "- Réponds UNIQUEMENT avec le JSON valide : aucun texte avant ou après, aucune explication, "
+    "pas de bloc de code markdown.\n"
+    "JSON actuel :\n"
+)
+
+
+def construire_texte_correspondance_ia(noms_profils: list, correspondance: dict) -> str:
+    """Texte a coller dans une IA : un court prompt puis le JSON {nom_profil_local: email}.
+    Contient tous les profils actuellement listes (valeur "" si pas encore de correspondance), puis les
+    entrees de la correspondance enregistree qui ne correspondent a aucun profil liste. L'IA renvoie ce
+    meme JSON corrige, directement importable par « Importer la correspondance »."""
+    correspondance = correspondance or {}
+    contenu: dict = {}
+    for nom in sorted({str(n) for n in noms_profils if str(n).strip()}, key=lambda n: n.lower()):
+        contenu[nom] = str(correspondance.get(nom, "") or "")
+    for nom, valeur in correspondance.items():
+        contenu.setdefault(str(nom), str(valeur or ""))
+    return PROMPT_CORRESPONDANCE_IA + json.dumps(contenu, ensure_ascii=False, indent=2)
+
+
 def importer_correspondance(reglages, texte: str) -> tuple:
     """Import atomique : remplace entierement la correspondance (pas de
     fusion). En cas d'erreur, l'ancienne correspondance reste intacte."""
@@ -31034,6 +31062,14 @@ class ProfilsKaggleScreen(QWidget):
         self.bouton_importer.setCursor(Qt.PointingHandCursor)
         self.bouton_importer.clicked.connect(self._sur_clic_importer)
         haut.addWidget(self.bouton_importer)
+        self.bouton_copier_ia = QPushButton(" Copier pour IA", self)
+        self.bouton_copier_ia.setIcon(qta.icon("mdi6.content-copy", color=Mocha.text))
+        self.bouton_copier_ia.setCursor(Qt.PointingHandCursor)
+        self.bouton_copier_ia.setToolTip(
+            "Copie un court prompt + le JSON actuel (tous les profils listés et la correspondance enregistrée).\n"
+            "Colle-le dans une IA : elle renvoie uniquement le JSON bien nommé, à importer avec le bouton de gauche.")
+        self.bouton_copier_ia.clicked.connect(self._sur_clic_copier_ia)
+        haut.addWidget(self.bouton_copier_ia)
         self.bouton_vider = QPushButton(" Vider", self)
         self.bouton_vider.setIcon(qta.icon("mdi6.delete-outline", color=Mocha.text))
         self.bouton_vider.setCursor(Qt.PointingHandCursor)
@@ -31192,6 +31228,17 @@ class ProfilsKaggleScreen(QWidget):
         self._recalculer_noms()
         if avertissements:
             QMessageBox.information(self, "Correspondance Kaggle", "Importee avec avertissement(s) :\n\n" + "\n".join(avertissements[:15]))
+
+    def _sur_clic_copier_ia(self):
+        noms = [str(p.get("nom", "")) for profils in self._profils_par_sautoniax.values() for p in profils]
+        correspondance = self._correspondance()
+        if not noms and not correspondance:
+            self.ajouter_journal("Rien à copier : aucun profil chargé et aucune correspondance enregistrée.")
+            return
+        texte = construire_texte_correspondance_ia(noms, correspondance)
+        QGuiApplication.clipboard().setText(texte)
+        nb_entrees = len(json.loads(texte[len(PROMPT_CORRESPONDANCE_IA):]))
+        self.ajouter_journal(f"Prompt + JSON copiés dans le presse-papiers ({nb_entrees} entrée(s)).")
 
     def _sur_clic_vider(self):
         vider_correspondance(self._reglages_courants())

@@ -128,6 +128,20 @@ QGuiApplication.clipboard().setText("[1, 2")
 E._sur_clic_importer()
 ok(reglages.kaggle_correspondance_noms["alice"] == "alice@x.com", "mauvais import : ancienne correspondance intacte")
 
+# ---- bouton « Copier pour IA » : prompt + JSON actuel ----------------------------------
+QGuiApplication.clipboard().setText("")
+E._sur_clic_copier_ia()
+copie = QGuiApplication.clipboard().text()
+prompt = ns["PROMPT_CORRESPONDANCE_IA"]
+ok(copie.startswith(prompt) and "UNIQUEMENT avec le JSON" in copie and "EXACTEMENT" in copie, "copie : prompt au debut")
+donnees = json.loads(copie[len(prompt):])
+ok(set(donnees) == {"alice", "bob", "commun", "carl"}, "copie : tous les profils listes + entrees de la correspondance")
+ok(donnees["alice"] == "alice@x.com" and donnees["bob"] == "", "copie : valeur existante gardee, vide sinon")
+ok(list(donnees) == ["alice", "bob", "carl", "commun"], "copie : profils tries sans tenir compte de la casse")
+ok("copiés" in E.journal.item(E.journal.count() - 1).text(), "copie : ligne de journal")
+ok(ns["valider_correspondance"](json.dumps({k: v or "x@y.z" for k, v in donnees.items()}))[0]["alice"] == "alice@x.com", "le JSON copie, une fois rempli, est importable")
+ok(ns["construire_texte_correspondance_ia"]([], {}).endswith("{}"), "aucun profil ni correspondance : JSON vide")
+
 # ---- meme profil sur deux sAutoniax -----------------------------------------
 ancien, recent = E._items[("s1", "commun")], E._items[("s2", "commun")]
 ok(recent.text(E.COL_ETAT).startswith("pret") and ancien.text(E.COL_ETAT).startswith("ignore"), "copie la plus recente gardee, l'ancienne ignoree")
