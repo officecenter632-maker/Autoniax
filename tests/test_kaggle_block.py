@@ -196,8 +196,13 @@ class FauxKaggle:
         return [Obj(ref=r, title=d["title"], subtitle=d["subtitle"], total_bytes=(0 if getattr(self, "taille_liste_zero", False) else sum(d["fichiers"].values())),
                     last_updated=d["maj"], is_private=True) for r, d in self.datasets.items()] + \
                [Obj(ref="mikereichlin/autre-projet", title="Autre", subtitle="", total_bytes=1, last_updated=None, is_private=True)]
-    def dataset_list_files(self, ref, **kw):
-        return Obj(dataset_files=[Obj(name=n, total_bytes=t) for n, t in self.datasets[ref]["fichiers"].items()])
+    def dataset_list_files(self, ref, page_token=None, page_size=20, **kw):
+        tous = [Obj(name=n, total_bytes=t) for n, t in self.datasets[ref]["fichiers"].items()]
+        if getattr(self, "pages_de", 0):
+            debut = int(page_token or 0)
+            fin = debut + self.pages_de
+            return Obj(dataset_files=tous[debut:fin], next_page_token=(str(fin) if fin < len(tous) else None))
+        return Obj(dataset_files=tous)
     def dataset_download_file(self, ref, file_name, path=None, force=False, quiet=True, **kw):
         if getattr(self, "fichier_par_fichier_interdit", False):
             e = Exception("404 Client Error: Not Found for url: https://api.kaggle.com/v1/datasets.DatasetApiService/DownloadDataset")
@@ -371,6 +376,18 @@ with tempfile.TemporaryDirectory() as tmp:
        "enveloppe : archive interne retrouvee malgre un nom different")
     api.enveloppe_avec_zip = False
 
+    # liste de fichiers paginee : toutes les pages sont lues (taille totale exacte)
+    api.datasets[ref]["fichiers"].update({f"extra{i}.bin": 1000 for i in range(5)})
+    api.pages_de = 2
+    attendu_total = sum(api.datasets[ref]["fichiers"].values())
+    ok(sum(t for _, t in g._fichiers_dataset(ref)) == attendu_total and len(g._fichiers_dataset(ref)) == len(api.datasets[ref]["fichiers"]),
+       "liste de fichiers paginee : toutes les pages lues")
+    api.taille_liste_zero = True
+    ok(next(d for d in g.lister_datasets() if d["ref"] == ref)["taille_octets"] == attendu_total, "taille affichee = somme de toutes les pages")
+    api.taille_liste_zero = False
+    api.pages_de = 0
+    for i in range(5):
+        del api.datasets[ref]["fichiers"][f"extra{i}.bin"]
     # archive recue dans un sous-dossier : trouvee quand meme
     api.zip_dans_sous_dossier = True
     r4e = g.telecharger_profil("ax-a-b-com", str(cible), "sousdos", "a_b")

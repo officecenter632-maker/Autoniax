@@ -30393,11 +30393,24 @@ class GestionnaireKaggle:
 
     def _fichiers_dataset(self, ref: str) -> list:
         api = self.authentifier()
-        rep = api.dataset_list_files(ref)
-        fichiers = getattr(rep, "dataset_files", None)
-        if fichiers is None:
-            fichiers = getattr(rep, "files", None) or []
-        return [(str(getattr(f, "name", "")), int(getattr(f, "total_bytes", 0) or 0)) for f in fichiers]
+        sortie: list = []
+        jeton = None
+        vus: set = set()
+        for _ in range(1000):  # la liste est paginee (20 par defaut) : on suit les pages jusqu'a la fin
+            try:
+                rep = api.dataset_list_files(ref, page_token=jeton, page_size=200)
+            except TypeError:
+                rep = api.dataset_list_files(ref)  # ancienne bibliotheque sans pagination
+                jeton = None
+            fichiers = getattr(rep, "dataset_files", None)
+            if fichiers is None:
+                fichiers = getattr(rep, "files", None) or []
+            sortie.extend((str(getattr(f, "name", "")), int(getattr(f, "total_bytes", 0) or 0)) for f in fichiers)
+            jeton = getattr(rep, "next_page_token", None) or getattr(rep, "nextPageToken", None) or None
+            if not jeton or jeton in vus:
+                break
+            vus.add(jeton)
+        return sortie
 
     # -- envoi -------------------------------------------------------------
     def envoyer_profil(self, chemin_dossier: str, nom_archive: str, nom_local: str = "",
