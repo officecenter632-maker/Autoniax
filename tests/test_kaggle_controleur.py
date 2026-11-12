@@ -8,7 +8,7 @@ from typing import Optional
 from PySide6.QtCore import Qt, Signal, QObject, QTimer
 from PySide6.QtGui import QBrush, QColor, QGuiApplication
 from PySide6.QtWidgets import (QApplication, QWidget, QHBoxLayout, QVBoxLayout, QListWidget, QListWidgetItem,
-                               QTreeWidget, QTreeWidgetItem, QPushButton, QMessageBox, QFrame, QAbstractItemView,
+                               QTreeWidget, QTreeWidgetItem, QPushButton, QProgressBar, QMessageBox, QFrame, QAbstractItemView,
                                QCheckBox, QLabel)
 import qtawesome as qta
 
@@ -41,7 +41,7 @@ ns = dict(os=os, re=re, json=json, shutil=shutil, tempfile=tempfile, zipfile=zip
           QObject=QObject, QTimer=QTimer, QBrush=QBrush, QColor=QColor, QGuiApplication=QGuiApplication,
           QWidget=QWidget, QHBoxLayout=QHBoxLayout, QVBoxLayout=QVBoxLayout, QListWidget=QListWidget,
           QListWidgetItem=QListWidgetItem, QTreeWidget=QTreeWidget, QTreeWidgetItem=QTreeWidgetItem,
-          QPushButton=QPushButton, QMessageBox=FauxQMessageBox, QFrame=QFrame, QAbstractItemView=QAbstractItemView,
+          QPushButton=QPushButton, QProgressBar=QProgressBar, QMessageBox=FauxQMessageBox, QFrame=QFrame, QAbstractItemView=QAbstractItemView,
           QCheckBox=QCheckBox, QLabel=QLabel, qta=qta, ReglagesApp=None)
 exec(mocha, ns)
 exec(compile(bloc, "kaggle_block", "exec"), ns)
