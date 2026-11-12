@@ -143,6 +143,11 @@ class FauxKaggle:
     def authenticate(self):
         self.appels.append("auth")
     def dataset_status(self, ref):
+        if getattr(self, "forbidden_au_lieu_de_404", False) or getattr(self, "forbidden_toujours", False):
+            if ref not in self.datasets or getattr(self, "forbidden_toujours", False):
+                e = Exception("403 Client Error: Forbidden for url: https://api.kaggle.com/v1/datasets.DatasetApiService/GetDatasetStatus")
+                e.response = Obj(status_code=403)
+                raise e
         if ref not in self.datasets:
             e = Exception("404 Not Found")
             e.response = Obj(status_code=404)
@@ -225,6 +230,10 @@ with tempfile.TemporaryDirectory() as tmp:
     g = faire_gestionnaire(api)
     g.authentifier()
     ok(not g.dataset_existe("mikereichlin/ax-a-b-com"), "dataset inexistant (404)")
+    # 403 au lieu de 404 pour un dataset pas encore cree : tranche via la liste de ses propres datasets
+    api.forbidden_au_lieu_de_404 = True
+    ok(not g.dataset_existe("mikereichlin/ax-a-b-com"), "403 sur dataset inexistant : traite comme absent")
+    api.forbidden_au_lieu_de_404 = False
 
     # creation, avec etapes de progression et suppression locale apres verification
     etapes = []

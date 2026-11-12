@@ -142,6 +142,16 @@ ok("copiés" in E.journal.item(E.journal.count() - 1).text(), "copie : ligne de 
 ok(ns["valider_correspondance"](json.dumps({k: v or "x@y.z" for k, v in donnees.items()}))[0]["alice"] == "alice@x.com", "le JSON copie, une fois rempli, est importable")
 ok(ns["construire_texte_correspondance_ia"]([], {}).endswith("{}"), "aucun profil ni correspondance : JSON vide")
 
+# ---- bouton « Copier les logs » ----------------------------------------------------------
+E.ajouter_journal("ligne de test A")
+E.ajouter_journal("ligne de test B")
+QGuiApplication.clipboard().setText("")
+E._sur_clic_copier_logs()
+copie_logs = QGuiApplication.clipboard().text()
+ok("ligne de test A" in copie_logs and "ligne de test B" in copie_logs and "\n" in copie_logs, "copie des logs : tout le journal dans le presse-papiers")
+ok(all(len(l) > 8 and l[2] == ":" for l in copie_logs.splitlines()), "copie des logs : lignes horodatees")
+ok("copiés" in E.journal.item(E.journal.count() - 1).text() and E.bouton_copier_logs.isEnabled(), "copie des logs : confirmation au journal")
+
 # ---- meme profil sur deux sAutoniax -----------------------------------------
 ancien, recent = E._items[("s1", "commun")], E._items[("s2", "commun")]
 ok(recent.text(E.COL_ETAT).startswith("pret") and ancien.text(E.COL_ETAT).startswith("ignore"), "copie la plus recente gardee, l'ancienne ignoree")

@@ -30331,6 +30331,10 @@ class GestionnaireKaggle:
             code = getattr(getattr(e, "response", None), "status_code", None)
             if code == 404 or "404" in str(e) or "not found" in str(e).lower():
                 return False
+            if code == 403 or "403" in str(e) or "forbidden" in str(e).lower():
+                # Kaggle repond 403 (et non 404) pour un dataset qui n'existe pas encore dans ton espace :
+                # on tranche avec la liste de tes propres datasets plutot que de bloquer la creation.
+                return any(d["ref"] == ref for d in self.lister_datasets())
             raise
 
     def lister_datasets(self) -> list:
@@ -31188,7 +31192,15 @@ class ProfilsKaggleScreen(QWidget):
         self.journal.setObjectName("ProfilsKaggleJournal")
         self.journal.setSelectionMode(QAbstractItemView.NoSelection)
         self.journal.setMaximumHeight(130)
-        layout.addWidget(self.journal)
+        ligne_journal = QHBoxLayout()
+        ligne_journal.addWidget(self.journal, stretch=1)
+        self.bouton_copier_logs = QPushButton(" Copier les logs", self)
+        self.bouton_copier_logs.setIcon(qta.icon("mdi6.content-copy", color=Mocha.text))
+        self.bouton_copier_logs.setCursor(Qt.PointingHandCursor)
+        self.bouton_copier_logs.setToolTip("Copie tout le journal (horodaté) dans le presse-papiers.")
+        self.bouton_copier_logs.clicked.connect(self._sur_clic_copier_logs)
+        ligne_journal.addWidget(self.bouton_copier_logs, alignment=Qt.AlignTop)
+        layout.addLayout(ligne_journal)
 
         self.label_correspondance.setText("Aucune correspondance importee.")  # reel des que definir_reglages() est appele
         self._rafraichir_libelle_tri()
@@ -31239,6 +31251,17 @@ class ProfilsKaggleScreen(QWidget):
         QGuiApplication.clipboard().setText(texte)
         nb_entrees = len(json.loads(texte[len(PROMPT_CORRESPONDANCE_IA):]))
         self.ajouter_journal(f"Prompt + JSON copiés dans le presse-papiers ({nb_entrees} entrée(s)).")
+
+    def texte_journal(self) -> str:
+        return "\n".join(self.journal.item(i).text() for i in range(self.journal.count()))
+
+    def _sur_clic_copier_logs(self):
+        texte = self.texte_journal()
+        if not texte:
+            self.ajouter_journal("Journal vide : rien a copier.")
+            return
+        QGuiApplication.clipboard().setText(texte)
+        self.ajouter_journal(f"Logs copiés dans le presse-papiers ({self.journal.count()} ligne(s)).")
 
     def _sur_clic_vider(self):
         vider_correspondance(self._reglages_courants())
