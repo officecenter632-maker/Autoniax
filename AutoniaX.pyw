@@ -29999,6 +29999,7 @@ KAGGLE_USERNAME = "mikereichlin"
 KAGGLE_API_TOKEN = "KGAT_af3ac4a714d020b6a4a8034cf1bf8792"  # en dur (decision explicite utilisateur)
 KAGGLE_PAQUET_PIP = "kaggle==2.2.5"  # minimum 1.8.0 ; meme epinglage dans le notebook sAutoniax
 PREFIXE_DATASET = "ax-"
+_DIAG_KAGGLE: dict = {"total_datasets_vus": None}  # diagnostic du dernier listing (tous les datasets du compte)
 MAX_TRANSFERTS_SIMULTANES = 3  # global, tous sAutoniax confondus
 NB_TENTATIVES = 3
 DELAIS_TENTATIVES_S = (5, 15, 45)
@@ -30265,12 +30266,16 @@ class GestionnaireKaggle:
         api = self.authentifier()
         sortie: list = []
         vus: set = set()
+        self.total_datasets_vus = 0  # diagnostic : tous les datasets du compte, avant filtre ax-
+        _DIAG_KAGGLE["total_datasets_vus"] = None
         page = 1
         while page <= 50:
-            lot = api.dataset_list(mine=True, page=page)  # mine et user sont exclusifs cote API or []
+            lot = api.dataset_list(mine=True, page=page) or []  # mine et user sont exclusifs cote API
             nouveaux = 0
             for d in lot:
                 ref = str(getattr(d, "ref", "") or "")
+                self.total_datasets_vus += 1
+                _DIAG_KAGGLE["total_datasets_vus"] = self.total_datasets_vus
                 slug = ref.split("/")[-1]
                 if not slug.startswith(PREFIXE_DATASET) or ref in vus:
                     continue
@@ -30289,6 +30294,7 @@ class GestionnaireKaggle:
             if not lot:
                 break
             page += 1
+        _DIAG_KAGGLE["total_datasets_vus"] = self.total_datasets_vus
         return sortie
 
     @staticmethod
@@ -31188,7 +31194,9 @@ class ProfilsKaggleScreen(QWidget):
         self._reconstruire_table_datasets()
         self.label_quota.setText(
             f"Quota prive : {formater_taille_octets(GestionnaireKaggle.quota_utilise_octets(self._datasets))} / {QUOTA_PRIVE_GO} Go")
-        self.ajouter_journal(f"{len(self._datasets)} dataset(s) ax- sur Kaggle.")
+        total = _DIAG_KAGGLE.get("total_datasets_vus")
+        self.ajouter_journal(f"{len(self._datasets)} dataset(s) ax- sur Kaggle."
+                             + (f" ({total} dataset(s) au total sur le compte.)" if total is not None else ""))
         self._recalculer_noms()
 
     # ------------------------------------------------------------------
