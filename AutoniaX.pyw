@@ -84869,7 +84869,23 @@ DRIVE_CLE_URL_TUNNEL = DRIVE_PREFIXE_SERVEURT + "url_tunnel.txt"
 # point ouvert 2 de la spec, tranché : cohérent avec le fait qu'un futur
 # exécutant qui démarre va de toute façon chercher ces mêmes fichiers.
 DRIVE_PREFIXE_APP = "App/"
-DRIVE_CLE_AUTONIAX = DRIVE_PREFIXE_APP + "AutoniaX.py"
+DRIVE_CLE_AUTONIAX = DRIVE_PREFIXE_APP + "AutoniaX.py"  # ancienne cle (non compressee), lue en repli par le notebook sAutoniax
+DRIVE_CLE_AUTONIAX_XZ = DRIVE_PREFIXE_APP + "AutoniaX.pyw.xz"  # cle actuelle : fichier compresse avant envoi
+
+
+def compresser_xz_maximal(donnees: bytes) -> bytes:
+    """Compresse en XZ (LZMA2, preset 9 | EXTREME, controle CRC64) et VERIFIE la relecture
+    avant de rendre le resultat. dict_size : 128 Mo au plus, ramene a la puissance de 2 qui
+    couvre le fichier (meme taux, bien moins de memoire pour un fichier de quelques Mo)."""
+    import lzma
+    dict_size = 1 << 20
+    while dict_size < len(donnees) and dict_size < 128 * 1024 * 1024:
+        dict_size <<= 1
+    filtres = [{"id": lzma.FILTER_LZMA2, "preset": 9 | lzma.PRESET_EXTREME, "dict_size": dict_size}]
+    compresse = lzma.compress(donnees, format=lzma.FORMAT_XZ, check=lzma.CHECK_CRC64, filters=filtres)
+    if lzma.decompress(compresse) != donnees:
+        raise RuntimeError("Verification de la compression XZ echouee (relecture differente de l'original).")
+    return compresse
 DRIVE_CLE_MOUSE_DATA = DRIVE_PREFIXE_APP + "mouseData.sqlite3"
 DRIVE_CLE_PROJECT_JSON = DRIVE_PREFIXE_APP + "project.json"
 DRIVE_CLE_SERVICE_API_ZIP = DRIVE_PREFIXE_APP + "service_api.zip"
@@ -90008,7 +90024,7 @@ class ClientServeurT(QObject):
         if element == "autoniax":
             chemin = chemin_autoniax
             nom_fichier = chemin_autoniax.name
-            cle_drive = DRIVE_CLE_AUTONIAX
+            cle_drive = DRIVE_CLE_AUTONIAX_XZ  # compresse avant l'envoi (cf. plus bas)
         elif element == "mouse_data":
             chemin = chemin_mouse_data
             nom_fichier = chemin_mouse_data.name
@@ -90107,6 +90123,12 @@ class ClientServeurT(QObject):
                     self.mise_a_jour_app_progression.emit, _nom_fichier, pourcentage,
                 )
             self.mise_a_jour_app_progression.emit(nom_fichier, -1)
+            if element == "autoniax":
+                # Mise a jour de l'application : le fichier est d'abord compresse (XZ maximal), puis
+                # seul l'archive part sur Drive (App/AutoniaX.pyw.xz). Le notebook sAutoniax la decompresse.
+                taille_origine = len(contenu)
+                contenu = await loop.run_in_executor(None, compresser_xz_maximal, contenu)
+                log_reseau_t.info(f"mise_a_jour_app 'AutoniaX.py' compresse : {taille_origine} -> {len(contenu)} octets")
             if element == "serveur_t":
                 await loop.run_in_executor(
                     None, lambda: GestionnaireStockageDriveDirect().envoyer_serveur_py(
@@ -90119,7 +90141,7 @@ class ClientServeurT(QObject):
                         cle_drive, contenu, progression_callback=_rappeler_progression,
                     ),
                 )
-            log_reseau_t.info(f"-> mise_a_jour_app '{nom_fichier}' uploadé directement sur Drive ({len(contenu)} octets)")
+            log_reseau_t.info(f"-> mise_a_jour_app '{nom_fichier}' uploadé directement sur Drive ({len(contenu)} octets, cle {cle_drive or 'serveur_t'})")
             self.mise_a_jour_app_resultat.emit(True, nom_fichier, "")
         except Exception as e:
             log_reseau_t.warning(f"mise_a_jour_app '{nom_fichier}' : échec upload Drive direct ({e!r})")
