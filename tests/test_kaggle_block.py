@@ -203,13 +203,19 @@ class FauxKaggle:
             e = Exception("404 Client Error: Not Found for url: https://api.kaggle.com/v1/datasets.DatasetApiService/DownloadDataset")
             e.response = Obj(status_code=404, text='{"code":5,"message":"Not found"}')
             raise e
-        shutil.copyfile(self.datasets[ref]["contenu_zip"], os.path.join(path, file_name))
+        shutil.copyfile(self.datasets[ref]["contenu_zip"], os.path.join(path, "telechargement" if getattr(self, "nom_sans_extension", False) else file_name))
     def dataset_download_files(self, ref, path=None, force=False, quiet=True, unzip=False, **kw):
         if getattr(self, "bundle_404", False):
             e = Exception("404 Client Error: Not Found for url: https://api.kaggle.com/v1/datasets.DatasetApiService/DownloadDataset")
             e.response = Obj(status_code=404)
             raise e
         d = self.datasets[ref]
+        if getattr(self, "enveloppe_avec_zip", False):
+            arch = [n for n in d["fichiers"] if n.endswith(".zip")][0]
+            with zipfile.ZipFile(os.path.join(path, "enveloppe.zip"), "w") as z:
+                z.write(d["contenu_zip"], arch)
+                z.writestr("meta.json", "{}")
+            return
         if self.zip_decompresse:
             with zipfile.ZipFile(os.path.join(path, "enveloppe.zip"), "w") as z:
                 z.writestr("contenu.txt", "hello")
@@ -343,6 +349,20 @@ with tempfile.TemporaryDirectory() as tmp:
     ok(e is not None and "repli fichier par fichier" in str(e) and "Not found" in str(e), "les deux voies refusees : erreur detaillee (reponse Kaggle incluse)")
     api.bundle_404 = False
     api.fichier_par_fichier_interdit = False
+
+    # fichier recu sans extension .zip (repli fichier par fichier) : reconnu par son contenu
+    api.bundle_404 = True
+    api.nom_sans_extension = True
+    r4c = g.telecharger_profil("ax-a-b-com", str(cible), "sansext", "a_b")
+    ok(r4c["ok"] and (cible / "sansext" / "Default" / "Cookies").read_text() == "cookie", "fichier sans extension .zip reconnu")
+    api.bundle_404 = False
+    api.nom_sans_extension = False
+    # enveloppe Kaggle (zip contenant meta.json + l'archive dont le nom differe du nom deduit du titre)
+    api.enveloppe_avec_zip = True
+    r4d = g.telecharger_profil("ax-a-b-com", str(cible), "envel", "a_b")
+    ok(r4d["ok"] and (cible / "envel" / "Default" / "Cookies").read_text() == "cookie" and not (cible / "envel" / "meta.json").exists(),
+       "enveloppe : archive interne retrouvee malgre un nom different")
+    api.enveloppe_avec_zip = False
 
     # zip decompresse par Kaggle
     api.zip_decompresse = True

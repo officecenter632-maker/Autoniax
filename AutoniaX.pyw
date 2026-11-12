@@ -30569,23 +30569,30 @@ class GestionnaireKaggle:
             prog("Telechargement", 10)
             self._avec_tentatives(f"Telechargement de {ref}", lambda: self._telecharger_dans(ref, temp))
             prog("Extraction", 60)
-            zips = [p for p in os.listdir(temp) if p.lower().endswith(".zip")]
+            recus = sorted(p for p in os.listdir(temp) if os.path.isfile(os.path.join(temp, p)))
+            # archive = fichier .zip OU fichier dont le contenu est un zip (le nom recu peut ne pas avoir d'extension)
+            zips = [p for p in recus if p.lower().endswith(".zip") or zipfile.is_zipfile(os.path.join(temp, p))]
+            if not zips:
+                raise ErreurKaggle(f"Aucune archive trouvee dans {ref} (fichiers recus : {', '.join(recus) or 'aucun'}).")
             attendu = f"{nom_archive}.zip"
+            choisi = attendu if attendu in zips else zips[0]
             extrait = os.path.join(temp, "_extrait")
             os.makedirs(extrait, exist_ok=True)
-            if attendu in zips:
-                _kaggle_extraire_zip_sur(os.path.join(temp, attendu), extrait)
-            elif zips:
-                _kaggle_extraire_zip_sur(os.path.join(temp, zips[0]), extrait)  # enveloppe Kaggle
+            _kaggle_extraire_zip_sur(os.path.join(temp, choisi), extrait)
+            if choisi != attendu:
+                # enveloppe Kaggle : l'archive du profil est dedans (son nom peut differer du nom deduit du titre)
                 interne = os.path.join(extrait, attendu)
-                if os.path.isfile(interne):
+                if not os.path.isfile(interne):
+                    contenu = [f for f in os.listdir(extrait) if f != "meta.json"]
+                    interne = os.path.join(extrait, contenu[0]) if (
+                        len(contenu) == 1 and contenu[0].lower().endswith(".zip")
+                        and os.path.isfile(os.path.join(extrait, contenu[0]))) else ""
+                if interne and os.path.isfile(interne):
                     sous = os.path.join(temp, "_interne")
                     os.makedirs(sous, exist_ok=True)
                     _kaggle_extraire_zip_sur(interne, sous)
                     shutil.rmtree(extrait)
                     extrait = sous
-            else:
-                raise ErreurKaggle(f"Aucune archive trouvee dans {ref}.")
             cible = os.path.join(dossier_profils, nom_local)
             os.makedirs(dossier_profils, exist_ok=True)
             if os.path.exists(cible):
