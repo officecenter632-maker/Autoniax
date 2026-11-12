@@ -219,4 +219,14 @@ ok(E.label_connexion.text() == "Kaggle : connecte" and "1,0 Go" in E.label_quota
 E.definir_etat_connexion(False, "jeton refuse")
 ok("jeton refuse" in E.label_connexion.text(), "connexion en echec")
 
+# ---- indicateur de requete en cours -----------------------------------------------
+E.definir_activite_kaggle(True, "Connexion a Kaggle en cours...")
+ok(not E.barre_activite_kaggle.isHidden() and "en cours" in E.label_connexion.text(), "barre + libelle pendant la connexion")
+ok("en cours" in E.journal.item(E.journal.count() - 1).text(), "ligne de journal 'en cours'")
+E.definir_etat_connexion(False, "jeton refuse")
+ok(E.barre_activite_kaggle.isHidden(), "barre masquee apres un echec")
+E.definir_activite_kaggle(True, "Actualisation en cours...")
+E.definir_datasets([])
+ok(E.barre_activite_kaggle.isHidden(), "barre masquee quand les datasets arrivent")
+
 print(f"OK -- {nb} verifications d'interface passees")

@@ -31004,6 +31004,13 @@ class ProfilsKaggleScreen(QWidget):
         self.label_quota.setObjectName("ReglagesLabel")
         haut.addWidget(self.label_quota)
         layout.addLayout(haut)
+        # Barre indeterminee : visible tant qu'une requete Kaggle (connexion, liste des datasets) est en cours.
+        self.barre_activite_kaggle = QProgressBar(self)
+        self.barre_activite_kaggle.setRange(0, 0)
+        self.barre_activite_kaggle.setTextVisible(False)
+        self.barre_activite_kaggle.setFixedHeight(6)
+        self.barre_activite_kaggle.setVisible(False)
+        layout.addWidget(self.barre_activite_kaggle)
 
         # --- Bloc A : Envoyer vers Kaggle ---
         titre_a = QLabel("Envoyer vers Kaggle", self)
@@ -31182,7 +31189,17 @@ class ProfilsKaggleScreen(QWidget):
         self._reconstruire_arbre()
         self.ajouter_journal(f"{self._sautoniax.get(id_executant, id_executant)} : {len(profils or [])} profil(s).")
 
+    def definir_activite_kaggle(self, en_cours: bool, texte: str = ""):
+        """Indicateur visible d'une requete Kaggle en cours : barre indeterminee + libelle + ligne de journal."""
+        self.barre_activite_kaggle.setVisible(bool(en_cours))
+        if en_cours:
+            self.label_connexion.setText(f"Kaggle : {texte or 'requete en cours...'}")
+            self.label_connexion.setToolTip("")
+            self.ajouter_journal(texte or "Requete Kaggle en cours...")
+
     def definir_etat_connexion(self, ok: bool, message: str = "", quota_octets: Optional[int] = None):
+        if not ok:
+            self.barre_activite_kaggle.setVisible(False)
         self.label_connexion.setText("Kaggle : connecte" if ok else f"Kaggle : {message or 'erreur de connexion'}")
         self.label_connexion.setToolTip(message)
         if quota_octets is not None:
@@ -31190,6 +31207,7 @@ class ProfilsKaggleScreen(QWidget):
         self.ajouter_journal("Connexion Kaggle OK." if ok else f"Connexion Kaggle : {message}")
 
     def definir_datasets(self, datasets: list):
+        self.barre_activite_kaggle.setVisible(False)
         self._datasets = list(datasets or [])
         self._reconstruire_table_datasets()
         self.label_quota.setText(
@@ -31432,7 +31450,7 @@ class ProfilsKaggleScreen(QWidget):
     def _sur_clic_actualiser_datasets(self):
         if self._operation_id is not None:
             return
-        self.ajouter_journal("Actualisation de la liste Kaggle...")
+        self.definir_activite_kaggle(True, "Actualisation de la liste des datasets Kaggle en cours...")
         self.demande_kaggle_actualiser_datasets.emit()
 
     def _sur_clic_telecharger(self):
@@ -31509,6 +31527,7 @@ class ProfilsKaggleScreen(QWidget):
         super().showEvent(event)
         if not self._deja_affiche:
             self._deja_affiche = True
+            self.definir_activite_kaggle(True, "Connexion a Kaggle en cours...")
             self.demande_kaggle_verifier_connexion.emit()
             if self._sautoniax:
                 self.demande_kaggle_actualiser_profils.emit(sorted(self._sautoniax))
