@@ -30098,7 +30098,13 @@ def slug_depuis_nom(nom_archive: str) -> str:
 
 
 def titre_depuis_nom(nom_archive: str) -> str:
-    titre = ("AX " + str(nom_archive or "").strip())[:KAGGLE_TITRE_MAX].rstrip()
+    """Titre Kaggle : 'AX ' + nom d'archive assaini. Kaggle refuse '@' (Invalid title) : on retire un
+    '.com' final, '@' devient '_' et tout autre caractere hors lettres/chiffres/espace/_/- devient '_'."""
+    corps = str(nom_archive or "").strip()
+    if corps.lower().endswith(".com"):
+        corps = corps[:-4]
+    corps = re.sub(r"[^A-Za-z0-9 _-]", "_", corps.replace("@", "_"))
+    titre = ("AX " + corps)[:KAGGLE_TITRE_MAX].rstrip()
     if len(titre) < KAGGLE_TITRE_MIN:
         titre = (titre + " profil")[:KAGGLE_TITRE_MAX]
     return titre

@@ -40,9 +40,11 @@ ok(len(long) <= 50 and re.fullmatch(r"ax-a+-[0-9a-f]{8}", long), "slug tronque +
 ok(slug("a" * 200) == long and slug("a" * 201) != long, "slug deterministe, hash distinct")
 ok(len(slug("x")) >= 6, "slug minimum 6")
 ok(len(slug("@@@")) >= 6 and slug("@@@").startswith("ax-"), "slug sans caractere valide")
-ok(ns["titre_depuis_nom"]("a@b.com") == "AX a@b.com", "titre")
+ok(ns["titre_depuis_nom"]("a@b.com") == "AX a_b", "titre : .com retire, @ remplace par _")
+ok(ns["titre_depuis_nom"]("jo.doe@mail.fr") == "AX jo_doe_mail_fr", "titre : autres caracteres speciaux remplaces par _")
+ok("@" not in ns["titre_depuis_nom"]("ADRESSE_DU_COMPTE@domaine.com") and ns["titre_depuis_nom"]("ADRESSE_DU_COMPTE@domaine.com") == "AX ADRESSE_DU_COMPTE_domaine", "titre : cas du journal")
 ok(len(ns["titre_depuis_nom"]("z" * 99)) <= 50, "titre tronque")
-ok(ns["nom_archive_depuis_titre"]("AX a@b.com") == "a@b.com", "nom depuis titre")
+ok(ns["nom_archive_depuis_titre"]("AX a_b") == "a_b", "nom depuis titre")
 st = ns["sous_titre_creation"]("2026-11-12T10:00:00Z")
 ok(st == "ax;cree=2026-11-12T10:00:00Z" and 20 <= len(st) <= 80, "sous-titre")
 ok(ns["date_creation_depuis_sous_titre"](st) == "2026-11-12T10:00:00Z", "relecture date")
@@ -301,7 +303,7 @@ with tempfile.TemporaryDirectory() as tmp:
     ok({d["slug"] for d in liste} >= {"ax-a-b-com", "ax-bob-x-com"} and all(d["slug"].startswith("ax-") for d in liste),
        "liste filtree sur le prefixe ax-")
     a = next(d for d in liste if d["slug"] == "ax-a-b-com")
-    ok(a["nom_archive"] == "a@b.com" and a["cree_le"] and a["prive"], "champs du listing")
+    ok(a["nom_archive"] == "a_b" and a["cree_le"] and a["prive"], "champs du listing")
     ok(g.quota_utilise_octets(liste) == sum(d["taille_octets"] for d in liste), "quota")
 
     # telechargement
