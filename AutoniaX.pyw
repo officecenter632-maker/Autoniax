@@ -30472,12 +30472,38 @@ class GestionnaireKaggle:
             except OSError:
                 pass
 
+    @staticmethod
+    def _est_403(e: Exception) -> bool:
+        code = getattr(getattr(e, "response", None), "status_code", None)
+        return code == 403 or "403" in str(e) or "forbidden" in str(e).lower()
+
+    def _statut_dataset(self, ref: str) -> str:
+        """Statut Kaggle du dataset. Si l'endpoint de statut repond 403 (droits du jeton), repli : le dataset
+        est 'ready' quand sa liste de fichiers (ou ta liste de datasets) le montre, sinon 'queued'."""
+        api = self.authentifier()
+        try:
+            return str(api.dataset_status(ref))
+        except Exception as e:
+            if not self._est_403(e):
+                raise
+        try:
+            if self._fichiers_dataset(ref):
+                return "ready"
+        except Exception:
+            pass
+        try:
+            if any(d["ref"] == ref for d in self.lister_datasets()):
+                return "ready"
+        except Exception:
+            pass
+        return "queued"
+
     def _attendre_pret(self, ref: str) -> None:
         api = self.authentifier()
         debut = time.monotonic()
         statut = ""
         while True:
-            statut = str(api.dataset_status(ref)).lower()
+            statut = self._statut_dataset(ref).lower()
             if statut.endswith("ready"):
                 return
             if "error" in statut or "fail" in statut:

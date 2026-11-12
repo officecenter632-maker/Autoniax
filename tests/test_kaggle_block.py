@@ -298,6 +298,15 @@ with tempfile.TemporaryDirectory() as tmp:
     ns["DELAI_PRET_KAGGLE_S"] = 600
     api.statuts = ["queued", "ready"]
 
+    # jeton sans droit sur GetDatasetStatus : 403 permanent -> repli sur la liste des fichiers
+    api.forbidden_toujours = True
+    (profils / "Fay").mkdir()
+    (profils / "Fay" / "f").write_text("x")
+    rf = g.envoyer_profil(str(profils / "Fay"), "fay@x.com", nom_local="Fay", email="fay@x.com", instance="s1",
+                          supprimer_local=True, zipper=zipper)
+    ok(rf["ok"] and rf["cree"] and not (profils / "Fay").exists(), "403 permanent sur le statut : envoi termine via la liste des fichiers")
+    api.forbidden_toujours = False
+
     # liste + quota
     liste = g.lister_datasets()
     ok({d["slug"] for d in liste} >= {"ax-a-b-com", "ax-bob-x-com"} and all(d["slug"].startswith("ax-") for d in liste),
