@@ -30079,11 +30079,22 @@ def _kaggle_maintenant_iso() -> str:
 # ---------------------------------------------------------------------------
 # Nommage
 # ---------------------------------------------------------------------------
+def nom_canonique(nom_archive: str) -> str:
+    """Nom assaini commun au titre ET a l'identifiant Kaggle (Kaggle refuse '@' dans le titre) : '.com' final
+    retire, '@' -> '_', tout autre caractere hors lettres/chiffres/espace/_/- -> '_'. Idempotent : le nom relu
+    depuis le titre (apres telechargement) redonne le MEME identifiant, donc un re-envoi met a jour le meme dataset."""
+    corps = str(nom_archive or "").strip()
+    if corps.lower().endswith(".com"):
+        corps = corps[:-4]
+    corps = "".join(c for c in _kg_unicodedata.normalize("NFKD", corps) if not _kg_unicodedata.combining(c))  # E accent -> E
+    return re.sub(r"[^A-Za-z0-9 _-]", "_", corps.replace("@", "_"))
+
+
 def slug_depuis_nom(nom_archive: str) -> str:
-    """PREFIXE_DATASET + nom transforme : minuscules, accents retires, tout
+    """PREFIXE_DATASET + nom canonique transforme : minuscules, accents retires, tout
     caractere hors a-z0-9 -> '-', tirets consecutifs fusionnes. Au-dela de
     KAGGLE_SLUG_MAX : troncature + '-' + 8 caracteres de hash. Deterministe."""
-    brut = str(nom_archive or "")
+    brut = nom_canonique(nom_archive)
     sans_accent = _kg_unicodedata.normalize("NFKD", brut).encode("ascii", "ignore").decode("ascii")
     corps = re.sub(r"[^a-z0-9]+", "-", sans_accent.lower()).strip("-")
     hash8 = hashlib.sha1(brut.encode("utf-8")).hexdigest()[:8]
@@ -30098,13 +30109,8 @@ def slug_depuis_nom(nom_archive: str) -> str:
 
 
 def titre_depuis_nom(nom_archive: str) -> str:
-    """Titre Kaggle : 'AX ' + nom d'archive assaini. Kaggle refuse '@' (Invalid title) : on retire un
-    '.com' final, '@' devient '_' et tout autre caractere hors lettres/chiffres/espace/_/- devient '_'."""
-    corps = str(nom_archive or "").strip()
-    if corps.lower().endswith(".com"):
-        corps = corps[:-4]
-    corps = re.sub(r"[^A-Za-z0-9 _-]", "_", corps.replace("@", "_"))
-    titre = ("AX " + corps)[:KAGGLE_TITRE_MAX].rstrip()
+    """Titre Kaggle : 'AX ' + nom canonique (voir nom_canonique)."""
+    titre = ("AX " + nom_canonique(nom_archive))[:KAGGLE_TITRE_MAX].rstrip()
     if len(titre) < KAGGLE_TITRE_MIN:
         titre = (titre + " profil")[:KAGGLE_TITRE_MAX]
     return titre

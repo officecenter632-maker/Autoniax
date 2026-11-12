@@ -33,7 +33,11 @@ def leve(exc, f):
 
 # ---- nommage -------------------------------------------------------------
 slug = ns["slug_depuis_nom"]
-ok(slug("Jean.Dupont@Gmail.com") == "ax-jean-dupont-gmail-com", "slug email")
+ok(slug("Jean.Dupont@Gmail.com") == "ax-jean-dupont-gmail", "slug email")
+for brut in ("ADRESSE_DU_COMPTE@domaine.com", "Jean.Dupont@Gmail.com", "a@b.com", "x.y+z@mail.fr"):
+    relu = ns["nom_archive_depuis_titre"](ns["titre_depuis_nom"](brut))  # nom relu apres telechargement
+    ok(slug(relu) == slug(brut) and ns["titre_depuis_nom"](relu) == ns["titre_depuis_nom"](brut),
+       f"re-envoi d'un profil restaure : meme dataset ({brut})")
 ok(slug("Élodie  ___ Test") == "ax-elodie-test", "slug accents/tirets fusionnes")
 long = slug("a" * 200)
 ok(len(long) <= 50 and re.fullmatch(r"ax-a+-[0-9a-f]{8}", long), "slug tronque + hash")
@@ -259,17 +263,17 @@ with tempfile.TemporaryDirectory() as tmp:
     api = FauxKaggle()
     g = faire_gestionnaire(api)
     g.authentifier()
-    ok(not g.dataset_existe("mikereichlin/ax-a-b-com"), "dataset inexistant (404)")
+    ok(not g.dataset_existe("mikereichlin/ax-a-b"), "dataset inexistant (404)")
     # 403 au lieu de 404 pour un dataset pas encore cree : tranche via la liste de ses propres datasets
     api.forbidden_au_lieu_de_404 = True
-    ok(not g.dataset_existe("mikereichlin/ax-a-b-com"), "403 sur dataset inexistant : traite comme absent")
+    ok(not g.dataset_existe("mikereichlin/ax-a-b"), "403 sur dataset inexistant : traite comme absent")
     api.forbidden_au_lieu_de_404 = False
 
     # creation, avec etapes de progression et suppression locale apres verification
     etapes = []
     r1 = g.envoyer_profil(str(profils / "Alice"), "a@b.com", nom_local="Alice", email="a@b.com", instance="s1",
                           supprimer_local=True, zipper=zipper, progression=lambda e, p: etapes.append((e, p)))
-    ref = "mikereichlin/ax-a-b-com"
+    ref = "mikereichlin/ax-a-b"
     ok(r1["ok"] and r1["cree"] and "create" in api.appels, "creation du dataset")
     ok(api.datasets[ref]["subtitle"].startswith("ax;cree="), "sous-titre de creation ecrit")
     ok(not (profils / "Alice").exists() and r1["dossier_supprime"], "dossier local supprime apres verification")
@@ -337,27 +341,27 @@ with tempfile.TemporaryDirectory() as tmp:
 
     # liste + quota
     liste = g.lister_datasets()
-    ok({d["slug"] for d in liste} >= {"ax-a-b-com", "ax-bob-x-com"} and all(d["slug"].startswith("ax-") for d in liste),
+    ok({d["slug"] for d in liste} >= {"ax-a-b", "ax-bob-x"} and all(d["slug"].startswith("ax-") for d in liste),
        "liste filtree sur le prefixe ax-")
-    a = next(d for d in liste if d["slug"] == "ax-a-b-com")
+    a = next(d for d in liste if d["slug"] == "ax-a-b")
     ok(a["nom_archive"] == "a_b" and a["cree_le"] and a["prive"], "champs du listing")
     ok(g.quota_utilise_octets(liste) == sum(d["taille_octets"] for d in liste), "quota")
 
     # telechargement
     cible = Path(tmp) / "recu"
-    r4 = g.telecharger_profil("ax-a-b-com", str(cible), "a@b.com", "a@b.com")
+    r4 = g.telecharger_profil("ax-a-b", str(cible), "a@b.com", "a@b.com")
     ok(r4["ok"] and (cible / "a@b.com" / "Default" / "Cookies").read_text() == "cookie", "telechargement + extraction")
     ok(ns["lire_origines_kaggle"](str(cible)) == {"a@b.com": "a@b.com"}, "_kaggle_origine.json ecrit")
     (cible / "a@b.com" / "vieux").write_text("v")
-    g.telecharger_profil("ax-a-b-com", str(cible), "a@b.com", "a@b.com")
+    g.telecharger_profil("ax-a-b", str(cible), "a@b.com", "a@b.com")
     ok(not (cible / "a@b.com" / "vieux").exists(), "ecrasement d'un profil du meme nom")
 
     # 404 sur le telechargement du dataset complet : repli fichier par fichier ; nom d'archive derive du titre (a_b)
     api.bundle_404 = True
-    r4b = g.telecharger_profil("ax-a-b-com", str(cible), "repli", "a_b")
+    r4b = g.telecharger_profil("ax-a-b", str(cible), "repli", "a_b")
     ok(r4b["ok"] and (cible / "repli" / "Default" / "Cookies").read_text() == "cookie", "404 sur le zip complet : repli fichier par fichier")
     api.fichier_par_fichier_interdit = True
-    e = leve(ns["ErreurKaggle"], lambda: g.telecharger_profil("ax-a-b-com", str(cible), "repli2", "a_b"))
+    e = leve(ns["ErreurKaggle"], lambda: g.telecharger_profil("ax-a-b", str(cible), "repli2", "a_b"))
     ok(e is not None and "repli fichier par fichier" in str(e) and "Not found" in str(e), "les deux voies refusees : erreur detaillee (reponse Kaggle incluse)")
     api.bundle_404 = False
     api.fichier_par_fichier_interdit = False
@@ -365,13 +369,13 @@ with tempfile.TemporaryDirectory() as tmp:
     # fichier recu sans extension .zip (repli fichier par fichier) : reconnu par son contenu
     api.bundle_404 = True
     api.nom_sans_extension = True
-    r4c = g.telecharger_profil("ax-a-b-com", str(cible), "sansext", "a_b")
+    r4c = g.telecharger_profil("ax-a-b", str(cible), "sansext", "a_b")
     ok(r4c["ok"] and (cible / "sansext" / "Default" / "Cookies").read_text() == "cookie", "fichier sans extension .zip reconnu")
     api.bundle_404 = False
     api.nom_sans_extension = False
     # enveloppe Kaggle (zip contenant meta.json + l'archive dont le nom differe du nom deduit du titre)
     api.enveloppe_avec_zip = True
-    r4d = g.telecharger_profil("ax-a-b-com", str(cible), "envel", "a_b")
+    r4d = g.telecharger_profil("ax-a-b", str(cible), "envel", "a_b")
     ok(r4d["ok"] and (cible / "envel" / "Default" / "Cookies").read_text() == "cookie" and not (cible / "envel" / "meta.json").exists(),
        "enveloppe : archive interne retrouvee malgre un nom different")
     api.enveloppe_avec_zip = False
@@ -390,12 +394,12 @@ with tempfile.TemporaryDirectory() as tmp:
         del api.datasets[ref]["fichiers"][f"extra{i}.bin"]
     # archive recue dans un sous-dossier : trouvee quand meme
     api.zip_dans_sous_dossier = True
-    r4e = g.telecharger_profil("ax-a-b-com", str(cible), "sousdos", "a_b")
+    r4e = g.telecharger_profil("ax-a-b", str(cible), "sousdos", "a_b")
     ok(r4e["ok"] and (cible / "sousdos" / "Default" / "Cookies").read_text() == "cookie", "archive dans un sous-dossier trouvee")
     api.zip_dans_sous_dossier = False
     # telechargement qui ne depose rien : erreur de diagnostic complete
     api.telechargement_vide = True
-    e = leve(ns["ErreurKaggle"], lambda: g.telecharger_profil("ax-a-b-com", str(cible), "vide", "a_b"))
+    e = leve(ns["ErreurKaggle"], lambda: g.telecharger_profil("ax-a-b", str(cible), "vide", "a_b"))
     ok(e is not None and "recus : aucun" in str(e) and "voie : dataset complet" in str(e) and "sur Kaggle :" in str(e)
        and "bibliotheque kaggle" in str(e), "aucun fichier recu : diagnostic (voie, recus, fichiers sur Kaggle, version)")
     api.telechargement_vide = False
@@ -407,7 +411,7 @@ with tempfile.TemporaryDirectory() as tmp:
 
     # zip decompresse par Kaggle
     api.zip_decompresse = True
-    r5 = g.telecharger_profil("ax-a-b-com", str(cible), "decomp", "a@b.com")
+    r5 = g.telecharger_profil("ax-a-b", str(cible), "decomp", "a@b.com")
     ok((cible / "decomp" / "contenu.txt").read_text() == "hello", "cas Kaggle qui decompresse")
     api.zip_decompresse = False
 
@@ -416,7 +420,7 @@ with tempfile.TemporaryDirectory() as tmp:
     with zipfile.ZipFile(mal, "w") as z:
         z.writestr("../../evasion.txt", "x")
     api.datasets[ref]["contenu_zip"] = str(mal)
-    e = leve(ns["ErreurKaggle"], lambda: g.telecharger_profil("ax-a-b-com", str(cible), "mal", "a@b.com"))
+    e = leve(ns["ErreurKaggle"], lambda: g.telecharger_profil("ax-a-b", str(cible), "mal", "a@b.com"))
     ok(e is not None and "suspect" in str(e) and not (Path(tmp) / "evasion.txt").exists(), "chemin suspect refuse")
 
     # lecture d'un fichier d'origine corrompu
@@ -451,9 +455,9 @@ with tempfile.TemporaryDirectory() as tmp:
     r = te(g3, str(dp), {"nom_local": "Zed", "nom_archive": "z@y.com"}, True, set(), zipper=zp)
     ok(r[0] is False and "introuvable" in r[1], "dossier introuvable")
     r = te(g3, str(dp), {"nom_local": "Alice", "nom_archive": "alice@x.com", "email": "alice@x.com"}, False, set(), instance="s1", zipper=zp)
-    ok(r[0] is True and (dp / "Alice").exists() and "mikereichlin/ax-alice-x-com" in api3.datasets and "cree" in r[1], "envoi OK sans suppression : dossier conserve")
+    ok(r[0] is True and (dp / "Alice").exists() and "mikereichlin/ax-alice-x" in api3.datasets and "cree" in r[1], "envoi OK sans suppression : dossier conserve")
     r = te(g3, str(dp), {"nom_local": "Alice", "nom_archive": "alice@x.com"}, True, set(), zipper=zp)
-    ok(r[0] is True and not (dp / "Alice").exists() and api3.datasets["mikereichlin/ax-alice-x-com"]["versions"] == 1, "mise a jour + suppression apres verification, une seule version")
+    ok(r[0] is True and not (dp / "Alice").exists() and api3.datasets["mikereichlin/ax-alice-x"]["versions"] == 1, "mise a jour + suppression apres verification, une seule version")
     api3.pannes = 99
     r = te(g3, str(dp), {"nom_local": "Bob", "nom_archive": "bob@x.com"}, True, set(), zipper=zp)
     ok(r[0] is False and (dp / "Bob").exists() and not list(zt.iterdir()), "echec reseau : rien supprime, temporaires nettoyes")
@@ -537,10 +541,10 @@ with tempfile.TemporaryDirectory() as tmp:
     dp = Path(tmp) / "sp"; (dp / "Alice").mkdir(parents=True); (dp / "Alice" / "f.txt").write_text("1")
     zt = Path(tmp) / "z"; zt.mkdir(); zp = faux_zipper_factory(zt)
     ok(ns["traiter_envoi_kaggle"](g4, str(dp), {"nom_local": "Alice", "nom_archive": "alice@x.com"}, False, set(), zipper=zp)[0], "prepa : dataset sur le faux Kaggle")
-    api4.datasets["mikereichlin/ax-alice-x-com"]["contenu_zip"] = str(zp(str(dp / "Alice")))
+    api4.datasets["mikereichlin/ax-alice-x"]["contenu_zip"] = str(zp(str(dp / "Alice")))
     td = ns["traiter_telechargement_kaggle"]
     cible = Path(tmp) / "cible"
-    pr = {"slug": "ax-alice-x-com", "nom_archive": "alice@x.com", "nom_local": "alice@x.com"}
+    pr = {"slug": "ax-alice-x", "nom_archive": "alice@x.com", "nom_local": "alice@x.com"}
     r = td(g4, str(cible), pr, {"alice@x.com"})
     ok(r[0] is False and "en cours d'execution" in r[1] and not cible.exists(), "telechargement refuse si le profil tourne")
     r = td(g4, str(cible), pr, set())
