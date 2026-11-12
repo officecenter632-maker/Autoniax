@@ -15925,6 +15925,12 @@ class ReglagesApp:
     # retombe sur les pondérations par défaut (cf. _POIDS_OUVERTURE_DEFAUT).
     calibration_ouverture_task: dict = field(default_factory=dict)
 
+    # PATCH (Profils Kaggle, phase 1) -- correspondance {nom_profil_local: email}
+    # importee depuis le presse-papiers, persistee pour survivre aux redemarrages.
+    # Date d'import en ISO UTC ("" si jamais importee).
+    kaggle_correspondance_noms: dict = field(default_factory=dict)
+    kaggle_correspondance_date: str = ""
+
     # PATCH (demande explicite utilisateur : "un bouton toggle dans les
     # paramètres qui va désactiver la sortie de cellules quand on a
     # exécuté un notebook... je veux pouvoir bloquer l'affichage de
@@ -16201,6 +16207,8 @@ class ReglagesApp:
             "taille_police_editeur_script": self.taille_police_editeur_script,
             "retour_a_la_ligne_editeur_script": self.retour_a_la_ligne_editeur_script,
             "calibration_ouverture_task": dict(self.calibration_ouverture_task),
+            "kaggle_correspondance_noms": dict(self.kaggle_correspondance_noms),
+            "kaggle_correspondance_date": self.kaggle_correspondance_date,
             "bloquer_sortie_cellules": self.bloquer_sortie_cellules,
             "splash_actif": self.splash_actif,
             "toujours_en_arriere_plan": self.toujours_en_arriere_plan,
@@ -16232,6 +16240,15 @@ class ReglagesApp:
                 for k, v in (d.get("calibration_ouverture_task") or {}).items()
                 if isinstance(v, (int, float)) and v >= 0
             },
+            # RETROCOMPATIBILITE (champs ajoutes apres coup) : repli sur vide si absents ou corrompus.
+            kaggle_correspondance_noms=(
+                {str(k): str(v).strip() for k, v in d["kaggle_correspondance_noms"].items()
+                 if isinstance(v, str) and v.strip()}
+                if isinstance(d.get("kaggle_correspondance_noms"), dict) else {}
+            ),
+            kaggle_correspondance_date=(
+                d["kaggle_correspondance_date"] if isinstance(d.get("kaggle_correspondance_date"), str) else ""
+            ),
             bloquer_sortie_cellules=bool(d.get("bloquer_sortie_cellules", False)),
             splash_actif=d.get("splash_actif", True),
             toujours_en_arriere_plan=bool(d.get("toujours_en_arriere_plan", False)),
@@ -29967,6 +29984,496 @@ class ProfilsLocalScreen(QWidget):
         self._codes_pays_demandes.discard(code_pays)
         self._pixmaps_drapeaux[code_pays] = QPixmap(str(chemin)) if chemin else None
         self._reconstruire_table()
+
+
+# ===========================================================================
+# PROFILS KAGGLE (phase 1) -- DEBUT DU BLOC ISOLE
+# Constantes, nommage, correspondance presse-papiers et GestionnaireKaggle.
+# Aucun appel Kaggle n'est ecrit en dehors de GestionnaireKaggle.
+# Kaggle et Drive restent deux stockages separes : rien ici ne touche a Drive.
+# ===========================================================================
+import unicodedata as _kg_unicodedata
+from datetime import datetime as _kg_datetime, timezone as _kg_timezone
+
+KAGGLE_USERNAME = "mikereichlin"
+KAGGLE_API_TOKEN = "KGAT_af3ac4a714d020b6a4a8034cf1bf8792"  # en dur (decision explicite utilisateur)
+KAGGLE_PAQUET_PIP = "kaggle==2.2.5"  # minimum 1.8.0 ; meme epinglage dans le notebook sAutoniax
+PREFIXE_DATASET = "ax-"
+MAX_TRANSFERTS_SIMULTANES = 3  # global, tous sAutoniax confondus
+NB_TENTATIVES = 3
+DELAIS_TENTATIVES_S = (5, 15, 45)
+DELAI_PRET_KAGGLE_S = 600
+QUOTA_PRIVE_GO = 100  # affichage seulement
+KAGGLE_SLUG_MIN = 6
+KAGGLE_SLUG_MAX = 50  # a confirmer au premier test reel
+KAGGLE_TITRE_MIN = 6
+KAGGLE_TITRE_MAX = 50
+KAGGLE_PREFIXE_SOUS_TITRE = "ax;cree="
+KAGGLE_REGLAGE_CORRESPONDANCE = "kaggle_correspondance_noms"
+
+# Le jeton doit etre dans l'environnement AVANT tout import du paquet kaggle.
+os.environ["KAGGLE_USERNAME"] = KAGGLE_USERNAME
+os.environ["KAGGLE_API_TOKEN"] = KAGGLE_API_TOKEN
+
+_log_kaggle = logging.getLogger("autoniax.kaggle")
+
+
+class ErreurKaggle(Exception):
+    """Erreur metier Kaggle (message destine a etre affiche tel quel)."""
+
+
+class ErreurCorrespondance(ErreurKaggle):
+    """JSON de correspondance invalide : l'ancienne correspondance reste intacte."""
+
+
+def _kaggle_maintenant_iso() -> str:
+    return _kg_datetime.now(_kg_timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ---------------------------------------------------------------------------
+# Nommage
+# ---------------------------------------------------------------------------
+def slug_depuis_nom(nom_archive: str) -> str:
+    """PREFIXE_DATASET + nom transforme : minuscules, accents retires, tout
+    caractere hors a-z0-9 -> '-', tirets consecutifs fusionnes. Au-dela de
+    KAGGLE_SLUG_MAX : troncature + '-' + 8 caracteres de hash. Deterministe."""
+    brut = str(nom_archive or "")
+    sans_accent = _kg_unicodedata.normalize("NFKD", brut).encode("ascii", "ignore").decode("ascii")
+    corps = re.sub(r"[^a-z0-9]+", "-", sans_accent.lower()).strip("-")
+    hash8 = hashlib.sha1(brut.encode("utf-8")).hexdigest()[:8]
+    if not corps:
+        corps = hash8
+    slug = PREFIXE_DATASET + corps
+    if len(slug) > KAGGLE_SLUG_MAX:
+        slug = slug[: KAGGLE_SLUG_MAX - 9].rstrip("-") + "-" + hash8
+    if len(slug) < KAGGLE_SLUG_MIN:
+        slug = (slug + "-" + hash8)[:KAGGLE_SLUG_MAX]
+    return slug
+
+
+def titre_depuis_nom(nom_archive: str) -> str:
+    titre = ("AX " + str(nom_archive or "").strip())[:KAGGLE_TITRE_MAX].rstrip()
+    if len(titre) < KAGGLE_TITRE_MIN:
+        titre = (titre + " profil")[:KAGGLE_TITRE_MAX]
+    return titre
+
+
+def nom_archive_depuis_titre(titre: str) -> str:
+    t = str(titre or "")
+    return t[3:] if t.startswith("AX ") else t
+
+
+def sous_titre_creation(date_iso: Optional[str] = None) -> str:
+    return KAGGLE_PREFIXE_SOUS_TITRE + (date_iso or _kaggle_maintenant_iso())
+
+
+def date_creation_depuis_sous_titre(sous_titre: Optional[str]) -> Optional[str]:
+    s = str(sous_titre or "")
+    if s.startswith(KAGGLE_PREFIXE_SOUS_TITRE):
+        valeur = s[len(KAGGLE_PREFIXE_SOUS_TITRE):].strip()
+        return valeur or None
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Correspondance {nom_profil_local: email} (JSON via presse-papiers)
+# ---------------------------------------------------------------------------
+def valider_correspondance(texte: str) -> tuple:
+    """Parse et valide le JSON. Retourne (correspondance, avertissements) ou
+    leve ErreurCorrespondance. Ne modifie rien."""
+    if texte is None or not str(texte).strip():
+        raise ErreurCorrespondance("Le presse-papiers est vide.")
+    try:
+        donnees = json.loads(texte)
+    except (json.JSONDecodeError, ValueError) as e:
+        raise ErreurCorrespondance(f"JSON invalide : {e}")
+    if not isinstance(donnees, dict):
+        raise ErreurCorrespondance(
+            'Le JSON doit etre un objet { "nom_profil": "email@domaine.com", ... }.')
+    resultat: dict = {}
+    avertissements: list = []
+    for cle, valeur in donnees.items():
+        if not isinstance(cle, str) or not isinstance(valeur, str):
+            raise ErreurCorrespondance(f"Cle ou valeur qui n'est pas une chaine : {cle!r}.")
+        c, v = cle.strip(), valeur.strip()
+        if not c or not v:
+            raise ErreurCorrespondance(f"Cle ou valeur vide : {cle!r} -> {valeur!r}.")
+        if c in resultat:
+            raise ErreurCorrespondance(f"Cle en double apres retrait des espaces : {c!r}.")
+        if "@" not in v:
+            avertissements.append(f"La valeur de {c!r} ne contient pas de '@' : {v!r}.")
+        resultat[c] = v
+    return resultat, avertissements
+
+
+def importer_correspondance(reglages, texte: str) -> tuple:
+    """Import atomique : remplace entierement la correspondance (pas de
+    fusion). En cas d'erreur, l'ancienne correspondance reste intacte."""
+    correspondance, avertissements = valider_correspondance(texte)
+    reglages.kaggle_correspondance_noms = correspondance
+    reglages.kaggle_correspondance_date = _kaggle_maintenant_iso()
+    reglages.save()
+    return correspondance, avertissements
+
+
+def vider_correspondance(reglages) -> None:
+    reglages.kaggle_correspondance_noms = {}
+    reglages.kaggle_correspondance_date = ""
+    reglages.save()
+
+
+def resume_correspondance(reglages) -> tuple:
+    """(libelle, infobulle) pour le bandeau du sous-onglet."""
+    corr = getattr(reglages, "kaggle_correspondance_noms", None) or {}
+    date = getattr(reglages, "kaggle_correspondance_date", "") or ""
+    if not corr:
+        return "Aucune correspondance importee.", ""
+    n = len(corr)
+    libelle = f"{n} correspondance{'s' if n > 1 else ''}, importee{'s' if n > 1 else ''} le {date or '?'}"
+    infobulle = "\n".join(f"{k} -> {v}" for k, v in list(corr.items())[:10])
+    if n > 10:
+        infobulle += f"\n... (+{n - 10})"
+    return libelle, infobulle
+
+
+def resoudre_noms_archive(profils: list, correspondance: dict) -> list:
+    """profils : [{"nom_local": str, "garder_nom": bool, ...}, ...].
+    Retourne une liste (meme ordre) de dicts :
+      {"nom_local", "nom_archive", "slug", "erreur" (str|None)}.
+    - case 'Garder le nom' cochee : nom local ; decochee : valeur du JSON ;
+    - profil absent du JSON avec case decochee : erreur (exclu, signale) ;
+    - deux profils donnant le meme nom d'archive (email) ou le meme slug :
+      TOUS les profils concernes sont bloques ; les autres partent normalement."""
+    correspondance = correspondance or {}
+    sortie: list = []
+    for p in profils:
+        nom_local = str(p.get("nom_local", ""))
+        garder = bool(p.get("garder_nom", False))
+        erreur = None
+        if garder:
+            nom_archive = nom_local
+        else:
+            nom_archive = (correspondance.get(nom_local) or "").strip()
+            if not nom_archive:
+                erreur = "Absent de la correspondance (case 'Garder le nom' decochee)."
+        if not erreur and not nom_archive:
+            erreur = "Nom d'archive vide."
+        sortie.append({"nom_local": nom_local, "nom_archive": nom_archive,
+                       "slug": slug_depuis_nom(nom_archive) if not erreur else "", "erreur": erreur})
+    # doublons de nom d'archive (email) et collisions d'identifiant
+    par_nom: dict = {}
+    par_slug: dict = {}
+    for i, r in enumerate(sortie):
+        if r["erreur"]:
+            continue
+        par_nom.setdefault(r["nom_archive"].lower(), []).append(i)
+        par_slug.setdefault(r["slug"], []).append(i)
+    for indices in par_nom.values():
+        if len(indices) > 1:
+            for i in indices:
+                sortie[i]["erreur"] = f"Meme nom d'archive / email que : {', '.join(sortie[j]['nom_local'] for j in indices if j != i)}."
+    for indices in par_slug.values():
+        if len(indices) > 1:
+            for i in indices:
+                if not sortie[i]["erreur"]:
+                    sortie[i]["erreur"] = f"Collision d'identifiant Kaggle avec : {', '.join(sortie[j]['nom_local'] for j in indices if j != i)}."
+    return sortie
+
+
+# ---------------------------------------------------------------------------
+# Archive : extraction sure (refus des chemins suspects)
+# ---------------------------------------------------------------------------
+def _kaggle_extraire_zip_sur(chemin_zip: str, dossier_dest: str) -> None:
+    racine = os.path.realpath(dossier_dest)
+    with zipfile.ZipFile(chemin_zip) as z:
+        for info in z.infolist():
+            cible = os.path.realpath(os.path.join(racine, info.filename))
+            if cible != racine and not cible.startswith(racine + os.sep):
+                raise ErreurKaggle(f"Archive refusee : chemin suspect {info.filename!r}.")
+        z.extractall(racine)
+
+
+# ---------------------------------------------------------------------------
+# GestionnaireKaggle : la "zone de script". Concu pour etre appele HORS thread Qt.
+# ---------------------------------------------------------------------------
+class GestionnaireKaggle:
+    def __init__(self, api=None, fabrique_api=None, pause=None):
+        self._api = api
+        self._fabrique_api = fabrique_api
+        self._pause = pause or time.sleep
+
+    # -- connexion ---------------------------------------------------------
+    def authentifier(self):
+        if self._api is not None:
+            return self._api
+        if self._fabrique_api is not None:
+            api = self._fabrique_api()
+        else:
+            os.environ["KAGGLE_USERNAME"] = KAGGLE_USERNAME
+            os.environ["KAGGLE_API_TOKEN"] = KAGGLE_API_TOKEN
+            from kaggle.api.kaggle_api_extended import KaggleApi
+            api = KaggleApi()
+        api.authenticate()
+        self._api = api
+        return api
+
+    @staticmethod
+    def ref(slug: str) -> str:
+        return f"{KAGGLE_USERNAME}/{slug}"
+
+    # -- utilitaires -------------------------------------------------------
+    def _avec_tentatives(self, libelle: str, fonction):
+        derniere = None
+        for n in range(1, NB_TENTATIVES + 1):
+            try:
+                return fonction()
+            except ErreurCorrespondance:
+                raise
+            except Exception as e:
+                derniere = e
+                _log_kaggle.warning("%s : tentative %d/%d echouee : %r", libelle, n, NB_TENTATIVES, e)
+                if n < NB_TENTATIVES:
+                    self._pause(DELAIS_TENTATIVES_S[min(n - 1, len(DELAIS_TENTATIVES_S) - 1)])
+        raise ErreurKaggle(f"{libelle} : echec apres {NB_TENTATIVES} tentatives ({derniere}).")
+
+    # -- lecture -----------------------------------------------------------
+    def dataset_existe(self, ref: str) -> bool:
+        api = self.authentifier()
+        try:
+            api.dataset_status(ref)
+            return True
+        except Exception as e:
+            code = getattr(getattr(e, "response", None), "status_code", None)
+            if code == 404 or "404" in str(e) or "not found" in str(e).lower():
+                return False
+            raise
+
+    def lister_datasets(self) -> list:
+        """Datasets ax- du compte : [{ref, slug, nom_archive, titre, taille_octets,
+        cree_le (ISO|None), maj_le (str|None), prive}]."""
+        api = self.authentifier()
+        sortie: list = []
+        vus: set = set()
+        page = 1
+        while page <= 50:
+            lot = api.dataset_list(user=KAGGLE_USERNAME, mine=True, page=page) or []
+            nouveaux = 0
+            for d in lot:
+                ref = str(getattr(d, "ref", "") or "")
+                slug = ref.split("/")[-1]
+                if not slug.startswith(PREFIXE_DATASET) or ref in vus:
+                    continue
+                vus.add(ref)
+                nouveaux += 1
+                titre = str(getattr(d, "title", "") or "")
+                maj = getattr(d, "last_updated", None)
+                sortie.append({
+                    "ref": ref, "slug": slug, "titre": titre,
+                    "nom_archive": nom_archive_depuis_titre(titre),
+                    "taille_octets": int(getattr(d, "total_bytes", 0) or 0),
+                    "cree_le": date_creation_depuis_sous_titre(getattr(d, "subtitle", None)),
+                    "maj_le": str(maj) if maj is not None else None,
+                    "prive": bool(getattr(d, "is_private", True)),
+                })
+            if not lot:
+                break
+            page += 1
+        return sortie
+
+    @staticmethod
+    def quota_utilise_octets(datasets: list) -> int:
+        return sum(int(d.get("taille_octets", 0)) for d in datasets)
+
+    def _fichiers_dataset(self, ref: str) -> list:
+        api = self.authentifier()
+        rep = api.dataset_list_files(ref)
+        fichiers = getattr(rep, "dataset_files", None)
+        if fichiers is None:
+            fichiers = getattr(rep, "files", None) or []
+        return [(str(getattr(f, "name", "")), int(getattr(f, "total_bytes", 0) or 0)) for f in fichiers]
+
+    # -- envoi -------------------------------------------------------------
+    def envoyer_profil(self, chemin_dossier: str, nom_archive: str, nom_local: str = "",
+                       email: str = "", instance: str = "", supprimer_local: bool = False,
+                       zipper=None, progression=None) -> dict:
+        """Zippe, cree/met a jour le dataset prive (une seule version conservee),
+        attend que Kaggle soit pret, verifie le fichier, puis (si demande)
+        supprime le dossier local -- UNIQUEMENT apres verification. Les fichiers
+        temporaires sont toujours nettoyes. Rien n'est supprime en cas d'echec."""
+        prog = progression or (lambda etape, pct: None)
+        zipper = zipper or globals().get("_zipper_dossier_profil")
+        if zipper is None:
+            raise ErreurKaggle("Fonction d'archivage indisponible.")
+        slug = slug_depuis_nom(nom_archive)
+        ref = self.ref(slug)
+        temp = tempfile.mkdtemp(prefix="ax_kaggle_")
+        zip_source = None
+        try:
+            prog("Archivage", 5)
+            zip_source = Path(zipper(chemin_dossier))
+            nom_zip = f"{nom_archive}.zip"
+            shutil.copyfile(str(zip_source), os.path.join(temp, nom_zip))
+            taille = os.path.getsize(os.path.join(temp, nom_zip))
+            date_envoi = _kaggle_maintenant_iso()
+            meta = {"nom_archive": nom_archive, "nom_local_origine": nom_local or os.path.basename(chemin_dossier),
+                    "taille": taille, "date_envoi_utc": date_envoi, "instance": instance}
+            with open(os.path.join(temp, "meta.json"), "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False)
+            description = json.dumps({"nom_archive": nom_archive, "nom_local": meta["nom_local_origine"],
+                                      "email": email, "instance": instance}, ensure_ascii=False, separators=(",", ":"))
+            prog("Preparation", 15)
+            existe = self._avec_tentatives(f"Verification de {ref}", lambda: self.dataset_existe(ref))
+            metadonnees = {"id": ref, "title": titre_depuis_nom(nom_archive),
+                           "licenses": [{"name": "other"}], "description": description}
+            if not existe:
+                metadonnees["subtitle"] = sous_titre_creation(date_envoi)
+            else:
+                # la date de creation vit dans le sous-titre existant : on la conserve, jamais ecrasee
+                existant = next((d for d in self.lister_datasets() if d["ref"] == ref), None)
+                if existant and existant.get("cree_le"):
+                    metadonnees["subtitle"] = sous_titre_creation(existant["cree_le"])
+            with open(os.path.join(temp, "dataset-metadata.json"), "w", encoding="utf-8") as f:
+                json.dump(metadonnees, f, ensure_ascii=False)
+            api = self.authentifier()
+            prog("Envoi vers Kaggle", 30)
+            if not existe:
+                def _creer():
+                    rep = api.dataset_create_new(temp, public=False, quiet=True, convert_to_csv=False, dir_mode="skip")
+                    erreur = getattr(rep, "error", "") or ""
+                    if erreur:
+                        raise ErreurKaggle(erreur)
+                    return rep
+                self._avec_tentatives(f"Creation de {ref}", _creer)
+            else:
+                def _maj():
+                    rep = api.dataset_create_version(temp, version_notes=f"maj {date_envoi}", quiet=True,
+                                                     convert_to_csv=False, delete_old_versions=True, dir_mode="skip")
+                    erreur = getattr(rep, "error", "") or ""
+                    if erreur:
+                        raise ErreurKaggle(erreur)
+                    return rep
+                self._avec_tentatives(f"Mise a jour de {ref}", _maj)
+            prog("Attente Kaggle", 70)
+            self._attendre_pret(ref)
+            prog("Verification", 90)
+            self._verifier_fichier(ref, nom_zip, taille)
+            supprime = False
+            if supprimer_local:
+                shutil.rmtree(chemin_dossier)
+                supprime = True
+            prog("Termine", 100)
+            return {"ok": True, "ref": ref, "slug": slug, "cree": not existe, "taille": taille,
+                    "dossier_supprime": supprime}
+        finally:
+            shutil.rmtree(temp, ignore_errors=True)
+            try:
+                if zip_source is not None and os.path.exists(str(zip_source)):
+                    os.remove(str(zip_source))
+            except OSError:
+                pass
+
+    def _attendre_pret(self, ref: str) -> None:
+        api = self.authentifier()
+        debut = time.monotonic()
+        statut = ""
+        while True:
+            statut = str(api.dataset_status(ref)).lower()
+            if statut.endswith("ready"):
+                return
+            if "error" in statut or "fail" in statut:
+                raise ErreurKaggle(f"Kaggle a refuse le traitement de {ref} (statut '{statut}').")
+            if time.monotonic() - debut > DELAI_PRET_KAGGLE_S:
+                raise ErreurKaggle(f"Kaggle n'a pas termine le traitement de {ref} en {DELAI_PRET_KAGGLE_S}s (statut '{statut}').")
+            self._pause(min(5, max(0.01, DELAI_PRET_KAGGLE_S / 100)))
+
+    def _verifier_fichier(self, ref: str, nom_zip: str, taille: int) -> None:
+        fichiers = self._avec_tentatives(f"Liste des fichiers de {ref}", lambda: self._fichiers_dataset(ref))
+        for nom, t in fichiers:
+            if nom == nom_zip:
+                if t != taille:
+                    raise ErreurKaggle(f"Taille inattendue sur Kaggle pour {nom_zip} : {t} au lieu de {taille}.")
+                return
+        # Kaggle peut avoir decompresse le zip : on accepte s'il reste du contenu autre que meta.json
+        if any(nom != "meta.json" for nom, _ in fichiers):
+            return
+        raise ErreurKaggle(f"Fichier {nom_zip} absent de {ref} apres l'envoi.")
+
+    # -- telechargement ----------------------------------------------------
+    def telecharger_profil(self, slug: str, dossier_profils: str, nom_local: str,
+                           nom_archive: str, progression=None) -> dict:
+        """Telecharge le dataset, extrait (zip conserve OU decompresse par Kaggle),
+        ecrase un profil du meme nom, note l'origine dans _kaggle_origine.json."""
+        prog = progression or (lambda etape, pct: None)
+        ref = self.ref(slug)
+        api = self.authentifier()
+        temp = tempfile.mkdtemp(prefix="ax_kaggle_dl_")
+        try:
+            prog("Telechargement", 10)
+            self._avec_tentatives(f"Telechargement de {ref}",
+                                  lambda: api.dataset_download_files(ref, path=temp, force=True, quiet=True, unzip=False))
+            prog("Extraction", 60)
+            zips = [p for p in os.listdir(temp) if p.lower().endswith(".zip")]
+            attendu = f"{nom_archive}.zip"
+            extrait = os.path.join(temp, "_extrait")
+            os.makedirs(extrait, exist_ok=True)
+            if attendu in zips:
+                _kaggle_extraire_zip_sur(os.path.join(temp, attendu), extrait)
+            elif zips:
+                _kaggle_extraire_zip_sur(os.path.join(temp, zips[0]), extrait)  # enveloppe Kaggle
+                interne = os.path.join(extrait, attendu)
+                if os.path.isfile(interne):
+                    sous = os.path.join(temp, "_interne")
+                    os.makedirs(sous, exist_ok=True)
+                    _kaggle_extraire_zip_sur(interne, sous)
+                    shutil.rmtree(extrait)
+                    extrait = sous
+            else:
+                raise ErreurKaggle(f"Aucune archive trouvee dans {ref}.")
+            cible = os.path.join(dossier_profils, nom_local)
+            os.makedirs(dossier_profils, exist_ok=True)
+            if os.path.exists(cible):
+                shutil.rmtree(cible)
+            shutil.move(extrait, cible)
+            origine_chemin = os.path.join(dossier_profils, "_kaggle_origine.json")
+            try:
+                with open(origine_chemin, encoding="utf-8") as f:
+                    origine = json.load(f)
+                if not isinstance(origine, dict):
+                    origine = {}
+            except (OSError, ValueError):
+                origine = {}
+            origine[nom_local] = nom_archive
+            with open(origine_chemin, "w", encoding="utf-8") as f:
+                json.dump(origine, f, ensure_ascii=False, indent=2)
+            prog("Termine", 100)
+            return {"ok": True, "ref": ref, "nom_local": nom_local, "chemin": cible}
+        finally:
+            shutil.rmtree(temp, ignore_errors=True)
+
+
+def lire_origines_kaggle(dossier_profils: str) -> dict:
+    """{nom_local: nom_archive_kaggle} -- sert a cocher 'Garder le nom'."""
+    try:
+        with open(os.path.join(dossier_profils, "_kaggle_origine.json"), encoding="utf-8") as f:
+            d = json.load(f)
+        return {str(k): str(v) for k, v in d.items()} if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def repartir_equitablement(items: list, ids_sautoniax: list) -> dict:
+    """Tourniquet dans l'ordre d'affichage ; sAutoniax tries de facon stable
+    par identifiant (10 profils sur 3 sAutoniax -> 4, 3, 3)."""
+    ids = sorted(ids_sautoniax)
+    if not ids:
+        return {}
+    repartition: dict = {i: [] for i in ids}
+    for n, item in enumerate(items):
+        repartition[ids[n % len(ids)]].append(item)
+    return repartition
+# ===========================================================================
+# PROFILS KAGGLE (phase 1) -- FIN DU BLOC ISOLE
+# ===========================================================================
 
 
 class ProfilsScreen(QWidget):
