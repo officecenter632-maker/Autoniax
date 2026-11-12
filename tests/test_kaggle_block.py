@@ -193,7 +193,7 @@ class FauxKaggle:
             raise ValueError("Cannot specify both mine and a user")
         if page > 1:
             return []
-        return [Obj(ref=r, title=d["title"], subtitle=d["subtitle"], total_bytes=sum(d["fichiers"].values()),
+        return [Obj(ref=r, title=d["title"], subtitle=d["subtitle"], total_bytes=(0 if getattr(self, "taille_liste_zero", False) else sum(d["fichiers"].values())),
                     last_updated=d["maj"], is_private=True) for r, d in self.datasets.items()] + \
                [Obj(ref="mikereichlin/autre-projet", title="Autre", subtitle="", total_bytes=1, last_updated=None, is_private=True)]
     def dataset_list_files(self, ref, **kw):
@@ -210,6 +210,13 @@ class FauxKaggle:
             e.response = Obj(status_code=404)
             raise e
         d = self.datasets[ref]
+        if getattr(self, "telechargement_vide", False):
+            return
+        if getattr(self, "zip_dans_sous_dossier", False):
+            arch = [n for n in d["fichiers"] if n.endswith(".zip")][0]
+            os.makedirs(os.path.join(path, "sous"), exist_ok=True)
+            shutil.copyfile(d["contenu_zip"], os.path.join(path, "sous", arch))
+            return
         if getattr(self, "enveloppe_avec_zip", False):
             arch = [n for n in d["fichiers"] if n.endswith(".zip")][0]
             with zipfile.ZipFile(os.path.join(path, "enveloppe.zip"), "w") as z:
@@ -363,6 +370,23 @@ with tempfile.TemporaryDirectory() as tmp:
     ok(r4d["ok"] and (cible / "envel" / "Default" / "Cookies").read_text() == "cookie" and not (cible / "envel" / "meta.json").exists(),
        "enveloppe : archive interne retrouvee malgre un nom different")
     api.enveloppe_avec_zip = False
+
+    # archive recue dans un sous-dossier : trouvee quand meme
+    api.zip_dans_sous_dossier = True
+    r4e = g.telecharger_profil("ax-a-b-com", str(cible), "sousdos", "a_b")
+    ok(r4e["ok"] and (cible / "sousdos" / "Default" / "Cookies").read_text() == "cookie", "archive dans un sous-dossier trouvee")
+    api.zip_dans_sous_dossier = False
+    # telechargement qui ne depose rien : erreur de diagnostic complete
+    api.telechargement_vide = True
+    e = leve(ns["ErreurKaggle"], lambda: g.telecharger_profil("ax-a-b-com", str(cible), "vide", "a_b"))
+    ok(e is not None and "recus : aucun" in str(e) and "voie : dataset complet" in str(e) and "sur Kaggle :" in str(e)
+       and "bibliotheque kaggle" in str(e), "aucun fichier recu : diagnostic (voie, recus, fichiers sur Kaggle, version)")
+    api.telechargement_vide = False
+    # taille absente de la liste des datasets : lue dans la liste des fichiers
+    api.taille_liste_zero = True
+    liste0 = g.lister_datasets()
+    ok(liste0 and all(d["taille_octets"] > 0 for d in liste0), "taille 0 dans la liste : relue via la liste des fichiers")
+    api.taille_liste_zero = False
 
     # zip decompresse par Kaggle
     api.zip_decompresse = True

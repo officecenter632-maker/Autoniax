@@ -30366,10 +30366,17 @@ class GestionnaireKaggle:
                 nouveaux += 1
                 titre = str(getattr(d, "title", "") or "")
                 maj = getattr(d, "last_updated", None)
+                taille = int(getattr(d, "total_bytes", 0) or 0)
+                if taille <= 0:
+                    # la liste des datasets ne donne pas toujours la taille : on la lit dans la liste des fichiers
+                    try:
+                        taille = sum(t for _, t in self._fichiers_dataset(ref))
+                    except Exception:
+                        taille = 0
                 sortie.append({
                     "ref": ref, "slug": slug, "titre": titre,
                     "nom_archive": nom_archive_depuis_titre(titre),
-                    "taille_octets": int(getattr(d, "total_bytes", 0) or 0),
+                    "taille_octets": taille,
                     "cree_le": date_creation_depuis_sous_titre(getattr(d, "subtitle", None)),
                     "maj_le": str(maj) if maj is not None else None,
                     "prive": bool(getattr(d, "is_private", True)),
@@ -30541,6 +30548,7 @@ class GestionnaireKaggle:
         """Telecharge le dataset dans temp. Si l'envoi 'dataset complet' est refuse (404/403, cas observe
         avec certains jetons), repli : telechargement des fichiers du dataset un par un."""
         api = self.authentifier()
+        self._voie_telechargement = "dataset complet"
         try:
             api.dataset_download_files(ref, path=temp, force=True, quiet=True, unzip=False)
             return
@@ -30551,11 +30559,46 @@ class GestionnaireKaggle:
         noms = [n for n, _ in self._fichiers_dataset(ref) if n != "meta.json"]
         if not noms:
             raise premiere
+        self._voie_telechargement = f"fichier par fichier ({', '.join(noms)})"
         try:
             for nom in noms:
                 api.dataset_download_file(ref, nom, path=temp, force=True, quiet=True)
         except Exception as e2:
             raise ErreurKaggle(f"{self._detail_erreur(premiere)} ; repli fichier par fichier : {self._detail_erreur(e2)}")
+
+    @staticmethod
+    def _inventaire_dossier(racine: str, limite: int = 25) -> list:
+        """['chemin/relatif (taille o)', ...] de tout ce qui se trouve sous racine (fichiers et dossiers)."""
+        sortie = []
+        for dossier, sous_dossiers, fichiers in os.walk(racine):
+            for nom in sorted(sous_dossiers):
+                sortie.append(os.path.relpath(os.path.join(dossier, nom), racine) + "/")
+            for nom in sorted(fichiers):
+                chemin = os.path.join(dossier, nom)
+                try:
+                    taille = os.path.getsize(chemin)
+                except OSError:
+                    taille = -1
+                sortie.append(f"{os.path.relpath(chemin, racine)} ({taille} o)")
+        sortie.sort()
+        if len(sortie) > limite:
+            sortie = sortie[:limite] + [f"... (+{len(sortie) - limite})"]
+        return sortie
+
+    def _diagnostic_aucune_archive(self, ref: str, temp: str) -> str:
+        try:
+            sur_kaggle = [f"{n} ({t} o)" for n, t in self._fichiers_dataset(ref)][:25]
+        except Exception as e:
+            sur_kaggle = [f"liste impossible : {e}"]
+        try:
+            from importlib.metadata import version as _version
+            version_kaggle = _version("kaggle")
+        except Exception:
+            version_kaggle = "inconnue"
+        recus = self._inventaire_dossier(temp)
+        return (f"Aucune archive trouvee dans {ref} | voie : {getattr(self, '_voie_telechargement', '?')} | "
+                f"recus : {', '.join(recus) or 'aucun'} | sur Kaggle : {', '.join(sur_kaggle) or 'aucun fichier'} | "
+                f"bibliotheque kaggle : {version_kaggle}")
 
     def telecharger_profil(self, slug: str, dossier_profils: str, nom_local: str,
                            nom_archive: str, progression=None) -> dict:
@@ -30569,17 +30612,18 @@ class GestionnaireKaggle:
             prog("Telechargement", 10)
             self._avec_tentatives(f"Telechargement de {ref}", lambda: self._telecharger_dans(ref, temp))
             prog("Extraction", 60)
-            recus = sorted(p for p in os.listdir(temp) if os.path.isfile(os.path.join(temp, p)))
-            # archive = fichier .zip OU fichier dont le contenu est un zip (le nom recu peut ne pas avoir d'extension)
+            recus = sorted(os.path.relpath(os.path.join(d, f), temp) for d, _, fs in os.walk(temp) for f in fs)
+            # archive = fichier .zip OU fichier dont le contenu est un zip (le nom recu peut ne pas avoir d'extension),
+            # a la racine ou dans un sous-dossier
             zips = [p for p in recus if p.lower().endswith(".zip") or zipfile.is_zipfile(os.path.join(temp, p))]
             if not zips:
-                raise ErreurKaggle(f"Aucune archive trouvee dans {ref} (fichiers recus : {', '.join(recus) or 'aucun'}).")
+                raise ErreurKaggle(self._diagnostic_aucune_archive(ref, temp))
             attendu = f"{nom_archive}.zip"
-            choisi = attendu if attendu in zips else zips[0]
+            choisi = next((p for p in zips if os.path.basename(p) == attendu), zips[0])
             extrait = os.path.join(temp, "_extrait")
             os.makedirs(extrait, exist_ok=True)
             _kaggle_extraire_zip_sur(os.path.join(temp, choisi), extrait)
-            if choisi != attendu:
+            if os.path.basename(choisi) != attendu:
                 # enveloppe Kaggle : l'archive du profil est dedans (son nom peut differer du nom deduit du titre)
                 interne = os.path.join(extrait, attendu)
                 if not os.path.isfile(interne):
