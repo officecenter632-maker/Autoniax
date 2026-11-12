@@ -30525,6 +30525,38 @@ class GestionnaireKaggle:
         raise ErreurKaggle(f"Fichier {nom_zip} absent de {ref} apres l'envoi.")
 
     # -- telechargement ----------------------------------------------------
+    @staticmethod
+    def _est_404(e: Exception) -> bool:
+        code = getattr(getattr(e, "response", None), "status_code", None)
+        return code == 404 or "404" in str(e) or "not found" in str(e).lower()
+
+    @staticmethod
+    def _detail_erreur(e: Exception) -> str:
+        """Message de l'erreur + debut de la reponse HTTP de Kaggle si elle existe (diagnostic)."""
+        texte = str(e)
+        corps = str(getattr(getattr(e, "response", None), "text", "") or "").strip().replace("\n", " ")[:300]
+        return f"{texte} | reponse : {corps}" if corps and corps not in texte else texte
+
+    def _telecharger_dans(self, ref: str, temp: str) -> None:
+        """Telecharge le dataset dans temp. Si l'envoi 'dataset complet' est refuse (404/403, cas observe
+        avec certains jetons), repli : telechargement des fichiers du dataset un par un."""
+        api = self.authentifier()
+        try:
+            api.dataset_download_files(ref, path=temp, force=True, quiet=True, unzip=False)
+            return
+        except Exception as e1:
+            if not (self._est_404(e1) or self._est_403(e1)):
+                raise
+            premiere = e1
+        noms = [n for n, _ in self._fichiers_dataset(ref) if n != "meta.json"]
+        if not noms:
+            raise premiere
+        try:
+            for nom in noms:
+                api.dataset_download_file(ref, nom, path=temp, force=True, quiet=True)
+        except Exception as e2:
+            raise ErreurKaggle(f"{self._detail_erreur(premiere)} ; repli fichier par fichier : {self._detail_erreur(e2)}")
+
     def telecharger_profil(self, slug: str, dossier_profils: str, nom_local: str,
                            nom_archive: str, progression=None) -> dict:
         """Telecharge le dataset, extrait (zip conserve OU decompresse par Kaggle),
@@ -30535,8 +30567,7 @@ class GestionnaireKaggle:
         temp = tempfile.mkdtemp(prefix="ax_kaggle_dl_")
         try:
             prog("Telechargement", 10)
-            self._avec_tentatives(f"Telechargement de {ref}",
-                                  lambda: api.dataset_download_files(ref, path=temp, force=True, quiet=True, unzip=False))
+            self._avec_tentatives(f"Telechargement de {ref}", lambda: self._telecharger_dans(ref, temp))
             prog("Extraction", 60)
             zips = [p for p in os.listdir(temp) if p.lower().endswith(".zip")]
             attendu = f"{nom_archive}.zip"

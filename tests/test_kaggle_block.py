@@ -198,7 +198,17 @@ class FauxKaggle:
                [Obj(ref="mikereichlin/autre-projet", title="Autre", subtitle="", total_bytes=1, last_updated=None, is_private=True)]
     def dataset_list_files(self, ref, **kw):
         return Obj(dataset_files=[Obj(name=n, total_bytes=t) for n, t in self.datasets[ref]["fichiers"].items()])
+    def dataset_download_file(self, ref, file_name, path=None, force=False, quiet=True, **kw):
+        if getattr(self, "fichier_par_fichier_interdit", False):
+            e = Exception("404 Client Error: Not Found for url: https://api.kaggle.com/v1/datasets.DatasetApiService/DownloadDataset")
+            e.response = Obj(status_code=404, text='{"code":5,"message":"Not found"}')
+            raise e
+        shutil.copyfile(self.datasets[ref]["contenu_zip"], os.path.join(path, file_name))
     def dataset_download_files(self, ref, path=None, force=False, quiet=True, unzip=False, **kw):
+        if getattr(self, "bundle_404", False):
+            e = Exception("404 Client Error: Not Found for url: https://api.kaggle.com/v1/datasets.DatasetApiService/DownloadDataset")
+            e.response = Obj(status_code=404)
+            raise e
         d = self.datasets[ref]
         if self.zip_decompresse:
             with zipfile.ZipFile(os.path.join(path, "enveloppe.zip"), "w") as z:
@@ -323,6 +333,16 @@ with tempfile.TemporaryDirectory() as tmp:
     (cible / "a@b.com" / "vieux").write_text("v")
     g.telecharger_profil("ax-a-b-com", str(cible), "a@b.com", "a@b.com")
     ok(not (cible / "a@b.com" / "vieux").exists(), "ecrasement d'un profil du meme nom")
+
+    # 404 sur le telechargement du dataset complet : repli fichier par fichier ; nom d'archive derive du titre (a_b)
+    api.bundle_404 = True
+    r4b = g.telecharger_profil("ax-a-b-com", str(cible), "repli", "a_b")
+    ok(r4b["ok"] and (cible / "repli" / "Default" / "Cookies").read_text() == "cookie", "404 sur le zip complet : repli fichier par fichier")
+    api.fichier_par_fichier_interdit = True
+    e = leve(ns["ErreurKaggle"], lambda: g.telecharger_profil("ax-a-b-com", str(cible), "repli2", "a_b"))
+    ok(e is not None and "repli fichier par fichier" in str(e) and "Not found" in str(e), "les deux voies refusees : erreur detaillee (reponse Kaggle incluse)")
+    api.bundle_404 = False
+    api.fichier_par_fichier_interdit = False
 
     # zip decompresse par Kaggle
     api.zip_decompresse = True
