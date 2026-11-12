@@ -30103,6 +30103,12 @@ def valider_correspondance(texte: str) -> tuple:
         if "@" not in v:
             avertissements.append(f"La valeur de {c!r} ne contient pas de '@' : {v!r}.")
         resultat[c] = v
+    vus: dict = {}
+    for c, v in resultat.items():
+        vus.setdefault(v.lower(), []).append(c)
+    for v, noms in vus.items():
+        if len(noms) > 1:
+            avertissements.append(f"Meme valeur pour plusieurs profils ({', '.join(noms)}) : {v!r}.")
     return resultat, avertissements
 
 
@@ -30110,9 +30116,14 @@ def importer_correspondance(reglages, texte: str) -> tuple:
     """Import atomique : remplace entierement la correspondance (pas de
     fusion). En cas d'erreur, l'ancienne correspondance reste intacte."""
     correspondance, avertissements = valider_correspondance(texte)
+    anciens = (reglages.kaggle_correspondance_noms, reglages.kaggle_correspondance_date)
     reglages.kaggle_correspondance_noms = correspondance
     reglages.kaggle_correspondance_date = _kaggle_maintenant_iso()
-    reglages.save()
+    try:
+        reglages.save()
+    except Exception as e:
+        reglages.kaggle_correspondance_noms, reglages.kaggle_correspondance_date = anciens
+        raise ErreurCorrespondance(f"Impossible d'enregistrer la correspondance : {e}")
     return correspondance, avertissements
 
 
@@ -30471,9 +30482,689 @@ def repartir_equitablement(items: list, ids_sautoniax: list) -> dict:
     for n, item in enumerate(items):
         repartition[ids[n % len(ids)]].append(item)
     return repartition
+# ---------------------------------------------------------------------------
+# Aides pures du sous-onglet (phase 2) : formats, tri, planification d'envoi
+# ---------------------------------------------------------------------------
+def formater_taille_octets(octets) -> str:
+    try:
+        n = float(octets)
+    except (TypeError, ValueError):
+        return "?"
+    for unite in ("o", "Ko", "Mo", "Go", "To"):
+        if n < 1024 or unite == "To":
+            return f"{int(n)} {unite}" if unite == "o" else f"{n:.1f} {unite}".replace(".", ",")
+        n /= 1024.0
+    return "?"
+
+
+def formater_horodatage(valeur) -> str:
+    """Epoch (int/float), datetime, ou chaine ISO/Kaggle -> 'AAAA-MM-JJ HH:MM' ('' si inconnu)."""
+    if valeur is None or valeur == "":
+        return ""
+    if isinstance(valeur, (int, float)):
+        try:
+            return _kg_datetime.fromtimestamp(float(valeur)).strftime("%Y-%m-%d %H:%M")
+        except (OverflowError, OSError, ValueError):
+            return ""
+    if isinstance(valeur, _kg_datetime):
+        return valeur.strftime("%Y-%m-%d %H:%M")
+    return str(valeur).replace("T", " ").replace("Z", "").strip()[:16]
+
+
+def cle_tri_date(valeur) -> str:
+    """Cle de tri lexicographique 'AAAA-MM-JJ HH:MM:SS' ('' si inconnu : en dernier)."""
+    if valeur is None or valeur == "":
+        return ""
+    if isinstance(valeur, (int, float)):
+        try:
+            return _kg_datetime.utcfromtimestamp(float(valeur)).strftime("%Y-%m-%d %H:%M:%S")
+        except (OverflowError, OSError, ValueError):
+            return ""
+    if isinstance(valeur, _kg_datetime):
+        return valeur.strftime("%Y-%m-%d %H:%M:%S")
+    return str(valeur).replace("T", " ").replace("Z", "").strip()
+
+
+def trier_datasets(datasets: list, cle: str = "maj") -> list:
+    """Du plus recent au plus ancien, sur la creation ('cree') ou la mise a jour
+    ('maj', defaut). Tri stable ; les dates inconnues passent en dernier."""
+    champ = "cree_le" if cle == "cree" else "maj_le"
+    connus = [d for d in datasets if cle_tri_date(d.get(champ))]
+    inconnus = [d for d in datasets if not cle_tri_date(d.get(champ))]
+    connus.sort(key=lambda d: cle_tri_date(d.get(champ)), reverse=True)
+    return connus + inconnus
+
+
+def planifier_envoi(lignes: list, correspondance: dict) -> list:
+    """lignes : [{"id_executant","nom_executant","nom_local","garder_nom","coche","modifie_ts"}].
+    Retourne (meme ordre) [{"cle","nom_archive","slug","erreur","ignore","avertissement","partira"}].
+    - seules les lignes cochees sont planifiees ;
+    - meme profil (meme nom local) sur plusieurs sAutoniax : seule la copie
+      modifiee le plus recemment est envoyee, les autres sont ignorees (avertissement) ;
+    - puis resolution des noms : absents du JSON, doublons d'email, collisions."""
+    sortie = [{"cle": (l.get("id_executant"), l.get("nom_local")), "nom_archive": "", "slug": "",
+               "erreur": None, "ignore": False, "avertissement": None, "partira": False} for l in lignes]
+    groupes: dict = {}
+    for i, l in enumerate(lignes):
+        if l.get("coche"):
+            groupes.setdefault(l.get("nom_local"), []).append(i)
+    gagnants: list = []
+    for nom_local, indices in groupes.items():
+        gagnant = max(indices, key=lambda i: (float(lignes[i].get("modifie_ts") or 0), -i))
+        gagnants.append(gagnant)
+        if len(indices) > 1:
+            sortie[gagnant]["avertissement"] = (
+                f"Present sur {len(indices)} sAutoniax : seule la copie la plus recente est envoyee.")
+            for i in indices:
+                if i != gagnant:
+                    sortie[i]["ignore"] = True
+                    sortie[i]["avertissement"] = (
+                        f"Copie plus ancienne ignoree (la plus recente est sur {lignes[gagnant].get('nom_executant')}).")
+    gagnants.sort()
+    resolus = resoudre_noms_archive(
+        [{"nom_local": lignes[i]["nom_local"], "garder_nom": lignes[i].get("garder_nom", False)} for i in gagnants],
+        correspondance)
+    for i, r in zip(gagnants, resolus):
+        sortie[i]["nom_archive"] = r["nom_archive"]
+        sortie[i]["slug"] = r["slug"]
+        sortie[i]["erreur"] = r["erreur"]
+        sortie[i]["partira"] = not r["erreur"]
+    return sortie
+
+
+def resume_plan_envoi(plan: list, lignes: list, slugs_existants: Optional[set], supprimer_local: bool) -> dict:
+    """Chiffres du recapitulatif a confirmer. slugs_existants=None : liste Kaggle pas encore chargee."""
+    partants = [p for p in plan if p["partira"]]
+    ids = {lignes[i]["id_executant"] for i, p in enumerate(plan) if p["partira"]}
+    crees = maj = 0
+    if slugs_existants is not None:
+        maj = sum(1 for p in partants if p["slug"] in slugs_existants)
+        crees = len(partants) - maj
+    return {"total": len(partants), "sautoniax": len(ids), "crees": crees, "maj": maj,
+            "inconnus": slugs_existants is None, "bloques": sum(1 for p in plan if p["erreur"]),
+            "ignores": sum(1 for p in plan if p["ignore"]), "supprimer_local": bool(supprimer_local)}
+
+
 # ===========================================================================
 # PROFILS KAGGLE (phase 1) -- FIN DU BLOC ISOLE
 # ===========================================================================
+
+
+class ProfilsKaggleScreen(QWidget):
+    """Sous-onglet "Profils Kaggle" de ProfilsScreen (PATCH, phase 2 -- INTERFACE
+    SEULE, aucun reseau ici : tout passe par des signaux relayes comme les autres
+    ecrans). Kaggle et Drive restent deux stockages separes : "Profils Cloud"
+    (Drive) n'est pas touche.
+
+    Bloc A "Envoyer vers Kaggle" : arbre sAutoniax -> profils (tout coche par
+    defaut), colonnes profil/taille/derniere modification/"Garder le nom"/nom
+    d'archive resultant/etat/progression. Les lignes en erreur de nommage sont
+    en rouge (motif en infobulle). Bloc B "Telecharger depuis Kaggle" : datasets
+    ax-, tri par creation ou mise a jour (du plus recent au plus ancien), liste
+    des sAutoniax connectes cochables, repartition equitable a confirmer.
+
+    Regles d'etat : pendant une operation, tous les boutons d'action sont
+    desactives ; une seule operation Kaggle a la fois. Aucun QTextEdit /
+    QPlainTextEdit : le journal est une QListWidget limitee a 500 lignes."""
+
+    demande_kaggle_verifier_connexion = Signal()
+    demande_kaggle_actualiser_profils = Signal(list)  # ids sAutoniax
+    demande_kaggle_actualiser_datasets = Signal()
+    demande_kaggle_envoyer = Signal(dict)
+    demande_kaggle_telecharger = Signal(dict)
+
+    LIGNES_JOURNAL_MAX = 500
+    COL_PROFIL, COL_TAILLE, COL_MODIF, COL_GARDER, COL_ARCHIVE, COL_ETAT, COL_PROG = range(7)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._reglages = None
+        self._sautoniax: dict = {}               # id_executant -> nom
+        self._profils_par_sautoniax: dict = {}   # id_executant -> [dict profil]
+        self._items: dict = {}                   # (id_executant, nom_local) -> QTreeWidgetItem
+        self._items_sautoniax: dict = {}         # id_executant -> QTreeWidgetItem
+        self._etat_cases: dict = {}              # (id, nom) -> (coche, garder) conserve entre reconstructions
+        self._datasets: list = []
+        self._tri_datasets = "maj"
+        self._operation_id: Optional[str] = None
+        self._deja_affiche = False
+        self._maj_en_cours = False
+        self._plan_courant: list = []
+        self._lignes_courantes_cache: list = []
+        self._arbre_perime = False
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        # --- Barre haute : correspondance, connexion, quota ---
+        haut = QHBoxLayout()
+        self.bouton_importer = QPushButton(" Importer la correspondance (presse-papiers)", self)
+        self.bouton_importer.setIcon(qta.icon("mdi6.clipboard-text-outline", color=Mocha.text))
+        self.bouton_importer.setCursor(Qt.PointingHandCursor)
+        self.bouton_importer.clicked.connect(self._sur_clic_importer)
+        haut.addWidget(self.bouton_importer)
+        self.bouton_vider = QPushButton(" Vider", self)
+        self.bouton_vider.setIcon(qta.icon("mdi6.delete-outline", color=Mocha.text))
+        self.bouton_vider.setCursor(Qt.PointingHandCursor)
+        self.bouton_vider.clicked.connect(self._sur_clic_vider)
+        haut.addWidget(self.bouton_vider)
+        self.label_correspondance = QLabel("", self)
+        self.label_correspondance.setObjectName("ReglagesLabel")
+        haut.addWidget(self.label_correspondance, stretch=1)
+        self.label_connexion = QLabel("Kaggle : non verifie", self)
+        self.label_connexion.setObjectName("ReglagesLabel")
+        haut.addWidget(self.label_connexion)
+        self.label_quota = QLabel("", self)
+        self.label_quota.setObjectName("ReglagesLabel")
+        haut.addWidget(self.label_quota)
+        layout.addLayout(haut)
+
+        # --- Bloc A : Envoyer vers Kaggle ---
+        titre_a = QLabel("Envoyer vers Kaggle", self)
+        titre_a.setObjectName("ReglagesLabel")
+        layout.addWidget(titre_a)
+
+        ligne_a = QHBoxLayout()
+        self.bouton_actualiser_profils = QPushButton(" Actualiser les profils", self)
+        self.bouton_actualiser_profils.setIcon(qta.icon("mdi6.refresh", color=Mocha.text))
+        self.bouton_actualiser_profils.setCursor(Qt.PointingHandCursor)
+        self.bouton_actualiser_profils.clicked.connect(self._sur_clic_actualiser_profils)
+        ligne_a.addWidget(self.bouton_actualiser_profils)
+        ligne_a.addStretch(1)
+        layout.addLayout(ligne_a)
+
+        self.arbre_envoi = QTreeWidget(self)
+        self.arbre_envoi.setObjectName("ProfilsKaggleEnvoiTable")
+        self.arbre_envoi.setUniformRowHeights(True)
+        self.arbre_envoi.setHeaderLabels(
+            ["Profil", "Taille", "Derniere modification", "Garder le nom", "Nom d'archive", "Etat", "Progression"])
+        self.arbre_envoi.setSelectionMode(QAbstractItemView.NoSelection)
+        self.arbre_envoi.header().setStretchLastSection(True)
+        self.arbre_envoi.setColumnWidth(self.COL_PROFIL, 230)
+        self.arbre_envoi.setColumnWidth(self.COL_ARCHIVE, 220)
+        self.arbre_envoi.setColumnWidth(self.COL_ETAT, 210)
+        self.arbre_envoi.itemChanged.connect(self._sur_case_changee)
+        layout.addWidget(self.arbre_envoi, stretch=3)
+
+        self.case_supprimer = QCheckBox("Supprimer du sAutoniax apres envoi (uniquement apres envoi verifie)", self)
+        self.case_supprimer.setChecked(True)
+        layout.addWidget(self.case_supprimer)
+
+        self.bouton_envoyer = QPushButton(" Arreter + Archiver + Envoyer", self)
+        self.bouton_envoyer.setIcon(qta.icon("mdi6.cloud-upload-outline", color=Mocha.text))
+        self.bouton_envoyer.setCursor(Qt.PointingHandCursor)
+        self.bouton_envoyer.setEnabled(False)
+        self.bouton_envoyer.clicked.connect(self._sur_clic_envoyer)
+        layout.addWidget(self.bouton_envoyer)
+
+        separateur = QFrame(self)
+        separateur.setObjectName("ReglagesSeparateur")
+        separateur.setFixedHeight(1)
+        layout.addWidget(separateur)
+
+        # --- Bloc B : Telecharger depuis Kaggle ---
+        titre_b = QLabel("Telecharger depuis Kaggle", self)
+        titre_b.setObjectName("ReglagesLabel")
+        layout.addWidget(titre_b)
+
+        ligne_b = QHBoxLayout()
+        self.bouton_actualiser_datasets = QPushButton(" Actualiser", self)
+        self.bouton_actualiser_datasets.setIcon(qta.icon("mdi6.refresh", color=Mocha.text))
+        self.bouton_actualiser_datasets.setCursor(Qt.PointingHandCursor)
+        self.bouton_actualiser_datasets.clicked.connect(self._sur_clic_actualiser_datasets)
+        ligne_b.addWidget(self.bouton_actualiser_datasets)
+        self.label_tri = QLabel("", self)
+        self.label_tri.setObjectName("PlaceholderSubtitle")
+        ligne_b.addWidget(self.label_tri, stretch=1)
+        layout.addLayout(ligne_b)
+
+        milieu = QHBoxLayout()
+        self.table_datasets = QTreeWidget(self)
+        self.table_datasets.setObjectName("ProfilsKaggleDatasetsTable")
+        self.table_datasets.setRootIsDecorated(False)
+        self.table_datasets.setUniformRowHeights(True)
+        self.table_datasets.setHeaderLabels(["Nom d'archive", "Taille", "Cree le", "Mis a jour le"])
+        self.table_datasets.setColumnWidth(0, 260)
+        self.table_datasets.header().setStretchLastSection(True)
+        self.table_datasets.header().setSectionsClickable(True)
+        self.table_datasets.header().sectionClicked.connect(self._sur_clic_entete_datasets)
+        self.table_datasets.itemChanged.connect(lambda *_: self._rafraichir_boutons())
+        milieu.addWidget(self.table_datasets, stretch=3)
+
+        colonne_cibles = QVBoxLayout()
+        label_cibles = QLabel("sAutoniax cibles", self)
+        label_cibles.setObjectName("ReglagesLabel")
+        colonne_cibles.addWidget(label_cibles)
+        self.liste_cibles = QListWidget(self)
+        self.liste_cibles.setObjectName("ProfilsKaggleCibles")
+        self.liste_cibles.itemChanged.connect(lambda *_: self._rafraichir_boutons())
+        colonne_cibles.addWidget(self.liste_cibles, stretch=1)
+        milieu.addLayout(colonne_cibles, stretch=1)
+        layout.addLayout(milieu, stretch=3)
+
+        self.bouton_telecharger = QPushButton(" Repartir et telecharger", self)
+        self.bouton_telecharger.setIcon(qta.icon("mdi6.cloud-download-outline", color=Mocha.text))
+        self.bouton_telecharger.setCursor(Qt.PointingHandCursor)
+        self.bouton_telecharger.setEnabled(False)
+        self.bouton_telecharger.clicked.connect(self._sur_clic_telecharger)
+        layout.addWidget(self.bouton_telecharger)
+
+        # --- Journal (QListWidget, jamais d'editeur de texte) ---
+        self.journal = QListWidget(self)
+        self.journal.setObjectName("ProfilsKaggleJournal")
+        self.journal.setSelectionMode(QAbstractItemView.NoSelection)
+        self.journal.setMaximumHeight(130)
+        layout.addWidget(self.journal)
+
+        self.label_correspondance.setText("Aucune correspondance importee.")  # reel des que definir_reglages() est appele
+        self._rafraichir_libelle_tri()
+
+    # ------------------------------------------------------------------
+    # Reglages / correspondance
+    # ------------------------------------------------------------------
+    def definir_reglages(self, reglages):
+        self._reglages = reglages
+        self._rafraichir_resume_correspondance()
+        self._recalculer_noms()
+
+    def _reglages_courants(self):
+        if self._reglages is None:
+            self._reglages = ReglagesApp.load()
+        return self._reglages
+
+    def _correspondance(self) -> dict:
+        return dict(getattr(self._reglages_courants(), "kaggle_correspondance_noms", None) or {})
+
+    def _rafraichir_resume_correspondance(self):
+        libelle, infobulle = resume_correspondance(self._reglages_courants())
+        self.label_correspondance.setText(libelle)
+        self.label_correspondance.setToolTip(infobulle)
+
+    def _sur_clic_importer(self):
+        texte = QGuiApplication.clipboard().text()
+        try:
+            correspondance, avertissements = importer_correspondance(self._reglages_courants(), texte)
+        except ErreurCorrespondance as e:
+            self.ajouter_journal(f"Import refuse : {e}")
+            QMessageBox.warning(self, "Correspondance Kaggle",
+                                f"{e}\n\nLa correspondance precedente est conservee.")
+            return
+        self.ajouter_journal(f"Correspondance importee : {len(correspondance)} entree(s).")
+        self._rafraichir_resume_correspondance()
+        self._recalculer_noms()
+        if avertissements:
+            QMessageBox.information(self, "Correspondance Kaggle", "Importee avec avertissement(s) :\n\n" + "\n".join(avertissements[:15]))
+
+    def _sur_clic_vider(self):
+        vider_correspondance(self._reglages_courants())
+        self.ajouter_journal("Correspondance videe.")
+        self._rafraichir_resume_correspondance()
+        self._recalculer_noms()
+
+    # ------------------------------------------------------------------
+    # Donnees entrantes (appelees par MainWindow)
+    # ------------------------------------------------------------------
+    def definir_sautoniax_disponibles(self, executants: dict):
+        """{id_executant: nom} des sAutoniax connectes. Les sAutoniax deconnectes
+        disparaissent ; les nouveaux demandent leurs profils si l'ecran a deja ete affiche."""
+        nouveaux = sorted(i for i in executants if i not in self._sautoniax)
+        coches = {self.liste_cibles.item(r).data(Qt.UserRole): self.liste_cibles.item(r).checkState()
+                  for r in range(self.liste_cibles.count())}
+        self._sautoniax = dict(executants)
+        for i in list(self._profils_par_sautoniax):
+            if i not in self._sautoniax:
+                del self._profils_par_sautoniax[i]
+        self.liste_cibles.blockSignals(True)
+        self.liste_cibles.clear()
+        for id_executant, nom in sorted(self._sautoniax.items(), key=lambda kv: (kv[1], kv[0])):
+            it = QListWidgetItem(nom)
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+            it.setData(Qt.UserRole, id_executant)
+            it.setCheckState(coches.get(id_executant, Qt.Unchecked))
+            self.liste_cibles.addItem(it)
+        self.liste_cibles.blockSignals(False)
+        self._reconstruire_arbre()
+        self._rafraichir_boutons()
+        if nouveaux and self._deja_affiche:
+            self.demande_kaggle_actualiser_profils.emit(nouveaux)
+
+    def definir_profils_sautoniax(self, id_executant: str, profils: list):
+        """profils : [{"nom", "taille_octets", "modifie_ts", "origine_kaggle" (str|None)}]."""
+        if id_executant not in self._sautoniax:
+            return
+        self._profils_par_sautoniax[id_executant] = list(profils or [])
+        self._reconstruire_arbre()
+        self.ajouter_journal(f"{self._sautoniax.get(id_executant, id_executant)} : {len(profils or [])} profil(s).")
+
+    def definir_etat_connexion(self, ok: bool, message: str = "", quota_octets: Optional[int] = None):
+        self.label_connexion.setText("Kaggle : connecte" if ok else f"Kaggle : {message or 'erreur de connexion'}")
+        self.label_connexion.setToolTip(message)
+        if quota_octets is not None:
+            self.label_quota.setText(f"Quota prive : {formater_taille_octets(quota_octets)} / {QUOTA_PRIVE_GO} Go")
+        self.ajouter_journal("Connexion Kaggle OK." if ok else f"Connexion Kaggle : {message}")
+
+    def definir_datasets(self, datasets: list):
+        self._datasets = list(datasets or [])
+        self._reconstruire_table_datasets()
+        self.label_quota.setText(
+            f"Quota prive : {formater_taille_octets(GestionnaireKaggle.quota_utilise_octets(self._datasets))} / {QUOTA_PRIVE_GO} Go")
+        self.ajouter_journal(f"{len(self._datasets)} dataset(s) ax- sur Kaggle.")
+        self._recalculer_noms()
+
+    # ------------------------------------------------------------------
+    # Bloc A : arbre
+    # ------------------------------------------------------------------
+    def _reconstruire_arbre(self):
+        if self._operation_id is not None:
+            self._arbre_perime = True  # reconstruit a la fin de l'operation (cf. terminer_operation)
+            return
+        self._arbre_perime = False
+        self._maj_en_cours = True
+        try:
+            for (i, nom), it in self._items.items():
+                self._etat_cases[(i, nom)] = (it.checkState(self.COL_PROFIL) == Qt.Checked,
+                                              it.checkState(self.COL_GARDER) == Qt.Checked)
+            self.arbre_envoi.clear()
+            self._items.clear()
+            self._items_sautoniax.clear()
+            for id_executant, nom_sautoniax in sorted(self._sautoniax.items(), key=lambda kv: (kv[1], kv[0])):
+                parent = QTreeWidgetItem([nom_sautoniax])
+                parent.setFlags(parent.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsAutoTristate)
+                parent.setCheckState(self.COL_PROFIL, Qt.Checked)
+                self.arbre_envoi.addTopLevelItem(parent)
+                self._items_sautoniax[id_executant] = parent
+                profils = self._profils_par_sautoniax.get(id_executant)
+                if profils is None:
+                    parent.setText(self.COL_ETAT, "profils non charges")
+                    continue
+                for p in sorted(profils, key=lambda p: str(p.get("nom", "")).lower()):
+                    nom_local = str(p.get("nom", ""))
+                    origine = p.get("origine_kaggle")
+                    coche, garder = self._etat_cases.get((id_executant, nom_local), (True, bool(origine)))
+                    it = QTreeWidgetItem([nom_local, formater_taille_octets(p.get("taille_octets")),
+                                          formater_horodatage(p.get("modifie_ts")), "", "", "", ""])
+                    it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+                    it.setCheckState(self.COL_PROFIL, Qt.Checked if coche else Qt.Unchecked)
+                    it.setCheckState(self.COL_GARDER, Qt.Checked if garder else Qt.Unchecked)
+                    it.setData(self.COL_PROFIL, Qt.UserRole, float(p.get("modifie_ts") or 0))
+                    if origine:
+                        it.setToolTip(self.COL_GARDER, f"Profil venu de Kaggle (archive : {origine}).")
+                    parent.addChild(it)
+                    self._items[(id_executant, nom_local)] = it
+                parent.setExpanded(True)
+        finally:
+            self._maj_en_cours = False
+        self._recalculer_noms()
+
+    def _lignes(self) -> list:
+        lignes = []
+        for (i, nom), it in self._items.items():
+            lignes.append({"id_executant": i, "nom_executant": self._sautoniax.get(i, i), "nom_local": nom,
+                           "garder_nom": it.checkState(self.COL_GARDER) == Qt.Checked,
+                           "coche": it.checkState(self.COL_PROFIL) == Qt.Checked,
+                           "modifie_ts": it.data(self.COL_PROFIL, Qt.UserRole) or 0})
+        return lignes
+
+    def _sur_case_changee(self, item, colonne):
+        if self._maj_en_cours or self._operation_id is not None:
+            return
+        if colonne in (self.COL_PROFIL, self.COL_GARDER):
+            self._recalculer_noms()
+
+    def _recalculer_noms(self):
+        """Resout les noms d'archive et colore les lignes (rouge = erreur, gris = ignoree)."""
+        if self._operation_id is not None:
+            self._rafraichir_boutons()
+            return
+        lignes = self._lignes()
+        self._plan_courant = planifier_envoi(lignes, self._correspondance())
+        self._lignes_courantes_cache = lignes
+        self._maj_en_cours = True
+        try:
+            for ligne, plan in zip(lignes, self._plan_courant):
+                it = self._items.get((ligne["id_executant"], ligne["nom_local"]))
+                if it is None:
+                    continue
+                couleur = None
+                if not ligne["coche"]:
+                    etat, archive, infobulle = "non selectionne", "", ""
+                    couleur = Mocha.overlay1
+                elif plan["erreur"]:
+                    etat, archive, infobulle = "erreur de nommage", plan["nom_archive"], plan["erreur"]
+                    couleur = Mocha.red
+                elif plan["ignore"]:
+                    etat, archive, infobulle = "ignore (copie plus ancienne)", "", plan["avertissement"] or ""
+                    couleur = Mocha.overlay1
+                else:
+                    etat = "pret"
+                    archive = plan["nom_archive"]
+                    infobulle = plan["avertissement"] or ""
+                    couleur = Mocha.yellow if plan["avertissement"] else None
+                    if self._datasets and plan["slug"] in {d["slug"] for d in self._datasets}:
+                        etat = "pret (mise a jour)"
+                    elif self._datasets:
+                        etat = "pret (creation)"
+                it.setText(self.COL_ARCHIVE, archive)
+                it.setText(self.COL_ETAT, etat)
+                it.setText(self.COL_PROG, "")
+                for col in range(7):
+                    it.setForeground(col, QBrush(QColor(couleur)) if couleur else QBrush())
+                it.setToolTip(self.COL_ARCHIVE, infobulle)
+                it.setToolTip(self.COL_ETAT, infobulle)
+        finally:
+            self._maj_en_cours = False
+        self._rafraichir_boutons()
+
+    def _sur_clic_actualiser_profils(self):
+        if self._operation_id is not None:
+            return
+        if not self._sautoniax:
+            self.ajouter_journal("Aucun sAutoniax connecte.")
+            return
+        self.ajouter_journal("Demande des profils aux sAutoniax connectes...")
+        self.demande_kaggle_actualiser_profils.emit(sorted(self._sautoniax))
+
+    def _sur_clic_envoyer(self):
+        if self._operation_id is not None:
+            return
+        self._recalculer_noms()
+        lignes, plan = self._lignes_courantes_cache, self._plan_courant
+        slugs = {d["slug"] for d in self._datasets} if self._datasets else None
+        supprimer = self.case_supprimer.isChecked()
+        r = resume_plan_envoi(plan, lignes, slugs, supprimer)
+        if r["total"] == 0:
+            QMessageBox.information(self, "Envoyer vers Kaggle",
+                                    "Aucun profil a envoyer (selection vide ou toutes les lignes sont en erreur).")
+            return
+        detail = (f"{r['total']} profil(s) sur {r['sautoniax']} sAutoniax.\n"
+                  + ("Archives : liste Kaggle non chargee (creation ou mise a jour inconnue).\n" if r["inconnus"]
+                     else f"Archives : {r['crees']} creee(s), {r['maj']} mise(s) a jour.\n")
+                  + "Les executions de ces profils seront ARRETEES avant l'archivage.\n"
+                  + f"Suppression du dossier sur le sAutoniax apres envoi verifie : {'OUI' if supprimer else 'non'}.\n")
+        if r["bloques"]:
+            detail += f"\n{r['bloques']} ligne(s) bloquee(s) (erreur de nommage) : non envoyees."
+        if r["ignores"]:
+            detail += f"\n{r['ignores']} copie(s) plus ancienne(s) ignoree(s)."
+        if QMessageBox.question(self, "Arreter + Archiver + Envoyer", detail + "\n\nConfirmer ?",
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        corr = self._correspondance()
+        profils = []
+        for ligne, p in zip(lignes, plan):
+            if not p["partira"]:
+                continue
+            profils.append({"id_executant": ligne["id_executant"], "nom_executant": ligne["nom_executant"],
+                            "nom_local": ligne["nom_local"], "nom_archive": p["nom_archive"], "slug": p["slug"],
+                            "email": corr.get(ligne["nom_local"], ""), "modifie_ts": ligne["modifie_ts"]})
+        self._operation_id = uuid.uuid4().hex[:12]
+        self._marquer_lignes_en_attente({(p["id_executant"], p["nom_local"]) for p in profils})
+        self._rafraichir_boutons()
+        self.ajouter_journal(f"Envoi : {len(profils)} profil(s) (operation {self._operation_id}).")
+        self.demande_kaggle_envoyer.emit({"id_operation": self._operation_id, "supprimer_local": supprimer,
+                                          "profils": profils})
+
+    def _marquer_lignes_en_attente(self, cles: set):
+        self._maj_en_cours = True
+        try:
+            for cle, it in self._items.items():
+                if cle in cles:
+                    it.setText(self.COL_ETAT, "en attente")
+                    it.setText(self.COL_PROG, "0 %")
+        finally:
+            self._maj_en_cours = False
+
+    def sur_progression_envoi(self, id_operation: str, id_executant: str, nom_local: str, etape: str, pourcentage: int):
+        if id_operation != self._operation_id:
+            return
+        it = self._items.get((id_executant, nom_local))
+        if it is not None:
+            self._maj_en_cours = True
+            it.setText(self.COL_ETAT, etape)
+            it.setText(self.COL_PROG, f"{max(0, min(100, int(pourcentage)))} %")
+            self._maj_en_cours = False
+
+    def sur_resultat_envoi(self, id_operation: str, id_executant: str, nom_local: str, ok: bool, message: str):
+        if id_operation != self._operation_id:
+            return
+        it = self._items.get((id_executant, nom_local))
+        if it is not None:
+            self._maj_en_cours = True
+            it.setText(self.COL_ETAT, "envoye" if ok else "ERREUR")
+            if ok:
+                it.setText(self.COL_PROG, "100 %")
+            for col in range(7):
+                it.setForeground(col, QBrush(QColor(Mocha.green if ok else Mocha.red)))
+            it.setToolTip(self.COL_ETAT, message or "")
+            self._maj_en_cours = False
+        self.ajouter_journal(f"{self._sautoniax.get(id_executant, id_executant)} / {nom_local} : {'OK' if ok else 'ERREUR'}"
+                             + (f" ({message})" if message else ""))
+
+    # ------------------------------------------------------------------
+    # Bloc B : datasets
+    # ------------------------------------------------------------------
+    def _rafraichir_libelle_tri(self):
+        self.label_tri.setText("Tri : " + ("creation" if self._tri_datasets == "cree" else "mise a jour")
+                               + ", du plus recent au plus ancien (clic sur un en-tete Cree le / Mis a jour le).")
+
+    def _sur_clic_entete_datasets(self, section: int):
+        if section in (2, 3):
+            self._tri_datasets = "cree" if section == 2 else "maj"
+            self._rafraichir_libelle_tri()
+            self._reconstruire_table_datasets()
+
+    def _reconstruire_table_datasets(self):
+        coches = {self.table_datasets.topLevelItem(r).data(0, Qt.UserRole): self.table_datasets.topLevelItem(r).checkState(0)
+                  for r in range(self.table_datasets.topLevelItemCount())}
+        self.table_datasets.blockSignals(True)
+        self.table_datasets.clear()
+        for d in trier_datasets(self._datasets, self._tri_datasets):
+            it = QTreeWidgetItem([d.get("nom_archive", ""), formater_taille_octets(d.get("taille_octets")),
+                                  formater_horodatage(d.get("cree_le")), formater_horodatage(d.get("maj_le"))])
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+            it.setCheckState(0, coches.get(d["slug"], Qt.Unchecked))
+            it.setData(0, Qt.UserRole, d["slug"])
+            self.table_datasets.addTopLevelItem(it)
+        self.table_datasets.blockSignals(False)
+        self._rafraichir_boutons()
+
+    def _datasets_coches(self) -> list:
+        """Datasets coches, dans l'ordre d'affichage."""
+        par_slug = {d["slug"]: d for d in self._datasets}
+        sortie = []
+        for r in range(self.table_datasets.topLevelItemCount()):
+            it = self.table_datasets.topLevelItem(r)
+            if it.checkState(0) == Qt.Checked and it.data(0, Qt.UserRole) in par_slug:
+                sortie.append(par_slug[it.data(0, Qt.UserRole)])
+        return sortie
+
+    def _cibles_cochees(self) -> list:
+        return [self.liste_cibles.item(r).data(Qt.UserRole) for r in range(self.liste_cibles.count())
+                if self.liste_cibles.item(r).checkState() == Qt.Checked]
+
+    def _sur_clic_actualiser_datasets(self):
+        if self._operation_id is not None:
+            return
+        self.ajouter_journal("Actualisation de la liste Kaggle...")
+        self.demande_kaggle_actualiser_datasets.emit()
+
+    def _sur_clic_telecharger(self):
+        if self._operation_id is not None:
+            return
+        choisis, cibles = self._datasets_coches(), self._cibles_cochees()
+        if not choisis or not cibles:
+            return
+        repartition = repartir_equitablement(choisis, cibles)
+        lignes = [f"{self._sautoniax.get(i, i)} : {len(v)} profil(s)" for i, v in sorted(repartition.items()) if v]
+        apercu = "\n".join(lignes) + "\n\nUn profil du meme nom sur le sAutoniax cible sera ECRASE (refuse s'il est en cours d'execution)."
+        if QMessageBox.question(self, "Repartir et telecharger", apercu + "\n\nConfirmer ?",
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        self._operation_id = uuid.uuid4().hex[:12]
+        self._rafraichir_boutons()
+        charge = {"id_operation": self._operation_id, "repartition": [
+            {"id_executant": i, "nom_executant": self._sautoniax.get(i, i),
+             "profils": [{"slug": d["slug"], "nom_archive": d["nom_archive"], "nom_local": d["nom_archive"]} for d in v]}
+            for i, v in sorted(repartition.items()) if v]}
+        self.ajouter_journal(f"Telechargement : {len(choisis)} profil(s) sur {len(charge['repartition'])} sAutoniax (operation {self._operation_id}).")
+        self.demande_kaggle_telecharger.emit(charge)
+
+    def sur_progression_telechargement(self, id_operation: str, id_executant: str, nom_local: str, etape: str, pourcentage: int):
+        if id_operation == self._operation_id:
+            self.ajouter_journal(f"{self._sautoniax.get(id_executant, id_executant)} / {nom_local} : {etape} {int(pourcentage)} %")
+
+    def sur_resultat_telechargement(self, id_operation: str, id_executant: str, nom_local: str, ok: bool, message: str):
+        if id_operation == self._operation_id:
+            self.ajouter_journal(f"{self._sautoniax.get(id_executant, id_executant)} / {nom_local} : {'OK' if ok else 'ERREUR'}"
+                                 + (f" ({message})" if message else ""))
+
+    # ------------------------------------------------------------------
+    # Etat, journal
+    # ------------------------------------------------------------------
+    def terminer_operation(self, id_operation: Optional[str] = None):
+        """Libere l'ecran (une seule operation Kaggle a la fois)."""
+        if id_operation is not None and id_operation != self._operation_id:
+            return
+        self._operation_id = None
+        self.ajouter_journal("Operation terminee.")
+        self._reconstruire_arbre()  # recalcule aussi les noms et les boutons
+        # Les listes ont change (dossiers supprimes, profils telecharges) : on les rafraichit.
+        self.demande_kaggle_actualiser_datasets.emit()
+        if self._sautoniax:
+            self.demande_kaggle_actualiser_profils.emit(sorted(self._sautoniax))
+
+    def sur_non_branche(self, id_operation: Optional[str], libelle: str = "Ce flux"):
+        """Phase 2 : le flux reseau n'est pas encore branche. Libere l'ecran."""
+        self.ajouter_journal(f"{libelle} n'est pas encore branche (phases suivantes).")
+        self._operation_id = id_operation if id_operation else self._operation_id
+        self.terminer_operation(id_operation)
+
+    def operation_en_cours(self) -> bool:
+        return self._operation_id is not None
+
+    def _rafraichir_boutons(self):
+        libre = self._operation_id is None
+        plan = self._plan_courant
+        self.bouton_importer.setEnabled(libre)
+        self.bouton_vider.setEnabled(libre)
+        self.bouton_actualiser_profils.setEnabled(libre)
+        self.bouton_actualiser_datasets.setEnabled(libre)
+        self.bouton_envoyer.setEnabled(libre and any(p["partira"] for p in plan))
+        self.bouton_telecharger.setEnabled(libre and bool(self._datasets_coches()) and bool(self._cibles_cochees()))
+
+    def ajouter_journal(self, texte: str):
+        self.journal.addItem(f"{time.strftime('%H:%M:%S')}  {texte}")
+        while self.journal.count() > self.LIGNES_JOURNAL_MAX:
+            self.journal.takeItem(0)
+        self.journal.scrollToBottom()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._deja_affiche:
+            self._deja_affiche = True
+            self.demande_kaggle_verifier_connexion.emit()
+            if self._sautoniax:
+                self.demande_kaggle_actualiser_profils.emit(sorted(self._sautoniax))
 
 
 class ProfilsScreen(QWidget):
@@ -30518,6 +31209,13 @@ class ProfilsScreen(QWidget):
     # self.cloud_screen, même patron que demande_envoi_profil_vers_
     # sautoniax juste au-dessus.
     demande_telechargement_local_profil = Signal(str)
+    # PATCH (sous-onglet "Profils Kaggle", phase 2) -- relais des signaux de
+    # ProfilsKaggleScreen, meme patron que ceux de Cloud/Local.
+    demande_kaggle_verifier_connexion = Signal()
+    demande_kaggle_actualiser_profils = Signal(list)
+    demande_kaggle_actualiser_datasets = Signal()
+    demande_kaggle_envoyer = Signal(dict)
+    demande_kaggle_telecharger = Signal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -30532,6 +31230,10 @@ class ProfilsScreen(QWidget):
 
         self.local_screen = ProfilsLocalScreen(self.sous_onglets)
         self.sous_onglets.addTab(self.local_screen, "Profils Local")
+
+        # PATCH (Profils Kaggle, phase 2) -- troisieme sous-onglet, apres "Profils Local".
+        self.kaggle_screen = ProfilsKaggleScreen(self.sous_onglets)
+        self.sous_onglets.addTab(self.kaggle_screen, "Profils Kaggle")
 
         layout.addWidget(self.sous_onglets)
 
@@ -30565,6 +31267,12 @@ class ProfilsScreen(QWidget):
         # fois, cf. definir_profils_disponibles ci-dessous). ---
         self.local_screen.demande_liste_profils_locaux.connect(self.demande_liste_profils_locaux)
         self.local_screen.demande_envoi_profil.connect(self.demande_envoi_profil)
+
+        self.kaggle_screen.demande_kaggle_verifier_connexion.connect(self.demande_kaggle_verifier_connexion)
+        self.kaggle_screen.demande_kaggle_actualiser_profils.connect(self.demande_kaggle_actualiser_profils)
+        self.kaggle_screen.demande_kaggle_actualiser_datasets.connect(self.demande_kaggle_actualiser_datasets)
+        self.kaggle_screen.demande_kaggle_envoyer.connect(self.demande_kaggle_envoyer)
+        self.kaggle_screen.demande_kaggle_telecharger.connect(self.demande_kaggle_telecharger)
 
     # --- Méthodes déléguées au sous-onglet Cloud, pour compatibilité
     # ascendante totale (cf. docstring de classe -- MainWindow appelle
@@ -30635,6 +31343,11 @@ class ProfilsScreen(QWidget):
 
     def definir_sautoniax_disponibles(self, executants: dict):
         self.cloud_screen.definir_sautoniax_disponibles(executants)
+        self.kaggle_screen.definir_sautoniax_disponibles(executants)
+
+    def definir_reglages_kaggle(self, reglages):
+        """Profils Kaggle (phase 2) -- fournit ReglagesApp (correspondance de noms persistee)."""
+        self.kaggle_screen.definir_reglages(reglages)
 
     def sur_resultat_envoi_vers_sautoniax(self, id_executant: str, nom_profil: str, ok: bool, message: str):
         self.cloud_screen.sur_resultat_envoi_vers_sautoniax(id_executant, nom_profil, ok, message)
@@ -111813,6 +112526,18 @@ class MainWindow(QMainWindow):
             lambda executants: reseau_screen.profils_screen.definir_sautoniax_disponibles(
                 {e.get("id", ""): e.get("nom") or e.get("id", "") for e in executants if e.get("id")}
             )
+        )
+        # PATCH (Profils Kaggle, phase 2) -- reglages (correspondance de noms) + flux
+        # reseau PAS ENCORE branches : les ordres d'envoi/telechargement liberent
+        # l'ecran immediatement (remplace par le vrai cablage aux phases 3 et 4).
+        reseau_screen.profils_screen.definir_reglages_kaggle(self.reglages)
+        reseau_screen.profils_screen.demande_kaggle_envoyer.connect(
+            lambda charge: reseau_screen.profils_screen.kaggle_screen.sur_non_branche(
+                charge.get("id_operation"), "L'envoi vers Kaggle")
+        )
+        reseau_screen.profils_screen.demande_kaggle_telecharger.connect(
+            lambda charge: reseau_screen.profils_screen.kaggle_screen.sur_non_branche(
+                charge.get("id_operation"), "Le telechargement depuis Kaggle")
         )
         # PATCH (sélecteur groupé Local/Réseau de TestComposantScreen,
         # cf. ApplicationsScreen.definir_client_serveur_t/definir_

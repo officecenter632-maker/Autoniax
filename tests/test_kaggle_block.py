@@ -93,6 +93,40 @@ rep = ns["repartir_equitablement"](list(range(10)), ["s3", "s1", "s2"])
 ok(sorted(len(v) for v in rep.values()) == [3, 3, 4] and len(rep["s1"]) == 4, "10 profils sur 3 -> 4,3,3")
 ok(rep["s1"] == [0, 3, 6, 9], "tourniquet dans l'ordre d'affichage")
 
+
+# ---- aides pures de la phase 2 -------------------------------------------
+ok(ns["formater_taille_octets"](512) == "512 o" and ns["formater_taille_octets"](5 * 1024 ** 2) == "5,0 Mo"
+   and ns["formater_taille_octets"](None) == "?", "format des tailles")
+ok(ns["formater_horodatage"]("2026-11-12T10:00:00Z") == "2026-11-12 10:00" and ns["formater_horodatage"](None) == "", "format des dates")
+td = ns["trier_datasets"]
+dd = [{"slug": "a", "cree_le": "2026-01-01T00:00:00Z", "maj_le": "2026-11-01 10:00:00"},
+      {"slug": "b", "cree_le": "2026-06-01T00:00:00Z", "maj_le": "2026-03-01 10:00:00"},
+      {"slug": "c", "cree_le": None, "maj_le": None}]
+ok([d["slug"] for d in td(dd, "maj")] == ["a", "b", "c"] and [d["slug"] for d in td(dd, "cree")] == ["b", "a", "c"], "tri maj/cree, plus recent d'abord, inconnus en dernier")
+ok([d["slug"] for d in td(dd)] == ["a", "b", "c"], "tri par defaut : mise a jour")
+L = [{"id_executant": "s1", "nom_executant": "A", "nom_local": "x", "garder_nom": True, "coche": True, "modifie_ts": 100},
+     {"id_executant": "s2", "nom_executant": "B", "nom_local": "x", "garder_nom": True, "coche": True, "modifie_ts": 200},
+     {"id_executant": "s1", "nom_executant": "A", "nom_local": "y", "garder_nom": False, "coche": True, "modifie_ts": 1},
+     {"id_executant": "s1", "nom_executant": "A", "nom_local": "z", "garder_nom": True, "coche": False, "modifie_ts": 1}]
+pl = ns["planifier_envoi"](L, {})
+ok(pl[0]["ignore"] and not pl[0]["partira"] and pl[1]["partira"] and pl[1]["avertissement"], "meme profil sur 2 sAutoniax : la copie recente part")
+ok(pl[2]["erreur"] and not pl[2]["partira"], "decoche et absent du JSON : bloque")
+ok(not pl[3]["partira"] and not pl[3]["erreur"], "ligne non cochee : ignoree sans erreur")
+pl2 = ns["planifier_envoi"](L, {"y": "y@x.com"})
+ok(pl2[2]["partira"] and pl2[2]["nom_archive"] == "y@x.com", "present dans le JSON : part")
+ok(ns["planifier_envoi"]([dict(L[0], modifie_ts=5), dict(L[1], modifie_ts=5)], {})[0]["partira"], "egalite de date : la premiere ligne gagne")
+rs = ns["resume_plan_envoi"](pl2, L, {slug("x")}, True)
+ok(rs["total"] == 2 and rs["sautoniax"] == 2 and rs["maj"] == 1 and rs["crees"] == 1 and rs["ignores"] == 1, "resume du plan")
+ok(ns["resume_plan_envoi"](pl2, L, None, False)["inconnus"], "resume : liste Kaggle non chargee")
+
+class ReglagesQuiEchoue(FauxReglages):
+    def save(self):
+        raise OSError("disque plein")
+rq = ReglagesQuiEchoue()
+e = leve(ns["ErreurCorrespondance"], lambda: ns["importer_correspondance"](rq, '{"a": "a@x.com"}'))
+ok(e is not None and rq.kaggle_correspondance_noms == {"ancien": "old@x.com"}, "echec d'ecriture : ancienne correspondance restauree")
+ok(len(vc('{"a": "m@x.com", "b": "M@x.com"}')[1]) == 1, "avertissement : meme email pour deux profils")
+
 # ---- faux client Kaggle --------------------------------------------------
 class Obj:
     def __init__(self, **kw):
