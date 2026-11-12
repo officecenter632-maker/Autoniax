@@ -427,6 +427,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 # rester alignes si ce choix change un jour.
 logging.Formatter.converter = time.gmtime
 logger = logging.getLogger("serveurT")
+
+# PATCH (Profils Kaggle, phase 3) -- types relayes par le sous-onglet "Profils Kaggle".
+TYPES_KAGGLE_PILOTE_VERS_EXECUTANT = frozenset({
+    "kaggle_lister_profils", "kaggle_envoyer_profils", "kaggle_telecharger_profils",
+})
+TYPES_KAGGLE_EXECUTANT_VERS_PILOTE = frozenset({
+    "kaggle_lister_profils_resultat", "kaggle_progression", "kaggle_resultat",
+})
 bb_stockage = GestionnaireStockageBB()  # cf. sa définition plus haut ; instancié ici, APRÈS logger (utilisé par marquer_serveur_a_jour)
 
 
@@ -4205,6 +4213,69 @@ async def route_websocket(websocket: WebSocket):
                         )
                     except Exception:
                         logger.exception("Échec relais profils_sautoniax_resultat vers pilote '%s'", id_pilote_cible)
+
+            elif type_message in TYPES_KAGGLE_PILOTE_VERS_EXECUTANT:
+                # PATCH (Profils Kaggle, phase 3) -- ordres du sous-onglet "Profils
+                # Kaggle" : kaggle_lister_profils, kaggle_envoyer_profils,
+                # kaggle_telecharger_profils. Meme patron EXACT que
+                # demander_profils_sautoniax : relais CIBLE pur, reserve au pilote.
+                # Le serveur ne transporte QUE les ordres et la progression : les
+                # archives vont directement sAutoniax <-> Kaggle (jamais par ici).
+                # Chaque ordre porte un id_operation, relaye tel quel.
+                ack = type_message + "_ack"
+                if connexion.role != "pilote":
+                    logger.warning("%s refuse (role=%r, seul 'pilote' est autorise) id=%s", type_message, connexion.role, id_connexion)
+                    await websocket.send_text(json.dumps({
+                        "type": ack, "ok": False, "id_operation": message.get("id_operation", ""),
+                        "erreur": "Seul le pilote peut envoyer un ordre Kaggle.",
+                    }))
+                    continue
+                id_executant = message.get("id_executant", "")
+                id_operation = message.get("id_operation", "")
+                cible = registre.executant_par_id(id_executant)
+                if cible is None:
+                    logger.warning("%s refuse : executant '%s' introuvable/deconnecte", type_message, id_executant)
+                    await websocket.send_text(json.dumps({
+                        "type": ack, "ok": False, "id_executant": id_executant, "id_operation": id_operation,
+                        "erreur": f"Exécutant '{id_executant}' introuvable ou déconnecté.",
+                    }))
+                    continue
+                try:
+                    message_relais = dict(message)
+                    message_relais["id_pilote"] = (connexion.id_pilote_stable or id_connexion)
+                    async with registre.verrou_pour(cible.websocket):
+                        await cible.websocket.send_text(json.dumps(message_relais))
+                    logger.info("%s : transmis a '%s' (op=%s) par pilote id=%s", type_message, cible.nom, id_operation, id_connexion)
+                    await websocket.send_text(json.dumps({
+                        "type": ack, "ok": True, "id_executant": id_executant, "id_operation": id_operation,
+                    }))
+                except Exception as e:
+                    logger.exception("Echec transmission %s a '%s'", type_message, id_executant)
+                    await websocket.send_text(json.dumps({
+                        "type": ack, "ok": False, "id_executant": id_executant, "id_operation": id_operation,
+                        "erreur": str(e),
+                    }))
+
+            elif type_message in TYPES_KAGGLE_EXECUTANT_VERS_PILOTE:
+                # PATCH (Profils Kaggle, phase 3) -- reponses de l'executant :
+                # kaggle_lister_profils_resultat, kaggle_progression, kaggle_resultat.
+                # Meme patron EXACT que profils_sautoniax_resultat : relais DIRECT au
+                # pilote demandeur (id_pilote), best-effort, jamais de plantage.
+                if connexion.role != "executant":
+                    logger.warning("%s refuse (role=%r) id=%s", type_message, connexion.role, id_connexion)
+                    continue
+                id_pilote_cible = message.get("id_pilote", "")
+                pilote_cible = registre.pilote_par_id(id_pilote_cible)
+                if pilote_cible is None or pilote_cible.role != "pilote":
+                    logger.warning("%s : pilote '%s' introuvable/deconnecte, message perdu (id=%s)", type_message, id_pilote_cible, id_connexion)
+                else:
+                    try:
+                        message_relais = dict(message)
+                        message_relais["id_executant"] = connexion.nom
+                        async with registre.verrou_pour(pilote_cible.websocket):
+                            await pilote_cible.websocket.send_text(json.dumps(message_relais))
+                    except Exception:
+                        logger.exception("Echec relais %s vers pilote '%s'", type_message, id_pilote_cible)
 
             elif type_message == "demander_horloge_mautoniax":
                 # PATCH (cf. AutoniaX.py, section historique juste avant

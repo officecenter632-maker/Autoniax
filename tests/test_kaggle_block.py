@@ -320,4 +320,112 @@ with tempfile.TemporaryDirectory() as tmp:
     (cible / "_kaggle_origine.json").write_text("n'importe quoi")
     ok(ns["lire_origines_kaggle"](str(cible)) == {}, "origine corrompue ignoree")
 
+# ---- phase 3 : cote sAutoniax (scan, traitement d'un envoi) ---------------
+with tempfile.TemporaryDirectory() as tmp:
+    dp = Path(tmp) / "sautoniax_profils"
+    (dp / "Alice" / "Default").mkdir(parents=True)
+    (dp / "Alice" / "Default" / "Cookies").write_text("cookie")
+    (dp / "Bob").mkdir()
+    (dp / "Bob" / "f.txt").write_text("xx")
+    (dp / "Vide").mkdir()
+    (dp / "_kaggle_origine.json").write_text(json.dumps({"Bob": "bob@x.com"}))
+    sc = ns["scanner_profils_kaggle"](str(dp), {"Bob"})
+    ok([p["nom"] for p in sc] == ["Alice", "Bob"], "scan : dossiers vides et fichiers ignores")
+    ok(sc[0]["taille_octets"] == 6 and sc[0]["modifie_ts"] > 0 and not sc[0]["actif"] and sc[0]["origine_kaggle"] is None, "scan : taille, date, inactif")
+    ok(sc[1]["actif"] and sc[1]["origine_kaggle"] == "bob@x.com", "scan : actif + origine Kaggle")
+    ok(ns["scanner_profils_kaggle"](str(Path(tmp) / "absent"), set()) == [], "scan : dossier absent")
+
+    zt = Path(tmp) / "zips"; zt.mkdir()
+    zp = faux_zipper_factory(zt)
+    api3 = FauxKaggle()
+    g3 = faire_gestionnaire(api3)
+    te = ns["traiter_envoi_kaggle"]
+    r = te(g3, str(dp), {"nom_local": "Bob", "nom_archive": "bob@x.com"}, True, {"Bob"}, zipper=zp)
+    ok(r[0] is False and "en cours d'execution" in r[1] and (dp / "Bob").exists() and not api3.datasets, "profil actif : refuse, rien envoye ni supprime")
+    for mauvais in ("../Alice", "a/b", "..", ""):
+        r = te(g3, str(dp), {"nom_local": mauvais, "nom_archive": "x@y.com"}, True, set(), zipper=zp)
+        ok(r[0] is False, f"nom de profil refuse : {mauvais!r}")
+    r = te(g3, str(dp), {"nom_local": "Zed", "nom_archive": "z@y.com"}, True, set(), zipper=zp)
+    ok(r[0] is False and "introuvable" in r[1], "dossier introuvable")
+    r = te(g3, str(dp), {"nom_local": "Alice", "nom_archive": "alice@x.com", "email": "alice@x.com"}, False, set(), instance="s1", zipper=zp)
+    ok(r[0] is True and (dp / "Alice").exists() and "mikereichlin/ax-alice-x-com" in api3.datasets and "cree" in r[1], "envoi OK sans suppression : dossier conserve")
+    r = te(g3, str(dp), {"nom_local": "Alice", "nom_archive": "alice@x.com"}, True, set(), zipper=zp)
+    ok(r[0] is True and not (dp / "Alice").exists() and api3.datasets["mikereichlin/ax-alice-x-com"]["versions"] == 1, "mise a jour + suppression apres verification, une seule version")
+    api3.pannes = 99
+    r = te(g3, str(dp), {"nom_local": "Bob", "nom_archive": "bob@x.com"}, True, set(), zipper=zp)
+    ok(r[0] is False and (dp / "Bob").exists() and not list(zt.iterdir()), "echec reseau : rien supprime, temporaires nettoyes")
+
+# ---- phase 3 : flux A cote pilote (orchestration pure) ---------------------
+class Horloge:
+    def __init__(self): self.t = 1000.0
+    def __call__(self): return self.t
+
+def faire_flux(profils, **kw):
+    ev = {"lister": [], "arreter": [], "envoyer": [], "notif": [], "fin": 0}
+    h = Horloge()
+    f = ns["FluxEnvoiKaggle"](
+        profils, lister=lambda i: ev["lister"].append(i), arreter=lambda i, n: ev["arreter"].append((i, n)),
+        envoyer=lambda i, p: ev["envoyer"].append((i, p["nom_local"])),
+        notifier=lambda i, n, o, m: ev["notif"].append((i, n, o, m)),
+        terminer=lambda: ev.__setitem__("fin", ev["fin"] + 1), horloge=h, **kw)
+    return f, ev, h
+
+def P(i, n): return {"id_executant": i, "nom_local": n, "nom_archive": n + "@x.com"}
+
+f, ev, h = faire_flux([P("s1", "a"), P("s1", "b"), P("s2", "c")])
+f.demarrer()
+ok(sorted(ev["lister"]) == ["s1", "s2"] and not ev["envoyer"], "flux : un listage par sAutoniax, rien n'est envoye avant")
+f.sur_liste("s1", [{"nom": "a", "actif": True}, {"nom": "b", "actif": False}])
+ok(ev["arreter"] == [("s1", "a")] and ev["envoyer"] == [("s1", "b")], "flux : profil actif arrete, profil inactif part sans arret")
+f.sur_liste("s2", [{"nom": "c", "actif": False}])
+ok(("s2", "c") in ev["envoyer"] and ("s1", "a") not in ev["envoyer"], "flux : un profil dont l'arret n'est pas confirme ne part pas")
+f.sur_arret("s1", "a", True)
+ok(("s1", "a") not in ev["envoyer"], "flux : au plus 1 envoi a la fois par sAutoniax")
+f.sur_resultat("s1", "b", True, "ok")
+ok(("s1", "a") in ev["envoyer"], "flux : le profil arrete part des que le sAutoniax est libre")
+f.sur_resultat("s2", "c", False, "erreur reseau")
+f.sur_resultat("s1", "a", True, "ok")
+ok(ev["fin"] == 1 and f.est_termine() and sorted((n, o) for _, n, o, _ in ev["notif"]) == [("a", True), ("b", True), ("c", False)],
+   "flux : une erreur n'arrete pas les autres, fin signalee une seule fois")
+
+f, ev, h = faire_flux([P("s1", "a")])
+f.demarrer(); f.sur_liste("s1", [{"nom": "a", "actif": True}])
+f.sur_arret("s1", "a", False, "refus")
+ok(not ev["envoyer"] and ev["notif"][0][2] is False and "non confirme" in ev["notif"][0][3] and ev["fin"] == 1, "flux : arret refuse -> pas d'archive")
+f, ev, h = faire_flux([P("s1", "a")])
+f.demarrer(); f.sur_liste("s1", [{"nom": "a", "actif": True}])
+h.t += ns["DELAI_ARRET_S"] + 1; f.verifier_delais()
+ok(not ev["envoyer"] and "non confirme" in ev["notif"][0][3], "flux : delai d'arret depasse -> pas d'archive")
+f, ev, h = faire_flux([P("s1", "a")])
+f.demarrer(); f.sur_liste("s1", [{"nom": "autre", "actif": False}])
+ok(not ev["envoyer"] and "introuvable" in ev["notif"][0][3], "flux : profil disparu du sAutoniax")
+f, ev, h = faire_flux([P("s1", "a"), P("s2", "b")])
+f.demarrer(); h.t += ns["DELAI_LISTAGE_S"] + 1; f.verifier_delais()
+ok(len(ev["notif"]) == 2 and "injoignable" in ev["notif"][0][3] and ev["fin"] == 1, "flux : liste jamais recue -> erreur, pas de blocage")
+f, ev, h = faire_flux([P("s1", "a"), P("s2", "b")])
+f.demarrer(); f.sur_liste("s1", [{"nom": "a"}]); f.sur_liste("s2", [{"nom": "b"}])
+f.sur_executants_connectes({"s1"})
+ok(("s2", "b", False, "sAutoniax deconnecte pendant l'operation.") in ev["notif"] and not f.est_termine(), "flux : deconnexion -> ligne en erreur, les autres continuent")
+f.sur_resultat("s1", "a", True, "ok")
+ok(f.est_termine(), "flux : termine apres deconnexion partielle")
+f, ev, h = faire_flux([P("s1", "a")])
+f.demarrer(); f.sur_liste("s1", [{"nom": "a"}])
+f.sur_echec_transmission("kaggle_envoyer_profils", "s1", "serveurT hors ligne")
+ok(ev["notif"][0][2] is False and ev["fin"] == 1, "flux : echec de transmission de l'envoi")
+f, ev, h = faire_flux([P("s1", "a")])
+f.demarrer(); f.sur_liste("s1", [{"nom": "a"}])
+h.t += ns["DELAI_INACTIVITE_ENVOI_S"] + 1; f.verifier_delais()
+ok(ev["notif"][0][2] is False and ev["fin"] == 1, "flux : inactivite prolongee -> erreur")
+f.sur_resultat("s1", "a", True, "ok tardif")
+ok(ev["notif"][-1] == ("s1", "a", True, "ok tardif"), "flux : un resultat tardif reel corrige la ligne")
+f, ev, h = faire_flux([P("s%d" % i, "p%d" % i) for i in range(5)])
+f.demarrer()
+for i in range(5): f.sur_liste("s%d" % i, [{"nom": "p%d" % i}])
+ok(len(ev["envoyer"]) == 3, "flux : au plus MAX_TRANSFERTS_SIMULTANES envois en parallele")
+f.sur_resultat("s0", "p0", True, "ok")
+ok(len(ev["envoyer"]) == 4, "flux : un creneau libere lance le suivant")
+f, ev, h = faire_flux([])
+f.demarrer()
+ok(ev["fin"] == 1, "flux : aucun profil -> termine")
+
 print(f"OK -- {nb} verifications passees")

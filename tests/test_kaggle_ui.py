@@ -18,7 +18,7 @@ src = (RACINE / "AutoniaX.pyw").read_text(encoding="utf-8")
 i0 = src.index("# PROFILS KAGGLE (phase 1) -- DEBUT DU BLOC ISOLE")
 i1 = src.index("# PROFILS KAGGLE (phase 1) -- FIN DU BLOC ISOLE")
 bloc = src[src.rfind("\n# ====", 0, i0) + 1: src.index("\n", i1) + 1]
-ecran = src[src.index("class ProfilsKaggleScreen(QWidget):"): src.index("class ProfilsScreen(QWidget):")]
+ecran = src[src.index("class ProfilsKaggleScreen(QWidget):"): src.index("class ControleurKaggle(QObject):")]
 m0 = src.index("class Mocha:\n")
 mocha = src[m0: src.index("\n\n\n", m0)]
 

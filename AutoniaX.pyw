@@ -30585,6 +30585,238 @@ def resume_plan_envoi(plan: list, lignes: list, slugs_existants: Optional[set], 
             "ignores": sum(1 for p in plan if p["ignore"]), "supprimer_local": bool(supprimer_local)}
 
 
+# ---------------------------------------------------------------------------
+# Cote sAutoniax (phase 3) : analyse du dossier de profils et traitement d'un envoi.
+# Fonctions pures/testables ; les handlers reseau ne font que les appeler.
+# ---------------------------------------------------------------------------
+def _kaggle_taille_et_mtime(dossier: str) -> tuple:
+    """(taille totale en octets, derniere modification epoch) d'un dossier, sans suivre les liens."""
+    total, dernier = 0, 0.0
+    for racine, _dirs, fichiers in os.walk(dossier):
+        for nom in fichiers:
+            try:
+                st = os.lstat(os.path.join(racine, nom))
+            except OSError:
+                continue
+            total += st.st_size
+            dernier = max(dernier, st.st_mtime)
+    try:
+        dernier = max(dernier, os.lstat(dossier).st_mtime)
+    except OSError:
+        pass
+    return total, dernier
+
+
+def scanner_profils_kaggle(dossier_profils: str, noms_actifs: set) -> list:
+    """Profils presents sur ce sAutoniax (un sous-dossier non vide = un profil) :
+    [{nom, taille_octets, modifie_ts, origine_kaggle (str|None), actif}]."""
+    if not os.path.isdir(dossier_profils):
+        return []
+    origines = lire_origines_kaggle(dossier_profils)
+    sortie = []
+    for nom in sorted(os.listdir(dossier_profils)):
+        chemin = os.path.join(dossier_profils, nom)
+        if not os.path.isdir(chemin):
+            continue
+        try:
+            if not any(True for _ in os.scandir(chemin)):
+                continue
+        except OSError:
+            continue
+        taille, mtime = _kaggle_taille_et_mtime(chemin)
+        sortie.append({"nom": nom, "taille_octets": taille, "modifie_ts": mtime,
+                       "origine_kaggle": origines.get(nom), "actif": nom in noms_actifs})
+    return sortie
+
+
+def traiter_envoi_kaggle(gestionnaire, dossier_profils: str, profil: dict, supprimer_local: bool,
+                         noms_actifs: set, instance: str = "", progression=None, zipper=None) -> tuple:
+    """Traite UN profil de l'ordre kaggle_envoyer_profils. Retourne (ok, message).
+    Securite : un profil dont l'execution tourne encore n'est JAMAIS archive (cookies et bases
+    SQLite possiblement incoherents), et un nom de profil qui sort du dossier est refuse.
+    Le dossier local n'est supprime que par GestionnaireKaggle.envoyer_profil, apres envoi verifie."""
+    nom_local = str(profil.get("nom_local", ""))
+    nom_archive = str(profil.get("nom_archive", ""))
+    if not nom_local or not nom_archive:
+        return False, "Ordre incomplet (nom local ou nom d'archive manquant)."
+    if nom_local != os.path.basename(nom_local) or nom_local in (".", ".."):
+        return False, f"Nom de profil refuse : {nom_local!r}."
+    if nom_local in noms_actifs:
+        return False, "Profil en cours d'execution : arret non confirme, archive refusee."
+    chemin = os.path.join(dossier_profils, nom_local)
+    if not os.path.isdir(chemin):
+        return False, "Dossier du profil introuvable sur ce sAutoniax."
+    try:
+        res = gestionnaire.envoyer_profil(
+            chemin, nom_archive, nom_local=nom_local, email=str(profil.get("email", "")), instance=instance,
+            supprimer_local=bool(supprimer_local), zipper=zipper, progression=progression)
+    except Exception as e:  # une erreur sur un profil n'arrete jamais les autres
+        _log_kaggle.warning("Envoi de %r echoue : %r", nom_local, e)
+        return False, str(e)
+    if res.get("dossier_supprime"):
+        return True, "Envoye, verifie sur Kaggle, dossier local supprime."
+    return True, ("Dataset cree" if res.get("cree") else "Dataset mis a jour") + ", verifie sur Kaggle."
+
+
+# ---------------------------------------------------------------------------
+# Flux A cote PILOTE (phase 3) : orchestration pure (sans Qt, sans reseau), testable.
+#   listage des profils -> arret des executions -> envoi (1 profil par ordre) -> resultats
+# Regles : une erreur sur un profil n'arrete jamais les autres ; un profil dont l'arret n'est
+# pas confirme n'est PAS archive ; au plus 1 envoi a la fois par sAutoniax et au plus
+# MAX_TRANSFERTS_SIMULTANES au total ; rien n'est supprime ici (le sAutoniax ne supprime
+# qu'apres envoi verifie).
+# ---------------------------------------------------------------------------
+DELAI_LISTAGE_S = 30
+DELAI_ARRET_S = 90
+DELAI_INACTIVITE_ENVOI_S = DELAI_PRET_KAGGLE_S + 900
+
+
+class FluxEnvoiKaggle:
+    def __init__(self, profils: list, lister, arreter, envoyer, notifier, terminer, horloge=None,
+                 max_simultanes: int = MAX_TRANSFERTS_SIMULTANES):
+        """profils : [{id_executant, nom_local, nom_archive, email, ...}] ; callbacks :
+        lister(id_executant), arreter(id_executant, nom_local), envoyer(id_executant, profil),
+        notifier(id_executant, nom_local, ok, message), terminer()."""
+        self._lister, self._arreter, self._envoyer = lister, arreter, envoyer
+        self._notifier, self._terminer = notifier, terminer
+        self._horloge = horloge or time.monotonic
+        self._max = max_simultanes
+        self._entrees = [{"profil": p, "id": p["id_executant"], "nom": p["nom_local"],
+                          "etat": "liste", "echeance": 0.0, "timeout": False} for p in profils]
+        self._attente_liste: set = set()
+        self._echeance_liste = 0.0
+        self._termine = False
+        self._demarre = False
+
+    # -- cycle de vie ------------------------------------------------------
+    def demarrer(self):
+        self._demarre = True
+        ids = sorted({e["id"] for e in self._entrees})
+        self._attente_liste = set(ids)
+        self._echeance_liste = self._horloge() + DELAI_LISTAGE_S
+        for i in ids:
+            self._lister(i)
+        self._pomper()
+
+    def est_termine(self) -> bool:
+        return self._termine
+
+    def _etat(self, id_executant, nom_local):
+        for e in self._entrees:
+            if e["id"] == id_executant and e["nom"] == nom_local:
+                return e
+        return None
+
+    def _echouer(self, e, message: str, timeout: bool = False):
+        if e["etat"] == "fini":
+            return
+        e["etat"] = "fini"
+        e["timeout"] = timeout
+        self._notifier(e["id"], e["nom"], False, message)
+
+    # -- evenements --------------------------------------------------------
+    def sur_liste(self, id_executant: str, profils: list):
+        if id_executant not in self._attente_liste:
+            return
+        self._attente_liste.discard(id_executant)
+        presents = {str(p.get("nom")) for p in profils if isinstance(p, dict)}
+        actifs = {str(p.get("nom")) for p in profils if isinstance(p, dict) and p.get("actif")}
+        for e in self._entrees:
+            if e["id"] != id_executant or e["etat"] != "liste":
+                continue
+            if e["nom"] not in presents:
+                self._echouer(e, "Profil introuvable sur ce sAutoniax.")
+            elif e["nom"] in actifs:
+                e["etat"] = "arret"
+                e["echeance"] = self._horloge() + DELAI_ARRET_S
+                self._arreter(id_executant, e["nom"])
+            else:
+                e["etat"] = "pret"
+        self._pomper()
+
+    def sur_arret(self, id_executant: str, nom_local: str, ok: bool, message: str = ""):
+        e = self._etat(id_executant, nom_local)
+        if e is None or e["etat"] != "arret":
+            return
+        if ok:
+            e["etat"] = "pret"
+        else:
+            self._echouer(e, f"Arret non confirme, profil non archive{(' : ' + message) if message else ''}.")
+        self._pomper()
+
+    def sur_progression(self, id_executant: str, nom_local: str):
+        e = self._etat(id_executant, nom_local)
+        if e is not None and e["etat"] == "envoi":
+            e["echeance"] = self._horloge() + DELAI_INACTIVITE_ENVOI_S
+
+    def sur_resultat(self, id_executant: str, nom_local: str, ok: bool, message: str = ""):
+        e = self._etat(id_executant, nom_local)
+        if e is None:
+            return
+        if e["etat"] == "envoi" or (e["etat"] == "fini" and e["timeout"]):
+            e["etat"] = "fini"
+            e["timeout"] = False
+            self._notifier(id_executant, nom_local, ok, message)
+        self._pomper()
+
+    def sur_echec_transmission(self, type_ordre: str, id_executant: str, message: str = ""):
+        """Un ordre n'a pas pu etre transmis (serveurT, sAutoniax injoignable...)."""
+        message = message or "Transmission impossible."
+        for e in self._entrees:
+            if e["id"] != id_executant:
+                continue
+            if (type_ordre == "kaggle_lister_profils" and e["etat"] == "liste") or \
+               (type_ordre == "kaggle_envoyer_profils" and e["etat"] == "envoi"):
+                self._echouer(e, message)
+        if type_ordre == "kaggle_lister_profils":
+            self._attente_liste.discard(id_executant)
+        self._pomper()
+
+    def sur_executants_connectes(self, ids_connectes):
+        ids = set(ids_connectes)
+        for e in self._entrees:
+            if e["etat"] != "fini" and e["id"] not in ids:
+                self._attente_liste.discard(e["id"])
+                self._echouer(e, "sAutoniax deconnecte pendant l'operation.")
+        self._pomper()
+
+    def verifier_delais(self):
+        if not self._demarre or self._termine:
+            return
+        maintenant = self._horloge()
+        for e in self._entrees:
+            if e["etat"] == "liste" and e["id"] in self._attente_liste and maintenant > self._echeance_liste:
+                self._echouer(e, f"sAutoniax injoignable (liste des profils non recue en {DELAI_LISTAGE_S} s).")
+            elif e["etat"] == "arret" and maintenant > e["echeance"]:
+                self._echouer(e, f"Arret non confirme en {DELAI_ARRET_S} s, profil non archive.")
+            elif e["etat"] == "envoi" and maintenant > e["echeance"]:
+                self._echouer(e, "Aucune nouvelle du sAutoniax : verifier Kaggle (le resultat peut arriver plus tard).",
+                              timeout=True)
+        if maintenant > self._echeance_liste:
+            self._attente_liste.clear()
+        self._pomper()
+
+    # -- ordonnancement ----------------------------------------------------
+    def _pomper(self):
+        if self._termine or not self._demarre:
+            return
+        en_cours = [e for e in self._entrees if e["etat"] == "envoi"]
+        occupes = {e["id"] for e in en_cours}
+        libres = self._max - len(en_cours)
+        for e in self._entrees:
+            if libres <= 0:
+                break
+            if e["etat"] == "pret" and e["id"] not in occupes:
+                e["etat"] = "envoi"
+                e["echeance"] = self._horloge() + DELAI_INACTIVITE_ENVOI_S
+                occupes.add(e["id"])
+                libres -= 1
+                self._envoyer(e["id"], e["profil"])
+        if all(e["etat"] == "fini" for e in self._entrees):
+            self._termine = True
+            self._terminer()
+
+
 # ===========================================================================
 # PROFILS KAGGLE (phase 1) -- FIN DU BLOC ISOLE
 # ===========================================================================
@@ -31165,6 +31397,148 @@ class ProfilsKaggleScreen(QWidget):
             self.demande_kaggle_verifier_connexion.emit()
             if self._sautoniax:
                 self.demande_kaggle_actualiser_profils.emit(sorted(self._sautoniax))
+
+
+class ControleurKaggle(QObject):
+    """Profils Kaggle (phase 3) -- colle ProfilsKaggleScreen, ClientServeurT et GestionnaireKaggle.
+    - connexion / quota / liste des datasets : GestionnaireKaggle dans un thread (jamais le thread Qt) ;
+    - liste des profils d'un sAutoniax : ordre kaggle_lister_profils ;
+    - flux A : FluxEnvoiKaggle (listage -> arret -> envoi, 1 profil par ordre).
+    Le flux B (telechargement) est branche a la phase 4."""
+
+    _connexion_prete = Signal(bool, str, object)
+    _datasets_prets = Signal(object)
+
+    def __init__(self, client_serveur_t, ecran, fabrique_gestionnaire=None, parent=None):
+        super().__init__(parent)
+        self._client = client_serveur_t
+        self._ecran = ecran
+        self._fabrique = fabrique_gestionnaire or GestionnaireKaggle
+        self._flux: Optional[FluxEnvoiKaggle] = None
+        self._operation: Optional[str] = None
+        self._supprimer_local = False
+        self._thread_liste: Optional[threading.Thread] = None
+        self._connexion_prete.connect(self._sur_connexion_prete)
+        self._datasets_prets.connect(self._sur_datasets_prets)
+        self._minuteur = QTimer(self)
+        self._minuteur.setInterval(1000)
+        self._minuteur.timeout.connect(self._sur_minuteur)
+        self._minuteur.start()
+        # ecran -> controleur
+        ecran.demande_kaggle_verifier_connexion.connect(self.verifier_connexion)
+        ecran.demande_kaggle_actualiser_profils.connect(self.actualiser_profils)
+        ecran.demande_kaggle_actualiser_datasets.connect(self.actualiser_datasets)
+        ecran.demande_kaggle_envoyer.connect(self.demarrer_envoi)
+        # reseau -> controleur
+        client_serveur_t.kaggle_profils_recus.connect(self._sur_profils_recus)
+        client_serveur_t.kaggle_progression_recue.connect(self._sur_progression)
+        client_serveur_t.kaggle_resultat_recu.connect(self._sur_resultat)
+        client_serveur_t.kaggle_ack_recu.connect(self._sur_ack)
+        client_serveur_t.arreter_execution_profil_resultat.connect(self._sur_ack_arret)
+        client_serveur_t.arreter_execution_profil_resultat_reel_recu.connect(self._sur_arret_reel)
+
+    # -- connexion Kaggle, quota, datasets (thread) ------------------------
+    def verifier_connexion(self):
+        def travail():
+            try:
+                g = self._fabrique()
+                g.authentifier()
+                datasets = g.lister_datasets()
+                self._connexion_prete.emit(True, "", GestionnaireKaggle.quota_utilise_octets(datasets))
+                self._datasets_prets.emit(datasets)
+            except Exception as e:
+                self._connexion_prete.emit(False, str(e), None)
+        threading.Thread(target=travail, name="kaggle-connexion", daemon=True).start()
+
+    def actualiser_datasets(self):
+        def travail():
+            try:
+                self._datasets_prets.emit(self._fabrique().lister_datasets())
+            except Exception as e:
+                self._connexion_prete.emit(False, str(e), None)
+        threading.Thread(target=travail, name="kaggle-datasets", daemon=True).start()
+
+    def _sur_connexion_prete(self, ok, message, quota):
+        self._ecran.definir_etat_connexion(bool(ok), message or "", quota)
+
+    def _sur_datasets_prets(self, datasets):
+        self._ecran.definir_datasets(datasets)
+
+    # -- liste des profils d'un sAutoniax ----------------------------------
+    def actualiser_profils(self, ids_executants):
+        for id_executant in ids_executants:
+            self._client.envoyer_ordre_kaggle("kaggle_lister_profils", id_executant, uuid.uuid4().hex[:12])
+
+    def _sur_profils_recus(self, id_executant, profils):
+        self._ecran.definir_profils_sautoniax(id_executant, profils)
+        if self._flux is not None:
+            self._flux.sur_liste(id_executant, profils)
+
+    # -- flux A ------------------------------------------------------------
+    def demarrer_envoi(self, charge: dict):
+        id_operation = charge.get("id_operation", "")
+        profils = list(charge.get("profils") or [])
+        if self._flux is not None and not self._flux.est_termine():
+            self._ecran.ajouter_journal("Une operation Kaggle est deja en cours.")
+            self._ecran.terminer_operation(id_operation)
+            return
+        self._operation = id_operation
+        self._supprimer_local = bool(charge.get("supprimer_local"))
+        self._flux = FluxEnvoiKaggle(
+            profils,
+            lister=lambda i: self._client.envoyer_ordre_kaggle("kaggle_lister_profils", i, id_operation),
+            arreter=self._arreter_profil,
+            envoyer=self._envoyer_profil,
+            notifier=lambda i, n, ok, m: self._ecran.sur_resultat_envoi(id_operation, i, n, ok, m),
+            terminer=lambda: self._ecran.terminer_operation(id_operation),
+        )
+        self._flux.demarrer()
+
+    def _arreter_profil(self, id_executant, nom_local):
+        self._ecran.ajouter_journal(f"Arret de l'execution : {self._ecran._sautoniax.get(id_executant, id_executant)} / {nom_local}")
+        self._client.arreter_execution_profil(id_executant, nom_local)
+
+    def _envoyer_profil(self, id_executant, profil):
+        self._client.envoyer_ordre_kaggle(
+            "kaggle_envoyer_profils", id_executant, self._operation or "",
+            supprimer_local=self._supprimer_local,
+            profils=[{"nom_local": profil["nom_local"], "nom_archive": profil["nom_archive"],
+                      "email": profil.get("email", "")}])
+
+    def _flux_actif(self):
+        return self._flux if (self._flux is not None and not self._flux.est_termine()) else None
+
+    def _sur_progression(self, id_operation, id_executant, nom_local, etape, pourcentage):
+        if id_operation != self._operation:
+            return
+        self._ecran.sur_progression_envoi(id_operation, id_executant, nom_local, etape, pourcentage)
+        if self._flux is not None:
+            self._flux.sur_progression(id_executant, nom_local)
+
+    def _sur_resultat(self, id_operation, id_executant, nom_local, ok, message):
+        if id_operation == self._operation and self._flux is not None:
+            self._flux.sur_resultat(id_executant, nom_local, ok, message)
+
+    def _sur_ack(self, type_ordre, id_executant, id_operation, ok, erreur):
+        if not ok and self._flux is not None and id_operation == self._operation:
+            self._flux.sur_echec_transmission(type_ordre, id_executant, erreur)
+
+    def _sur_ack_arret(self, ok, id_executant, nom_profil, erreur):
+        # ok=True : simple transmission ; le vrai resultat arrive via arreter_..._resultat_reel
+        if not ok and self._flux is not None:
+            self._flux.sur_arret(id_executant, nom_profil, False, erreur)
+
+    def _sur_arret_reel(self, id_executant, nom_profil, ok, message):
+        if self._flux is not None:
+            self._flux.sur_arret(id_executant, nom_profil, bool(ok), message)
+
+    def sur_executants_connectes(self, executants: dict):
+        if self._flux is not None:
+            self._flux.sur_executants_connectes(set(executants))
+
+    def _sur_minuteur(self):
+        if self._flux is not None:
+            self._flux.verifier_delais()
 
 
 class ProfilsScreen(QWidget):
@@ -85810,6 +86184,15 @@ class ClientServeurT(QObject):
     #   pour la construction exacte.
     demander_profils_sautoniax_resultat = Signal(bool, str, str)
     profils_sautoniax_recu = Signal(str, list)
+    # PATCH (Profils Kaggle, phase 3) -- cote PILOTE : accuse de transmission d'un ordre
+    # Kaggle (type_ordre, id_executant, id_operation, ok, erreur), liste des profils d'un
+    # sAutoniax (id_executant, profils), progression (id_operation, id_executant,
+    # nom_local, etape, pourcentage) et resultat par profil (id_operation, id_executant,
+    # nom_local, ok, message). Voir serveur.py (TYPES_KAGGLE_*).
+    kaggle_ack_recu = Signal(str, str, str, bool, str)
+    kaggle_profils_recus = Signal(str, list)
+    kaggle_progression_recue = Signal(str, str, str, str, int)
+    kaggle_resultat_recu = Signal(str, str, str, bool, str)
 
     # PATCH (bouton "Démarrer" sur un profil INACTIF du panneau de
     # propriétés -- demande explicite utilisateur : "on peu tres bien
@@ -86250,6 +86633,9 @@ class ClientServeurT(QObject):
     # de batch en cours + Notebook Distant) et répond via envoyer_profils_
     # sautoniax_resultat.
     profils_sautoniax_demande = Signal(str)  # id_pilote
+    # PATCH (Profils Kaggle, phase 3) -- cote EXECUTANT : ordre Kaggle recu du pilote
+    # (type_ordre, message complet avec id_pilote ajoute par le serveur).
+    kaggle_ordre_recu = Signal(str, dict)
 
     # Côté EXÉCUTANT -- ordre de démarrage d'UN profil ISOLÉ (sans
     # ProjetBatch, cf. docstring demarrer_profil_isole_resultat_recu côté
@@ -87112,6 +87498,34 @@ class ClientServeurT(QObject):
             return
         asyncio.run_coroutine_threadsafe(
             self._demander_profils_sautoniax(id_executant), self._loop,
+        )
+
+    def envoyer_ordre_kaggle(self, type_ordre: str, id_executant: str, id_operation: str, **champs):
+        """PILOTE -- ordre du sous-onglet Profils Kaggle (kaggle_lister_profils /
+        kaggle_envoyer_profils / kaggle_telecharger_profils), relaye par serveur.py
+        vers UN sAutoniax. Les archives ne passent jamais par le serveurT."""
+        if self._loop is None or not self._loop.is_running() or self._ws is None:
+            self.kaggle_ack_recu.emit(type_ordre, id_executant, id_operation, False, "Non connecté au serveurT.")
+            return
+        message = {"type": type_ordre, "id_executant": id_executant, "id_operation": id_operation, **champs}
+
+        async def _envoi():
+            try:
+                await self._ws.send(json.dumps(message))
+                log_reseau_t.info(f"-> {type_ordre} envoyé au serveurT (id_executant={id_executant!r}, op={id_operation!r})")
+            except Exception as e:
+                log_reseau_t.warning(f"Échec envoi {type_ordre} ('{id_executant}') : {e!r}")
+                self.kaggle_ack_recu.emit(type_ordre, id_executant, id_operation, False, str(e))
+
+        asyncio.run_coroutine_threadsafe(_envoi(), self._loop)
+
+    def envoyer_kaggle_vers_pilote(self, type_message: str, id_pilote: str, **champs):
+        """EXECUTANT -- reponse Kaggle (kaggle_lister_profils_resultat / kaggle_progression /
+        kaggle_resultat), relayee DIRECTEMENT au pilote demandeur. Appelable depuis un thread."""
+        if self._loop is None or not self._loop.is_running() or self._ws is None:
+            return
+        asyncio.run_coroutine_threadsafe(
+            self._ws.send(json.dumps({"type": type_message, "id_pilote": id_pilote, **champs})), self._loop,
         )
 
     def demander_demarrer_profil_isole(self, id_executant: str, nom_profil: str):
@@ -91631,6 +92045,36 @@ class ClientServeurT(QObject):
             profils = data.get("profils", [])
             log_reseau_t.info(f"<- profils_sautoniax_resultat (id_executant={id_executant!r}, {len(profils)} profil(s))")
             self.profils_sautoniax_recu.emit(id_executant, profils)
+
+        elif data.get("type") in ("kaggle_lister_profils", "kaggle_envoyer_profils", "kaggle_telecharger_profils"):
+            # Côté EXÉCUTANT -- ordre Kaggle relayé par le serveurT (id_pilote ajouté).
+            log_reseau_t.info(f"<- {data.get('type')} reçu du pilote (op={data.get('id_operation')!r})")
+            self.kaggle_ordre_recu.emit(data.get("type"), dict(data))
+
+        elif data.get("type") in ("kaggle_lister_profils_ack", "kaggle_envoyer_profils_ack", "kaggle_telecharger_profils_ack"):
+            # Côté PILOTE -- accusé de TRANSMISSION d'un ordre (pas du résultat).
+            ok = bool(data.get("ok", False))
+            if not ok:
+                log_reseau_t.warning(f"<- {data.get('type')} (ok=False) : {data.get('erreur', '')}")
+            self.kaggle_ack_recu.emit(str(data.get("type", ""))[:-4], data.get("id_executant", ""),
+                                       data.get("id_operation", ""), ok, data.get("erreur", ""))
+
+        elif data.get("type") == "kaggle_lister_profils_resultat":
+            profils = data.get("profils", [])
+            self.kaggle_profils_recus.emit(data.get("id_executant", ""), profils if isinstance(profils, list) else [])
+
+        elif data.get("type") == "kaggle_progression":
+            try:
+                pct = int(data.get("pourcentage", 0))
+            except (TypeError, ValueError):
+                pct = 0
+            self.kaggle_progression_recue.emit(data.get("id_operation", ""), data.get("id_executant", ""),
+                                                data.get("nom_local", ""), str(data.get("etape", "")), pct)
+
+        elif data.get("type") == "kaggle_resultat":
+            self.kaggle_resultat_recu.emit(data.get("id_operation", ""), data.get("id_executant", ""),
+                                            data.get("nom_local", ""), bool(data.get("ok", False)),
+                                            str(data.get("message", "")))
 
         elif data.get("type") == "demander_horloge_mautoniax":
             # Côté PILOTE -- un sAutoniax vient de demander l'heure (cf.
@@ -112527,14 +112971,14 @@ class MainWindow(QMainWindow):
                 {e.get("id", ""): e.get("nom") or e.get("id", "") for e in executants if e.get("id")}
             )
         )
-        # PATCH (Profils Kaggle, phase 2) -- reglages (correspondance de noms) + flux
-        # reseau PAS ENCORE branches : les ordres d'envoi/telechargement liberent
-        # l'ecran immediatement (remplace par le vrai cablage aux phases 3 et 4).
+        # PATCH (Profils Kaggle, phase 3) -- reglages + controleur reseau. Le flux A (envoi) est
+        # branche ; le flux B (telechargement) reste a brancher a la phase 4 (stub conserve).
         reseau_screen.profils_screen.definir_reglages_kaggle(self.reglages)
-        reseau_screen.profils_screen.demande_kaggle_envoyer.connect(
-            lambda charge: reseau_screen.profils_screen.kaggle_screen.sur_non_branche(
-                charge.get("id_operation"), "L'envoi vers Kaggle")
-        )
+        self.controleur_kaggle = ControleurKaggle(
+            self.client_serveur_t, reseau_screen.profils_screen.kaggle_screen, parent=self)
+        self.client_serveur_t.executants_detail_change.connect(
+            lambda executants: self.controleur_kaggle.sur_executants_connectes(
+                {e.get("id", ""): e.get("nom") or e.get("id", "") for e in executants if e.get("id")}))
         reseau_screen.profils_screen.demande_kaggle_telecharger.connect(
             lambda charge: reseau_screen.profils_screen.kaggle_screen.sur_non_branche(
                 charge.get("id_operation"), "Le telechargement depuis Kaggle")
@@ -144731,6 +145175,77 @@ async def _main_async_sautoniax(
         client_t.envoyer_profils_sautoniax_resultat(id_pilote, profils)
 
     client_t.profils_sautoniax_demande.connect(_sur_profils_sautoniax_demande, Qt.DirectConnection)
+
+    # PATCH (Profils Kaggle, phase 3) -- ordres Kaggle du pilote (relayes par serveur.py).
+    # Les transferts sont BLOQUANTS : chaque ordre tourne dans un thread dedie (jamais sur le
+    # thread reseau ni Qt), un seul ordre de transfert a la fois sur ce sAutoniax. Le pilote
+    # envoie UN profil par ordre et borne le total a MAX_TRANSFERTS_SIMULTANES.
+    _verrou_transfert_kaggle = threading.Lock()
+
+    def _kaggle_noms_actifs() -> set:
+        actifs: set = set()
+        moteur_k = _moteur_batch_courant.get("moteur")
+        if moteur_k is not None and hasattr(moteur_k, "_instances_par_profil"):
+            actifs |= {n for n, v in dict(moteur_k._instances_par_profil).items() if v}
+        actifs |= {n for n, v in dict(_instances_isolees).items() if v}
+        actifs |= {n for n, v in dict(_instances_legacy_par_profil).items() if v}
+        if namespace_notebook_distant.get("profil_charge"):
+            actifs.add(namespace_notebook_distant["profil_charge"])
+        for _tk in list(_taches_projets_en_cours):
+            _nk = getattr(_tk, "_diag_profil_nom", None)
+            if _nk and not _tk.done():
+                actifs.add(_nk)
+        return actifs
+
+    def _kaggle_travail(type_ordre: str, msg: dict):
+        id_pilote = msg.get("id_pilote", "")
+        id_operation = msg.get("id_operation", "")
+        dossier_profils = str(_chemin_donnees("sautoniax_profils"))
+        try:
+            if type_ordre == "kaggle_lister_profils":
+                profils_k = scanner_profils_kaggle(dossier_profils, _kaggle_noms_actifs())
+                log.info(f"[sAutoniax] kaggle_lister_profils : {len(profils_k)} profil(s).")
+                client_t.envoyer_kaggle_vers_pilote("kaggle_lister_profils_resultat", id_pilote,
+                                                    id_operation=id_operation, profils=profils_k)
+                return
+            profils_ordre = [p for p in (msg.get("profils") or []) if isinstance(p, dict)]
+            if type_ordre != "kaggle_envoyer_profils":
+                for p in profils_ordre:
+                    client_t.envoyer_kaggle_vers_pilote(
+                        "kaggle_resultat", id_pilote, id_operation=id_operation, nom_local=str(p.get("nom_local", "")),
+                        ok=False, message="Ce type d'ordre n'est pas disponible dans cette version.")
+                return
+            with _verrou_transfert_kaggle:
+                gestionnaire = GestionnaireKaggle()
+                for p in profils_ordre:
+                    nom_local_k = str(p.get("nom_local", ""))
+
+                    def _prog(etape, pct, _n=nom_local_k):
+                        client_t.envoyer_kaggle_vers_pilote("kaggle_progression", id_pilote, id_operation=id_operation,
+                                                            nom_local=_n, etape=etape, pourcentage=int(pct))
+
+                    # l'arret confirme par le pilote peut mettre quelques secondes a vider les registres
+                    for _ in range(15):
+                        if nom_local_k not in _kaggle_noms_actifs():
+                            break
+                        time.sleep(1)
+                    ok_k, message_k = traiter_envoi_kaggle(
+                        gestionnaire, dossier_profils, p, bool(msg.get("supprimer_local")),
+                        _kaggle_noms_actifs(), instance=str(instance_id), progression=_prog)
+                    log.info(f"[sAutoniax] kaggle envoi '{nom_local_k}' : ok={ok_k} -- {message_k}")
+                    client_t.envoyer_kaggle_vers_pilote("kaggle_resultat", id_pilote, id_operation=id_operation,
+                                                        nom_local=nom_local_k, ok=ok_k, message=message_k)
+        except Exception as e:
+            log.exception("[sAutoniax] ordre Kaggle en echec")
+            for p in ([{}] if type_ordre == "kaggle_lister_profils" else (msg.get("profils") or [{}])):
+                client_t.envoyer_kaggle_vers_pilote(
+                    "kaggle_resultat", id_pilote, id_operation=id_operation,
+                    nom_local=str(p.get("nom_local", "")) if isinstance(p, dict) else "", ok=False, message=str(e))
+
+    def _sur_kaggle_ordre_recu(type_ordre: str, msg: dict):
+        threading.Thread(target=_kaggle_travail, args=(type_ordre, msg), name="kaggle-sautoniax", daemon=True).start()
+
+    client_t.kaggle_ordre_recu.connect(_sur_kaggle_ordre_recu, Qt.DirectConnection)
 
     def _sur_demarrer_profil_isole_demande(nom_profil: str, id_pilote: str):
         # PATCH (Patch 4.2 -- bouton "Démarrer" sur un profil inactif du
