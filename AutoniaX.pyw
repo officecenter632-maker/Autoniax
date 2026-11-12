@@ -15975,6 +15975,7 @@ class ReglagesApp:
     # Date d'import en ISO UTC ("" si jamais importee).
     kaggle_correspondance_noms: dict = field(default_factory=dict)
     kaggle_correspondance_date: str = ""
+    kaggle_correspondance_sites: dict = field(default_factory=dict)  # {nom_profil: [tags sites]} (fournis par l'IA)
 
     # PATCH (demande explicite utilisateur : "un bouton toggle dans les
     # paramètres qui va désactiver la sortie de cellules quand on a
@@ -16254,6 +16255,7 @@ class ReglagesApp:
             "calibration_ouverture_task": dict(self.calibration_ouverture_task),
             "kaggle_correspondance_noms": dict(self.kaggle_correspondance_noms),
             "kaggle_correspondance_date": self.kaggle_correspondance_date,
+            "kaggle_correspondance_sites": {str(k): list(v) for k, v in self.kaggle_correspondance_sites.items()},
             "bloquer_sortie_cellules": self.bloquer_sortie_cellules,
             "splash_actif": self.splash_actif,
             "toujours_en_arriere_plan": self.toujours_en_arriere_plan,
@@ -16293,6 +16295,10 @@ class ReglagesApp:
             ),
             kaggle_correspondance_date=(
                 d["kaggle_correspondance_date"] if isinstance(d.get("kaggle_correspondance_date"), str) else ""
+            ),
+            kaggle_correspondance_sites=(
+                {str(k): normaliser_sites(v) for k, v in d["kaggle_correspondance_sites"].items()}
+                if isinstance(d.get("kaggle_correspondance_sites"), dict) else {}
             ),
             bloquer_sortie_cellules=bool(d.get("bloquer_sortie_cellules", False)),
             splash_actif=d.get("splash_actif", True),
@@ -30121,16 +30127,35 @@ def nom_archive_depuis_titre(titre: str) -> str:
     return t[3:] if t.startswith("AX ") else t
 
 
-def sous_titre_creation(date_iso: Optional[str] = None) -> str:
-    return KAGGLE_PREFIXE_SOUS_TITRE + (date_iso or _kaggle_maintenant_iso())
+_KG_MARQUE_SITES = ";sites="
+_KG_SOUS_TITRE_MAX = 80  # limite Kaggle du sous-titre
+
+
+def sous_titre_creation(date_iso: Optional[str] = None, sites=None) -> str:
+    """'ax;cree=<date>' + ';sites=a,b' : les tags qui ne tiennent pas dans les 80 caracteres sont omis en entier."""
+    s = KAGGLE_PREFIXE_SOUS_TITRE + (date_iso or _kaggle_maintenant_iso())
+    gardes: list = []
+    for tag in normaliser_sites(sites):
+        essai = s + _KG_MARQUE_SITES + ",".join(gardes + [tag])
+        if len(essai) > _KG_SOUS_TITRE_MAX:
+            break
+        gardes.append(tag)
+    return s + (_KG_MARQUE_SITES + ",".join(gardes) if gardes else "")
 
 
 def date_creation_depuis_sous_titre(sous_titre: Optional[str]) -> Optional[str]:
     s = str(sous_titre or "")
     if s.startswith(KAGGLE_PREFIXE_SOUS_TITRE):
-        valeur = s[len(KAGGLE_PREFIXE_SOUS_TITRE):].strip()
+        valeur = s[len(KAGGLE_PREFIXE_SOUS_TITRE):].split(_KG_MARQUE_SITES, 1)[0].strip()
         return valeur or None
     return None
+
+
+def sites_depuis_sous_titre(sous_titre: Optional[str]) -> list:
+    s = str(sous_titre or "")
+    if s.startswith(KAGGLE_PREFIXE_SOUS_TITRE) and _KG_MARQUE_SITES in s:
+        return normaliser_sites(s.split(_KG_MARQUE_SITES, 1)[1].split(","))
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -30139,6 +30164,14 @@ def date_creation_depuis_sous_titre(sous_titre: Optional[str]) -> Optional[str]:
 def valider_correspondance(texte: str) -> tuple:
     """Parse et valide le JSON. Retourne (correspondance, avertissements) ou
     leve ErreurCorrespondance. Ne modifie rien."""
+    correspondance, _sites, avertissements = valider_correspondance_complete(texte)
+    return correspondance, avertissements
+
+
+def valider_correspondance_complete(texte: str) -> tuple:
+    """Comme valider_correspondance, mais retourne (emails, sites, avertissements). Chaque valeur du JSON est soit
+    une chaine (email, ancien format) soit un objet {"email": "...", "sites": ["google", ...]}.
+    sites : {nom_profil: [tags]} ; un profil donne en ancien format n'a PAS d'entree (ses tags ne sont pas touches)."""
     if texte is None or not str(texte).strip():
         raise ErreurCorrespondance("Le presse-papiers est vide.")
     try:
@@ -30147,10 +30180,17 @@ def valider_correspondance(texte: str) -> tuple:
         raise ErreurCorrespondance(f"JSON invalide : {e}")
     if not isinstance(donnees, dict):
         raise ErreurCorrespondance(
-            'Le JSON doit etre un objet { "nom_profil": "email@domaine.com", ... }.')
+            'Le JSON doit etre un objet { "nom_profil": {"email": "email@domaine.com", "sites": [...]}, ... }.')
     resultat: dict = {}
+    sites_par_profil: dict = {}
     avertissements: list = []
     for cle, valeur in donnees.items():
+        sites_valeur = None
+        if isinstance(valeur, dict):
+            sites_valeur = valeur.get("sites")
+            if sites_valeur is not None and not isinstance(sites_valeur, (list, str)):
+                raise ErreurCorrespondance(f"'sites' doit etre une liste de textes : {cle!r}.")
+            valeur = valeur.get("email")
         if not isinstance(cle, str) or not isinstance(valeur, str):
             raise ErreurCorrespondance(f"Cle ou valeur qui n'est pas une chaine : {cle!r}.")
         c, v = cle.strip(), valeur.strip()
@@ -30161,60 +30201,74 @@ def valider_correspondance(texte: str) -> tuple:
         if "@" not in v:
             avertissements.append(f"La valeur de {c!r} ne contient pas de '@' : {v!r}.")
         resultat[c] = v
+        if sites_valeur is not None:
+            sites_par_profil[c] = normaliser_sites(sites_valeur)
     vus: dict = {}
     for c, v in resultat.items():
         vus.setdefault(v.lower(), []).append(c)
     for v, noms in vus.items():
         if len(noms) > 1:
             avertissements.append(f"Meme valeur pour plusieurs profils ({', '.join(noms)}) : {v!r}.")
-    return resultat, avertissements
+    return resultat, sites_par_profil, avertissements
 
 
 PROMPT_CORRESPONDANCE_IA = (
     "Tu vas corriger un JSON de correspondance pour une application.\n"
-    "FORMAT EXIGÉ : un objet JSON plat { \"nom_profil_local\": \"email@domaine.com\" }.\n"
+    "FORMAT EXIGÉ : un objet JSON { \"nom_profil_local\": { \"email\": \"email@domaine.com\", "
+    "\"sites\": [\"google\", \"tiktok\"] } }.\n"
     "- Chaque clé est un nom de profil local : recopie-la EXACTEMENT telle quelle (même casse, mêmes "
     "caractères). Ne renomme, n'ajoute et ne supprime aucune clé.\n"
-    "- Chaque valeur est l'adresse e-mail complète du compte (avec @), jamais vide. Les valeurs vides "
+    "- \"email\" : l'adresse e-mail complète du compte (avec @), jamais vide. Les valeurs vides "
     "\"\" sont à compléter ; corrige aussi celles qui sont fausses.\n"
-    "- Deux clés ne doivent jamais avoir la même valeur.\n"
+    "- Deux clés ne doivent jamais avoir le même email.\n"
+    "- \"sites\" : la liste des sites/services sur lesquels le compte est déjà connecté, en minuscules, "
+    "un mot par site (ex. google, youtube, tiktok, facebook). Complète-la d'après les informations que je te "
+    "donne ; garde les sites déjà présents ; mets [] si tu n'en sais rien.\n"
     "- Réponds UNIQUEMENT avec le JSON valide : aucun texte avant ou après, aucune explication, "
     "pas de bloc de code markdown.\n"
     "JSON actuel :\n"
 )
 
 
-def construire_texte_correspondance_ia(noms_profils: list, correspondance: dict) -> str:
-    """Texte a coller dans une IA : un court prompt puis le JSON {nom_profil_local: email}.
-    Contient tous les profils actuellement listes (valeur "" si pas encore de correspondance), puis les
-    entrees de la correspondance enregistree qui ne correspondent a aucun profil liste. L'IA renvoie ce
-    meme JSON corrige, directement importable par « Importer la correspondance »."""
+def construire_texte_correspondance_ia(noms_profils: list, correspondance: dict, sites: Optional[dict] = None) -> str:
+    """Texte a coller dans une IA : un court prompt puis le JSON {nom_profil_local: {"email", "sites"}}.
+    Contient tous les profils actuellement listes (email "" et sites [] si rien d'enregistre), puis les entrees
+    enregistrees qui ne correspondent a aucun profil liste. L'IA renvoie ce meme JSON corrige, directement
+    importable par « Importer la correspondance »."""
     correspondance = correspondance or {}
+    sites = sites or {}
+    # Seuls les profils actuellement listes sont proposes : les anciennes entrees enregistrees (profil deja envoye
+    # puis supprime du sAutoniax, par ex.) ne reviennent plus dans le JSON. Repli sur l'enregistre si rien n'est liste.
+    noms = {str(n) for n in noms_profils if str(n).strip()}
+    if not noms:
+        noms = {str(n) for n in correspondance} | {str(n) for n in sites}
     contenu: dict = {}
-    for nom in sorted({str(n) for n in noms_profils if str(n).strip()}, key=lambda n: n.lower()):
-        contenu[nom] = str(correspondance.get(nom, "") or "")
-    for nom, valeur in correspondance.items():
-        contenu.setdefault(str(nom), str(valeur or ""))
+    for nom in sorted(noms, key=lambda n: n.lower()):
+        contenu[nom] = {"email": str(correspondance.get(nom, "") or ""), "sites": normaliser_sites(sites.get(nom))}
     return PROMPT_CORRESPONDANCE_IA + json.dumps(contenu, ensure_ascii=False, indent=2)
 
 
 def importer_correspondance(reglages, texte: str) -> tuple:
     """Import atomique : remplace entierement la correspondance (pas de
     fusion). En cas d'erreur, l'ancienne correspondance reste intacte."""
-    correspondance, avertissements = valider_correspondance(texte)
-    anciens = (reglages.kaggle_correspondance_noms, reglages.kaggle_correspondance_date)
+    correspondance, sites, avertissements = valider_correspondance_complete(texte)
+    anciens = (reglages.kaggle_correspondance_noms, reglages.kaggle_correspondance_date,
+               getattr(reglages, "kaggle_correspondance_sites", {}))
     reglages.kaggle_correspondance_noms = correspondance
+    reglages.kaggle_correspondance_sites = sites
     reglages.kaggle_correspondance_date = _kaggle_maintenant_iso()
     try:
         reglages.save()
     except Exception as e:
-        reglages.kaggle_correspondance_noms, reglages.kaggle_correspondance_date = anciens
+        (reglages.kaggle_correspondance_noms, reglages.kaggle_correspondance_date,
+         reglages.kaggle_correspondance_sites) = anciens
         raise ErreurCorrespondance(f"Impossible d'enregistrer la correspondance : {e}")
     return correspondance, avertissements
 
 
 def vider_correspondance(reglages) -> None:
     reglages.kaggle_correspondance_noms = {}
+    reglages.kaggle_correspondance_sites = {}
     reglages.kaggle_correspondance_date = ""
     reglages.save()
 
@@ -30291,6 +30345,242 @@ def _kaggle_extraire_zip_sur(chemin_zip: str, dossier_dest: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Journal detaille, statistiques, historique et corbeille locale des transferts Kaggle
+# ---------------------------------------------------------------------------
+KAGGLE_EXTENSION_ARCHIVE = ".axz"  # extension de l'archive envoyee : Kaggle decompresse les ".zip" (77 fichiers a retelecharger un par un -> 429) mais garde les autres extensions telles quelles (1 seul fichier). Remettre ".zip" pour revenir en arriere.
+SEUIL_PETIT_DOSSIER_OCTETS = 5 * 1024 * 1024
+CORBEILLE_KAGGLE_JOURS = 7
+NOM_HISTORIQUE_KAGGLE = "_kaggle_historique.json"
+NOM_CORBEILLE_KAGGLE = "sautoniax_profils_corbeille"  # frere de sautoniax_profils : jamais pris pour un profil
+
+
+def _noms_archive_attendus(nom_archive: str) -> list:
+    noms = [f"{nom_archive}{KAGGLE_EXTENSION_ARCHIVE}", f"{nom_archive}.zip"]
+    return list(dict.fromkeys(noms))
+
+
+def _kg_duree(t0: float) -> str:
+    return f"{time.monotonic() - t0:.1f} s"
+
+
+def _kg_stats_dossier(chemin: str) -> tuple:
+    """(nombre de fichiers, taille totale en octets) d'un dossier. Liens casses ignores, comme le zip."""
+    nb = taille = 0
+    for racine, _dirs, fichiers in os.walk(chemin):
+        for nom in fichiers:
+            p = os.path.join(racine, nom)
+            try:
+                if os.path.islink(p) and not os.path.exists(p):
+                    continue
+                taille += os.stat(p).st_size
+                nb += 1
+            except OSError:
+                continue
+    return nb, taille
+
+
+def _kg_stats_zip(chemin_zip: str) -> tuple:
+    """(nb fichiers, nb fichiers non vides, taille du contenu) d'un zip, dossiers exclus."""
+    nb = nb_non_vides = taille = 0
+    with zipfile.ZipFile(chemin_zip) as z:
+        for info in z.infolist():
+            if info.is_dir():
+                continue
+            nb += 1
+            taille += info.file_size
+            if info.file_size > 0:
+                nb_non_vides += 1
+    return nb, nb_non_vides, taille
+
+
+def _kg_hist_lire(dossier_profils: str) -> dict:
+    try:
+        with open(os.path.join(dossier_profils, NOM_HISTORIQUE_KAGGLE), encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _kg_hist_maj(dossier_profils: str, nom_local: str, **champs) -> None:
+    """Dernier envoi / dernier telechargement / nombre de fichiers et taille, par profil. Jamais bloquant."""
+    try:
+        h = _kg_hist_lire(dossier_profils)
+        entree = h.get(nom_local) if isinstance(h.get(nom_local), dict) else {}
+        entree.update(champs)
+        h[nom_local] = entree
+        os.makedirs(dossier_profils, exist_ok=True)
+        chemin = os.path.join(dossier_profils, NOM_HISTORIQUE_KAGGLE)
+        with open(chemin + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(h, f, ensure_ascii=False, indent=2)
+        os.replace(chemin + ".tmp", chemin)
+    except Exception as e:
+        _log_kaggle.warning("Historique Kaggle non ecrit pour %r : %r", nom_local, e)
+
+
+def _kg_purger_corbeille(racine: str) -> None:
+    """Supprime les copies de plus de CORBEILLE_KAGGLE_JOURS jours (date lue dans le nom : ...__AAAAMMJJ-HHMMSS)."""
+    limite = time.time() - CORBEILLE_KAGGLE_JOURS * 86400
+    try:
+        for nom in os.listdir(racine):
+            m = re.search(r"__(\d{8}-\d{6})$", nom)
+            if not m:
+                continue
+            try:
+                ts = time.mktime(time.strptime(m.group(1), "%Y%m%d-%H%M%S"))
+            except (ValueError, OverflowError):
+                continue
+            if ts < limite:
+                shutil.rmtree(os.path.join(racine, nom), ignore_errors=True)
+    except OSError:
+        pass
+
+
+def _kg_vers_corbeille(dossier_profils: str, chemin: str, motif: str) -> str:
+    """Deplace (jamais supprime) un dossier de profil dans la corbeille locale, conserve CORBEILLE_KAGGLE_JOURS jours."""
+    racine = os.path.join(os.path.dirname(os.path.abspath(dossier_profils)), NOM_CORBEILLE_KAGGLE)
+    os.makedirs(racine, exist_ok=True)
+    horo = time.strftime("%Y%m%d-%H%M%S")
+    base = f"{os.path.basename(os.path.normpath(chemin))}__{motif}"
+    dest = os.path.join(racine, f"{base}__{horo}")
+    n = 1
+    while os.path.exists(dest):
+        n += 1
+        dest = os.path.join(racine, f"{base}-{n}__{horo}")
+    shutil.move(chemin, dest)
+    _kg_purger_corbeille(racine)
+    return dest
+
+
+def _kg_message_avec_journal(gestionnaire, message: str) -> str:
+    """Message court (1re ligne) suivi des lignes detaillees du transfert (une par ligne)."""
+    lignes = list(getattr(gestionnaire, "journal_detail", None) or [])
+    return message + ("\n" + "\n".join(lignes) if lignes else "")
+
+
+
+# ---------------------------------------------------------------------------
+# Type de moteur d'un profil (chrome / camoufox) : detecte d'apres les fichiers, transmis dans meta.json
+# ---------------------------------------------------------------------------
+_KG_INDICES_FIREFOX = ("prefs.js", "xulstore.json", "cookies.sqlite", "places.sqlite", "camoufox_fingerprint.json")
+_KG_INDICES_CHROME = ("Default", "Local State")
+
+
+def detecter_moteur_profil(dossier: str) -> Optional[str]:
+    """'camoufox' ou 'chrome' d'apres les fichiers a la racine du dossier ; None si aucun indice ou si les
+    deux moteurs sont presents (ambigu)."""
+    try:
+        noms = set(os.listdir(dossier))
+    except OSError:
+        return None
+    firefox = any(n in noms for n in _KG_INDICES_FIREFOX)
+    chrome = any(n in noms for n in _KG_INDICES_CHROME)
+    if firefox and not chrome:
+        return "camoufox"
+    if chrome and not firefox:
+        return "chrome"
+    return None
+
+
+def _kg_famille_moteur(type_instance: str) -> str:
+    return "firefox" if type_instance == "camoufox" else "chrome"
+
+
+def resoudre_type_profil(type_declare: str, dossier: str) -> tuple:
+    """(type | None, avertissement | None). Le type declare (config ou meta) est retenu, sauf s'il contredit les
+    fichiers du dossier (ex. 'chrome' declare mais fichiers Camoufox) : les fichiers l'emportent, car un profil
+    lance avec le mauvais moteur demarre vide. Sans type declare : celui des fichiers, sinon None."""
+    valides = globals().get("TYPES_INSTANCE_VALIDES") or ("chrome", "camoufox", "cloakbrowser", "feather")
+    declare = type_declare if type_declare in valides else ""
+    disque = detecter_moteur_profil(dossier)
+    if declare and disque and _kg_famille_moteur(declare) != _kg_famille_moteur(disque):
+        return disque, f"type declare '{declare}' en desaccord avec les fichiers du profil ({disque}) : fichiers retenus."
+    return (declare or disque or None), None
+
+
+def _kg_type_declare_local(nom_profil: str) -> str:
+    """Type enregistre pour ce profil dans le profils_config.json de CETTE machine ('' s'il n'a pas d'entree)."""
+    try:
+        charger = globals().get("charger_registre_profils_config")
+        obtenir = globals().get("obtenir_config_profil")
+        if charger and obtenir and nom_profil in (charger() or {}):
+            return str(obtenir(nom_profil).get("type_instance") or "")
+    except Exception:
+        pass
+    return ""
+
+
+def _kg_sites_declares_local(nom_profil: str) -> list:
+    """Sites connectes enregistres pour ce profil dans le profils_config.json de CETTE machine ([] sinon)."""
+    try:
+        charger = globals().get("charger_registre_profils_config")
+        obtenir = globals().get("obtenir_config_profil")
+        if charger and obtenir and nom_profil in (charger() or {}):
+            return list(obtenir(nom_profil).get("sites") or [])
+    except Exception:
+        pass
+    return []
+
+
+def _kg_enregistrer_sites_local(nom_profil: str, sites) -> None:
+    definir = globals().get("definir_sites_config_profil")
+    if definir:
+        definir(nom_profil, sites)
+
+
+def _kg_enregistrer_type_local(nom_profil: str, type_instance: str) -> None:
+    """Ecrit le type dans le profils_config.json de CETTE machine. Entree existante : seul le type change
+    (le reste est conserve) ; sinon entree creee avec les valeurs par defaut, sans proxy."""
+    charger = globals().get("charger_registre_profils_config")
+    sauver = globals().get("sauvegarder_registre_profils_config")
+    creer = globals().get("enregistrer_config_profil")
+    if not (charger and sauver and creer):
+        return
+    configs = charger() or {}
+    if nom_profil in configs:
+        if configs[nom_profil].get("type_instance") != type_instance:
+            configs[nom_profil]["type_instance"] = type_instance
+            sauver(configs)
+    else:
+        creer(nom_profil, type_instance, None)
+
+
+# Badges d'un profil (profils_config.json) transmis dans meta.json. Le proxy, le pays et l'ip ne sont PAS transmis
+# (identifiants du proxy : pas sur Kaggle ; le pays/l'ip n'ont pas de sens sans le proxy).
+_KG_CLES_BADGES = ("youtube", "tiktok", "ia", "favori", "bloquer_media", "proxy_natif", "contraintes_ecran")
+
+
+def _kg_badges_declares_local(nom_profil: str) -> dict:
+    """Badges enregistres pour ce profil dans le profils_config.json de CETTE machine ({} s'il n'a pas d'entree)."""
+    try:
+        charger = globals().get("charger_registre_profils_config")
+        obtenir = globals().get("obtenir_config_profil")
+        if charger and obtenir and nom_profil in (charger() or {}):
+            cfg = obtenir(nom_profil)
+            return {k: cfg[k] for k in _KG_CLES_BADGES if k in cfg}
+    except Exception:
+        pass
+    return {}
+
+
+def _kg_enregistrer_badges_local(nom_profil: str, badges) -> None:
+    """Applique les badges recus a l'entree du profil (creee par _kg_enregistrer_type_local). Cles inconnues ignorees."""
+    if not isinstance(badges, dict) or not badges:
+        return
+    charger = globals().get("charger_registre_profils_config")
+    sauver = globals().get("sauvegarder_registre_profils_config")
+    if not (charger and sauver):
+        return
+    configs = charger() or {}
+    if nom_profil not in configs:
+        return
+    for k in _KG_CLES_BADGES:
+        if k in badges:
+            configs[nom_profil][k] = badges[k]
+    sauver(configs)
+
+
+# ---------------------------------------------------------------------------
 # GestionnaireKaggle : la "zone de script". Concu pour etre appele HORS thread Qt.
 # ---------------------------------------------------------------------------
 class GestionnaireKaggle:
@@ -30298,6 +30588,11 @@ class GestionnaireKaggle:
         self._api = api
         self._fabrique_api = fabrique_api
         self._pause = pause or time.sleep
+        self.journal_detail: list = []  # lignes detaillees du transfert en cours (remontees a l'ecran du pilote)
+
+    def _j(self, texte: str) -> None:
+        self.journal_detail.append(texte)
+        _log_kaggle.info("%s", texte)
 
     # -- connexion ---------------------------------------------------------
     def authentifier(self):
@@ -30384,6 +30679,7 @@ class GestionnaireKaggle:
                     "nom_archive": nom_archive_depuis_titre(titre),
                     "taille_octets": taille,
                     "cree_le": date_creation_depuis_sous_titre(getattr(d, "subtitle", None)),
+                    "sites": sites_depuis_sous_titre(getattr(d, "subtitle", None)),
                     "maj_le": str(maj) if maj is not None else None,
                     "prive": bool(getattr(d, "is_private", True)),
                 })
@@ -30392,6 +30688,29 @@ class GestionnaireKaggle:
             page += 1
         _DIAG_KAGGLE["total_datasets_vus"] = self.total_datasets_vus
         return sortie
+
+    def supprimer_dataset(self, slug: str):
+        """Supprime definitivement UN dataset ax- du compte Kaggle (garde-fou : jamais un autre dataset).
+        no_confirm=True : la confirmation est faite par l'ecran (sinon la bibliotheque appelle input() et bloque).
+        Un 404 est traite comme 'deja supprime' pour que les nouvelles tentatives restent sans risque."""
+        slug = str(slug or "")
+        if not slug.startswith(PREFIXE_DATASET):
+            raise ErreurKaggle(f"Suppression refusee : '{slug}' n'est pas un dataset {PREFIXE_DATASET}.")
+        api = self.authentifier()
+        supprimer = getattr(api, "dataset_delete", None)
+        if supprimer is None:
+            raise ErreurKaggle("La bibliotheque kaggle installee ne sait pas supprimer un dataset.")
+
+        def _une_tentative():
+            try:
+                return supprimer(KAGGLE_USERNAME, slug, no_confirm=True)
+            except Exception as e:
+                code = getattr(getattr(e, "response", None), "status_code", None)
+                if code == 404 or "404" in str(e) or "not found" in str(e).lower():
+                    return True
+                raise
+        if not self._avec_tentatives(f"Suppression de {self.ref(slug)}", _une_tentative):
+            raise ErreurKaggle(f"Kaggle n'a pas confirme la suppression de {self.ref(slug)}.")
 
     @staticmethod
     def quota_utilise_octets(datasets: list) -> int:
@@ -30421,48 +30740,114 @@ class GestionnaireKaggle:
     # -- envoi -------------------------------------------------------------
     def envoyer_profil(self, chemin_dossier: str, nom_archive: str, nom_local: str = "",
                        email: str = "", instance: str = "", supprimer_local: bool = False,
-                       zipper=None, progression=None) -> dict:
+                       zipper=None, progression=None, sites=None) -> dict:
         """Zippe, cree/met a jour le dataset prive (une seule version conservee),
-        attend que Kaggle soit pret, verifie le fichier, puis (si demande)
-        supprime le dossier local -- UNIQUEMENT apres verification. Les fichiers
-        temporaires sont toujours nettoyes. Rien n'est supprime en cas d'echec."""
+        attend que Kaggle soit pret, verifie ce que Kaggle contient (archive gardee OU decompressee),
+        puis (si demande) DEPLACE le dossier local dans la corbeille locale (conservee quelques jours) --
+        UNIQUEMENT si Kaggle contient bien le meme nombre de fichiers et la meme taille. Chaque etape ecrit
+        ses chiffres dans self.journal_detail. Les fichiers temporaires sont toujours nettoyes."""
         prog = progression or (lambda etape, pct: None)
+        self.journal_detail = []
         zipper = zipper or globals().get("_zipper_dossier_profil")
         if zipper is None:
             raise ErreurKaggle("Fonction d'archivage indisponible.")
         slug = slug_depuis_nom(nom_archive)
         ref = self.ref(slug)
+        nom_profil = nom_local or os.path.basename(chemin_dossier)
+        dossier_profils = os.path.dirname(os.path.abspath(chemin_dossier))
         temp = tempfile.mkdtemp(prefix="ax_kaggle_")
         zip_source = None
+        avertissements: list = []
+        t_debut = time.monotonic()
+
+        def avert(texte: str) -> None:
+            avertissements.append(texte)
+            self._j(f"ATTENTION : {texte}")
+            _log_kaggle.warning("%s : %s", nom_profil, texte)
+
         try:
+            nom_zip = f"{nom_archive}{KAGGLE_EXTENSION_ARCHIVE}"
+            self._j(f"Envoi de '{nom_profil}' vers {ref} (archive '{nom_zip}')")
             prog("Archivage", 5)
+            t0 = time.monotonic()
+            nb_dossier, taille_dossier = _kg_stats_dossier(chemin_dossier)
+            self._j(f"Dossier local avant zip : {nb_dossier} fichier(s), {formater_taille_octets(taille_dossier)} ({taille_dossier} o)")
+            if taille_dossier < SEUIL_PETIT_DOSSIER_OCTETS:
+                avert(f"dossier local tres petit ({formater_taille_octets(taille_dossier)}, moins de 5 Mo) : profil vide ou incomplet ?")
+            prec = _kg_hist_lire(dossier_profils).get(nom_profil)
+            prec = prec if isinstance(prec, dict) else {}
+            try:
+                prec_nb, prec_taille = int(prec.get("nb_fichiers") or 0), int(prec.get("taille") or 0)
+            except (TypeError, ValueError):
+                prec_nb = prec_taille = 0
+            if prec_nb > 0:
+                self._j(f"Envoi precedent de ce profil : {prec_nb} fichier(s), {formater_taille_octets(prec_taille)}")
+                if nb_dossier < prec_nb * 0.5:
+                    avert(f"{nb_dossier} fichier(s) maintenant contre {prec_nb} au dernier envoi (moins de la moitie)")
+                if prec_taille > 0 and taille_dossier < prec_taille * 0.5:
+                    avert(f"{formater_taille_octets(taille_dossier)} maintenant contre {formater_taille_octets(prec_taille)} au dernier envoi (moins de la moitie)")
             zip_source = Path(zipper(chemin_dossier))
-            nom_zip = f"{nom_archive}.zip"
             shutil.copyfile(str(zip_source), os.path.join(temp, nom_zip))
             taille = os.path.getsize(os.path.join(temp, nom_zip))
+            nb_zip, nb_zip_non_vides, taille_contenu_zip = _kg_stats_zip(os.path.join(temp, nom_zip))
+            self._j(f"Zip cree en {_kg_duree(t0)} : {taille} o ({formater_taille_octets(taille)}), "
+                    f"{nb_zip} fichier(s) dedans, contenu {taille_contenu_zip} o")
+            if nb_zip < nb_dossier:
+                avert(f"le zip contient {nb_dossier - nb_zip} fichier(s) de moins que le dossier local")
             date_envoi = _kaggle_maintenant_iso()
-            meta = {"nom_archive": nom_archive, "nom_local_origine": nom_local or os.path.basename(chemin_dossier),
-                    "taille": taille, "date_envoi_utc": date_envoi, "instance": instance}
+            type_profil, avert_type = resoudre_type_profil(
+                _kg_type_declare_local(nom_profil), chemin_dossier)
+            if avert_type:
+                _log_kaggle.warning("%s : %s", nom_profil, avert_type)
+            # sites fournis par l'ordre d'envoi (JSON de l'IA) ; None = non fournis -> tags locaux du profil
+            sites_envoi = (normaliser_sites(sites) if sites is not None
+                           else _kg_sites_declares_local(nom_profil))
+            meta = {"nom_archive": nom_archive, "nom_local_origine": nom_profil,
+                    "taille": taille, "date_envoi_utc": date_envoi, "instance": instance,
+                    "type_instance": type_profil or "",
+                    "sites": sites_envoi,
+                    "badges": _kg_badges_declares_local(nom_profil),
+                    "nb_fichiers": nb_zip, "taille_dossier": taille_contenu_zip}
             with open(os.path.join(temp, "meta.json"), "w", encoding="utf-8") as f:
                 json.dump(meta, f, ensure_ascii=False)
             description = json.dumps({"nom_archive": nom_archive, "nom_local": meta["nom_local_origine"],
                                       "email": email, "instance": instance}, ensure_ascii=False, separators=(",", ":"))
             prog("Preparation", 15)
             existe = self._avec_tentatives(f"Verification de {ref}", lambda: self.dataset_existe(ref))
+            existait = existe
+            liste_avant = None
+            if existe and not str(email or "").strip():
+                # FIX : pas d'email fourni (profil renomme, absent de la correspondance) -> on CONSERVE celui deja
+                # present dans la description du dataset au lieu de l'ecraser par "".
+                ancien_email = self._email_description_existante(ref)
+                if ancien_email:
+                    email = ancien_email
+                    description = json.dumps({"nom_archive": nom_archive, "nom_local": meta["nom_local_origine"],
+                                              "email": email, "instance": instance}, ensure_ascii=False, separators=(",", ":"))
+                    self._j(f"Email conserve depuis le dataset existant : {email}")
+            self._j(f"Dataset {'deja present' if existe else 'absent'} sur Kaggle")
             metadonnees = {"id": ref, "title": titre_depuis_nom(nom_archive),
                            "licenses": [{"name": "other"}], "description": description}
             if not existe:
-                metadonnees["subtitle"] = sous_titre_creation(date_envoi)
+                metadonnees["subtitle"] = sous_titre_creation(date_envoi, sites_envoi)
             else:
                 # la date de creation vit dans le sous-titre existant : on la conserve, jamais ecrasee
                 existant = next((d for d in self.lister_datasets() if d["ref"] == ref), None)
                 if existant and existant.get("cree_le"):
-                    metadonnees["subtitle"] = sous_titre_creation(existant["cree_le"])
+                    metadonnees["subtitle"] = sous_titre_creation(existant["cree_le"], sites_envoi)
+                if existant:
+                    self._j(f"Ancien dataset : {formater_taille_octets(existant.get('taille_octets', 0))}")
+                # Re-envoi = nouvelle VERSION du dataset existant (plus de suppression/recreation) : le telechargement
+                # se fait fichier par fichier et ne depend plus de l'archive construite par Kaggle.
+                self._j("Re-envoi : nouvelle version du dataset existant (pas de suppression)")
             with open(os.path.join(temp, "dataset-metadata.json"), "w", encoding="utf-8") as f:
                 json.dump(metadonnees, f, ensure_ascii=False)
             api = self.authentifier()
             prog("Envoi vers Kaggle", 30)
+            t0 = time.monotonic()
             if not existe:
+                self._j(f"Creation du dataset : debut ({formater_taille_octets(taille)} a envoyer)")
+
                 def _creer():
                     rep = api.dataset_create_new(temp, public=False, quiet=True, convert_to_csv=False, dir_mode="skip")
                     erreur = getattr(rep, "error", "") or ""
@@ -30470,7 +30855,16 @@ class GestionnaireKaggle:
                         raise ErreurKaggle(erreur)
                     return rep
                 self._avec_tentatives(f"Creation de {ref}", _creer)
+                self._j(f"Creation du dataset : terminee en {_kg_duree(t0)}")
             else:
+                self._j(f"Mise a jour du dataset : debut ({formater_taille_octets(taille)} a envoyer)")
+                # FIX : le statut 'ready' est celui de l'ANCIENNE version ; on memorise ses fichiers pour detecter la nouvelle
+                try:
+                    liste_avant = sorted(self._fichiers_dataset(ref))
+                except Exception as e:
+                    _log_kaggle.warning("Liste avant mise a jour illisible pour %s : %r", ref, e)
+                    liste_avant = None
+
                 def _maj():
                     rep = api.dataset_create_version(temp, version_notes=f"maj {date_envoi}", quiet=True,
                                                      convert_to_csv=False, delete_old_versions=True, dir_mode="skip")
@@ -30479,17 +30873,35 @@ class GestionnaireKaggle:
                         raise ErreurKaggle(erreur)
                     return rep
                 self._avec_tentatives(f"Mise a jour de {ref}", _maj)
+                self._j(f"Mise a jour du dataset : terminee en {_kg_duree(t0)}")
             prog("Attente Kaggle", 70)
+            t0 = time.monotonic()
             self._attendre_pret(ref)
+            if existait:
+                self._attendre_nouvelle_version(ref, liste_avant)
+            self._j(f"Kaggle a termine le traitement apres {_kg_duree(t0)}")
             prog("Verification", 90)
-            self._verifier_fichier(ref, nom_zip, taille)
+            verif = self._verifier_envoi(ref, nom_zip, taille, nb_zip, nb_zip_non_vides, taille_contenu_zip,
+                                         liste_avant=liste_avant)
+            avertissements.extend(verif["avertissements"])
+            _kg_hist_maj(dossier_profils, nom_profil, nom_archive=nom_archive, nb_fichiers=nb_dossier,
+                         taille=taille_dossier, dernier_envoi=date_envoi, kaggle_mode=verif["mode"],
+                         kaggle_nb=verif["nb"], kaggle_taille=verif["taille"])
             supprime = False
+            chemin_corbeille = ""
             if supprimer_local:
-                shutil.rmtree(chemin_dossier)
-                supprime = True
+                if verif["ok"]:
+                    chemin_corbeille = _kg_vers_corbeille(dossier_profils, chemin_dossier, "apres-envoi")
+                    supprime = True
+                    self._j(f"Dossier local deplace dans la corbeille ({chemin_corbeille}), conserve {CORBEILLE_KAGGLE_JOURS} jours")
+                else:
+                    self._j("Dossier local CONSERVE : Kaggle ne contient pas le meme nombre de fichiers / la meme taille que l'envoi")
+            self._j(f"Duree totale de l'envoi : {_kg_duree(t_debut)}")
             prog("Termine", 100)
-            return {"ok": True, "ref": ref, "slug": slug, "cree": not existe, "taille": taille,
-                    "dossier_supprime": supprime}
+            return {"ok": True, "ref": ref, "slug": slug, "cree": not existait, "taille": taille,
+                    "dossier_supprime": supprime, "type_instance": type_profil,
+                    "verification": verif, "avertissements": avertissements, "corbeille": chemin_corbeille,
+                    "suppression_refusee": bool(supprimer_local and not supprime)}
         finally:
             shutil.rmtree(temp, ignore_errors=True)
             try:
@@ -30538,17 +30950,102 @@ class GestionnaireKaggle:
                 raise ErreurKaggle(f"Kaggle n'a pas termine le traitement de {ref} en {DELAI_PRET_KAGGLE_S}s (statut '{statut}').")
             self._pause(min(5, max(0.01, DELAI_PRET_KAGGLE_S / 100)))
 
-    def _verifier_fichier(self, ref: str, nom_zip: str, taille: int) -> None:
-        fichiers = self._avec_tentatives(f"Liste des fichiers de {ref}", lambda: self._fichiers_dataset(ref))
-        for nom, t in fichiers:
-            if nom == nom_zip:
-                if t != taille:
-                    raise ErreurKaggle(f"Taille inattendue sur Kaggle pour {nom_zip} : {t} au lieu de {taille}.")
-                return
-        # Kaggle peut avoir decompresse le zip : on accepte s'il reste du contenu autre que meta.json
-        if any(nom != "meta.json" for nom, _ in fichiers):
+    def _email_description_existante(self, ref: str) -> str:
+        """Email lu dans la description JSON du dataset existant ('' si illisible : jamais bloquant)."""
+        dossier = tempfile.mkdtemp(prefix="kg_meta_")
+        try:
+            api = self.authentifier()
+            chemin = api.dataset_metadata(ref, dossier)
+            if not chemin or not os.path.isfile(str(chemin)):
+                chemin = os.path.join(dossier, "dataset-metadata.json")
+            with open(chemin, "r", encoding="utf-8") as f:
+                desc = json.load(f).get("description") or ""
+            donnees = json.loads(desc) if isinstance(desc, str) else {}
+            mail = str(donnees.get("email", "") or "").strip()
+            return mail if "@" in mail else ""
+        except Exception as e:
+            _log_kaggle.warning("Email existant illisible pour %s : %r", ref, e)
+            return ""
+        finally:
+            shutil.rmtree(dossier, ignore_errors=True)
+
+    def _attendre_nouvelle_version(self, ref: str, liste_avant) -> None:
+        """Apres dataset_create_version, le statut reste 'ready' (ancienne version) : on attend que la liste des
+        fichiers change reellement (nouvelle version publiee) avant de verifier. Delai depasse -> on continue
+        quand meme (renvoi identique possible) et la verification tranche."""
+        if liste_avant is None:
             return
-        raise ErreurKaggle(f"Fichier {nom_zip} absent de {ref} apres l'envoi.")
+        debut = time.monotonic()
+        delai = min(DELAI_PRET_KAGGLE_S, 300)
+        while True:
+            try:
+                courant = sorted(self._fichiers_dataset(ref))
+            except Exception:
+                courant = None
+            if courant and courant != liste_avant:
+                return
+            if time.monotonic() - debut > delai:
+                self._j(f"Attention : la liste des fichiers n'a pas change apres {int(delai)} s (renvoi identique ou Kaggle en retard).")
+                return
+            self._pause(min(3, max(0.01, delai / 100)))
+
+    def _verifier_envoi(self, ref: str, nom_zip: str, taille_zip: int, nb_attendu: int,
+                        nb_attendu_non_vides: int, taille_attendue: int, liste_avant=None) -> dict:
+        """Relit ce que Kaggle contient APRES l'envoi et le compare a ce qui est parti.
+        - archive gardee : le zip est la, avec la bonne taille ;
+        - archive decompressee par Kaggle : meme nombre de fichiers et meme taille totale que le contenu du zip.
+        Retourne {ok, mode, nb, taille, avertissements}. ok=False => le dossier local ne doit PAS etre supprime."""
+        def _correspond(fs) -> bool:
+            hm = [(n, t) for n, t in fs if n != "meta.json"]
+            return any(n == nom_zip for n, _ in hm) or (len(hm) == 1 and hm[0][1] == taille_zip)
+
+        fichiers = self._avec_tentatives(f"Liste des fichiers de {ref}", lambda: self._fichiers_dataset(ref))
+        # FIX journaux : Kaggle peut encore afficher l'ANCIENNE version juste apres l'envoi. Tant que la liste n'est pas
+        # celle attendue, on relit (jusqu'a ~60 s) avant de tirer la moindre conclusion.
+        for _essai in range(12):
+            if _correspond(fichiers):
+                break
+            self._j(f"La liste Kaggle n'est pas encore a jour (essai {_essai + 1}/12), nouvelle lecture...")
+            self._pause(5)
+            fichiers = self._avec_tentatives(f"Liste des fichiers de {ref}", lambda: self._fichiers_dataset(ref))
+        hors_meta = [(n, t) for n, t in fichiers if n != "meta.json"]
+        total_tout = sum(t for _, t in fichiers)
+        self._j(f"Kaggle liste {len(fichiers)} fichier(s) ({len(hors_meta)} hors meta.json), "
+                f"taille totale {formater_taille_octets(total_tout)} ({total_tout} o)")
+        apercu = [f"{n} ({t} o)" for n, t in fichiers[:15]]
+        self._j("Fichiers listes par Kaggle : " + ", ".join(apercu) + (f" ... (+{len(fichiers) - 15})" if len(fichiers) > 15 else ""))
+        res = {"ok": False, "mode": "", "nb": len(hors_meta), "taille": sum(t for _, t in hors_meta), "avertissements": []}
+        exact = [(n, t) for n, t in hors_meta if n == nom_zip]
+        if exact:
+            if exact[0][1] != taille_zip:
+                raise ErreurKaggle(f"Taille inattendue sur Kaggle pour {nom_zip} : {exact[0][1]} au lieu de {taille_zip}.")
+            self._j(f"Kaggle a GARDE l'archive telle quelle ({nom_zip}, {taille_zip} o) : pas de decompression.")
+            res.update(ok=True, mode="archive conservee")
+            return res
+        if not hors_meta:
+            raise ErreurKaggle(f"Fichier {nom_zip} absent de {ref} apres l'envoi.")
+        # Kaggle nettoie parfois le nom (ex. retire '@') : UN seul fichier hors meta.json, de la taille exacte du zip = archive gardee
+        if len(hors_meta) == 1 and hors_meta[0][1] == taille_zip:
+            self._j(f"Kaggle a GARDE l'archive telle quelle (renommee par Kaggle : '{hors_meta[0][0]}' au lieu de '{nom_zip}', {taille_zip} o) : pas de decompression.")
+            res.update(ok=True, mode="archive conservee")
+            return res
+        # Cas 1 : la liste est toujours celle d'avant l'envoi -> ce n'est PAS une decompression
+        if liste_avant is not None and sorted(fichiers) == liste_avant:
+            self._j("ERREUR : Kaggle affiche toujours l'ANCIENNE version (la nouvelle n'est pas encore publiee). "
+                    "Ce n'est pas une decompression.")
+            raise ErreurKaggle("Kaggle n'a pas publie la nouvelle version a temps (liste de fichiers inchangee). "
+                               "Dossier local CONSERVE : reessayez dans un moment, l'archive n'est pas decompressee.")
+        # Cas 2 : un seul fichier, mais ni le bon nom ni la bonne taille -> pas une decompression non plus
+        if len(hors_meta) == 1:
+            self._j(f"ERREUR : fichier inattendu sur Kaggle : {hors_meta[0][0]} ({hors_meta[0][1]} o) au lieu de "
+                    f"{nom_zip} ({taille_zip} o). Ce n'est pas une decompression.")
+            raise ErreurKaggle(f"Fichier inattendu sur Kaggle ({hors_meta[0][0]}, {hors_meta[0][1]} o) au lieu de "
+                               f"{nom_zip} ({taille_zip} o). Dossier local CONSERVE.")
+        # Cas 3 : plusieurs fichiers -> Kaggle a decompresse l'archive : INACCEPTABLE (un profil = UN fichier sur Kaggle = UN telechargement).
+        # Le dataset decompresse est laisse tel quel, mais l'envoi est signale en ERREUR et le dossier local est CONSERVE.
+        self._j(f"ERREUR : Kaggle a DECOMPRESSE l'archive : {nom_zip} n'existe plus, {len(hors_meta)} fichier(s) a la place.")
+        raise ErreurKaggle(f"Kaggle a decompresse l'archive ({len(hors_meta)} fichiers au lieu de {nom_zip}). "
+                           f"Dossier local CONSERVE. Changer KAGGLE_EXTENSION_ARCHIVE (actuellement '{KAGGLE_EXTENSION_ARCHIVE}').")
 
     # -- telechargement ----------------------------------------------------
     @staticmethod
@@ -30563,27 +31060,115 @@ class GestionnaireKaggle:
         corps = str(getattr(getattr(e, "response", None), "text", "") or "").strip().replace("\n", " ")[:300]
         return f"{texte} | reponse : {corps}" if corps and corps not in texte else texte
 
-    def _telecharger_dans(self, ref: str, temp: str) -> None:
-        """Telecharge le dataset dans temp. Si l'envoi 'dataset complet' est refuse (404/403, cas observe
-        avec certains jetons), repli : telechargement des fichiers du dataset un par un."""
+    def _dl_fichier_par_fichier(self, api, ref: str, listing: list, racine: str, temp: str, prog) -> None:
+        """Un appel par fichier ; l'arborescence est recreee sous racine et chaque taille est comparee a celle de Kaggle."""
+        n = len(listing)
+        for i, (nom, taille) in enumerate(listing, 1):
+            parties = nom.split("/")
+            if nom.startswith("/") or ".." in parties or "\\" in nom:
+                raise ErreurKaggle(f"nom de fichier suspect sur Kaggle : {nom!r}")
+            part = os.path.join(temp, "_part")
+            attentes = (5, 10, 20, 40, 60, 60, 60)  # secondes, apres un 429 (trop de requetes)
+            for essai in range(len(attentes) + 1):
+                shutil.rmtree(part, ignore_errors=True)
+                os.makedirs(part)
+                try:
+                    api.dataset_download_file(ref, nom, path=part, force=True, quiet=True)
+                    break
+                except Exception as e:
+                    txt = self._detail_erreur(e)
+                    if ("429" in txt or "Too Many Requests" in txt or "RESOURCE_EXHAUSTED" in txt) and essai < len(attentes):
+                        self._j(f"429 (trop de requetes) sur le fichier {i}/{n} : pause {attentes[essai]} s puis essai {essai + 2}")
+                        self._pause(attentes[essai])
+                        continue
+                    if nom == "meta.json":
+                        self._j(f"ATTENTION : meta.json non telecharge ({txt})")
+                        part = None
+                        break
+                    raise ErreurKaggle(f"'{nom}' (fichier {i}/{n}) : {txt}")
+            if part is None:
+                continue
+            self._pause(0.4)  # evite de depasser la limite de requetes de Kaggle
+            recus = [os.path.join(d, f) for d, _, fs in os.walk(part) for f in fs]
+            dest = os.path.join(racine, *parties)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            if not recus and taille == 0:
+                open(dest, "wb").close()
+            elif len(recus) != 1:
+                raise ErreurKaggle(f"'{nom}' : {len(recus)} fichier(s) recu(s) au lieu d'1")
+            else:
+                if os.path.getsize(recus[0]) != taille:
+                    raise ErreurKaggle(f"'{nom}' : {os.path.getsize(recus[0])} o recus au lieu de {taille} o annonces par Kaggle")
+                shutil.move(recus[0], dest)
+            if i % 25 == 0 or i == n:
+                prog(f"Telechargement {i}/{n}", 10 + int(45 * i / max(1, n)))
+        shutil.rmtree(os.path.join(temp, "_part"), ignore_errors=True)
+
+    def _dl_dataset_complet(self, api, ref: str, listing: list, racine: str, temp: str) -> None:
+        """Archive 'dataset complet' (un seul appel), extraite sous racine puis comparee a la liste Kaggle."""
+        dossier_zip = os.path.join(temp, "_complet")
+        shutil.rmtree(dossier_zip, ignore_errors=True)
+        os.makedirs(dossier_zip)
+        api.dataset_download_files(ref, path=dossier_zip, force=True, quiet=True, unzip=False)
+        recus = [os.path.join(d, f) for d, _, fs in os.walk(dossier_zip) for f in fs]
+        if len(recus) != 1 or not zipfile.is_zipfile(recus[0]):
+            raise ErreurKaggle(f"{len(recus)} fichier(s) recu(s) au lieu d'une archive zip ({', '.join(os.path.basename(r) for r in recus[:5])})")
+        self._j(f"Archive complete recue : {os.path.basename(recus[0])} ({os.path.getsize(recus[0])} o)")
+        _kaggle_extraire_zip_sur(recus[0], racine)
+        shutil.rmtree(dossier_zip, ignore_errors=True)
+        presents = {}
+        for d, _, fs in os.walk(racine):
+            for f in fs:
+                p = os.path.join(d, f)
+                presents[os.path.relpath(p, racine).replace(os.sep, "/")] = os.path.getsize(p)
+        attendus = dict(listing)
+        manquants = [n for n in attendus if n not in presents]
+        if manquants:
+            self._j(f"ATTENTION : {len(manquants)} nom(s) de la liste Kaggle absents de l'archive complete (ex. {', '.join(manquants[:3])})")
+        if len(presents) < len(attendus) or sum(presents.values()) < sum(attendus.values()):
+            raise ErreurKaggle(f"archive complete incomplete : {len(presents)} fichier(s) / {sum(presents.values())} o "
+                               f"au lieu de {len(attendus)} / {sum(attendus.values())} o annonces par Kaggle")
+
+    def _telecharger_dans(self, ref: str, temp: str, progression=None) -> dict:
+        """Telecharge TOUT le contenu du dataset dans temp/contenu (arborescence conservee).
+        Voie choisie d'apres ce que Kaggle liste, et dite dans le journal :
+        - 1 a 5 fichiers (archive gardee) : fichier par fichier D'ABORD (le dataset complet n'est parfois jamais
+          construit par Kaggle : 404 'No gcs url found', puis 429) ; dataset complet en repli ;
+        - plus de 5 fichiers (Kaggle a decompresse le zip) : dataset complet D'ABORD (un appel au lieu de milliers) ;
+          fichier par fichier en repli. Un seul essai par voie, sans attente."""
+        prog = progression or (lambda etape, pct: None)
         api = self.authentifier()
-        self._voie_telechargement = "dataset complet"
-        try:
-            api.dataset_download_files(ref, path=temp, force=True, quiet=True, unzip=False)
-            return
-        except Exception as e1:
-            if not (self._est_404(e1) or self._est_403(e1)):
-                raise
-            premiere = e1
-        noms = [n for n, _ in self._fichiers_dataset(ref) if n != "meta.json"]
-        if not noms:
-            raise premiere
-        self._voie_telechargement = f"fichier par fichier ({', '.join(noms)})"
-        try:
-            for nom in noms:
-                api.dataset_download_file(ref, nom, path=temp, force=True, quiet=True)
-        except Exception as e2:
-            raise ErreurKaggle(f"{self._detail_erreur(premiere)} ; repli fichier par fichier : {self._detail_erreur(e2)}")
+        listing = self._avec_tentatives(f"Liste des fichiers de {ref}", lambda: self._fichiers_dataset(ref))
+        hors_meta = [(n, t) for n, t in listing if n != "meta.json"]
+        total = sum(t for _, t in hors_meta)
+        self._j(f"Kaggle liste {len(listing)} fichier(s) ({len(hors_meta)} hors meta.json), "
+                f"{formater_taille_octets(total)} ({total} o) hors meta.json")
+        if not hors_meta:
+            raise ErreurKaggle(f"le dataset {ref} ne contient aucun fichier hors meta.json")
+        racine = os.path.join(temp, "contenu")
+        n = len(hors_meta)
+        ordre = [("fichier par fichier", f"{n} fichier(s) : voie la plus fiable (le dataset complet fait 404 'No gcs url found' quand Kaggle n'a pas construit l'archive), avec pauses et reprise sur 429"),
+                 ("dataset complet", "repli")]
+        erreurs: list = []
+        for voie, pourquoi in ordre:
+            self._voie_telechargement = voie
+            self._j(f"Voie de telechargement : {voie} -- {pourquoi}")
+            shutil.rmtree(racine, ignore_errors=True)
+            os.makedirs(racine)
+            t0 = time.monotonic()
+            try:
+                if voie == "fichier par fichier":
+                    self._dl_fichier_par_fichier(api, ref, listing, racine, temp, prog)
+                else:
+                    self._dl_dataset_complet(api, ref, listing, racine, temp)
+            except Exception as e:
+                erreurs.append(f"{voie} : {self._detail_erreur(e)}")
+                self._j(f"Echec de la voie '{voie}' apres {_kg_duree(t0)} : {self._detail_erreur(e)}")
+                continue
+            nb, taille = _kg_stats_dossier(racine)
+            self._j(f"Recu via '{voie}' : {nb} fichier(s), {formater_taille_octets(taille)} ({taille} o) en {_kg_duree(t0)}")
+            return {"racine": racine, "voie": voie, "listing": listing, "nb_hors_meta": n, "taille_hors_meta": total}
+        raise ErreurKaggle(" ; ".join(erreurs))
 
     @staticmethod
     def _inventaire_dossier(racine: str, limite: int = 25) -> list:
@@ -30621,46 +31206,157 @@ class GestionnaireKaggle:
 
     def telecharger_profil(self, slug: str, dossier_profils: str, nom_local: str,
                            nom_archive: str, progression=None) -> dict:
-        """Telecharge le dataset, extrait (zip conserve OU decompresse par Kaggle),
-        ecrase un profil du meme nom, note l'origine dans _kaggle_origine.json."""
+        """Telecharge le dataset, restaure le profil (archive gardee par Kaggle OU fichiers decompresses :
+        reconstruction), controle les chiffres a chaque etape, ne touche au profil local qu'apres controle ;
+        l'ancien profil local est DEPLACE dans la corbeille (conservee quelques jours), jamais supprime.
+        Note l'origine dans _kaggle_origine.json. Chaque etape ecrit ses chiffres dans self.journal_detail."""
         prog = progression or (lambda etape, pct: None)
+        self.journal_detail = []
         ref = self.ref(slug)
-        api = self.authentifier()
+        self.authentifier()
         temp = tempfile.mkdtemp(prefix="ax_kaggle_dl_")
+        t_debut = time.monotonic()
+        avertissements: list = []
+
+        def avert(texte: str) -> None:
+            avertissements.append(texte)
+            self._j(f"ATTENTION : {texte}")
+            _log_kaggle.warning("%s : %s", nom_local, texte)
+
         try:
+            self._j(f"Telechargement de {ref} vers le profil local '{nom_local}' (archive '{nom_archive}')")
             prog("Telechargement", 10)
-            self._avec_tentatives(f"Telechargement de {ref}", lambda: self._telecharger_dans(ref, temp))
+            # Un seul essai par voie, sans attente : en cas d'echec l'erreur est dans les logs et l'utilisateur relance a la main.
+            try:
+                recu = self._telecharger_dans(ref, temp, prog)
+            except Exception as e:
+                raise ErreurKaggle(f"Telechargement de {ref} : echec ({e}).")
+            racine = recu["racine"]
             prog("Extraction", 60)
-            recus = sorted(os.path.relpath(os.path.join(d, f), temp) for d, _, fs in os.walk(temp) for f in fs)
-            # archive = fichier .zip OU fichier dont le contenu est un zip (le nom recu peut ne pas avoir d'extension),
-            # a la racine ou dans un sous-dossier
-            zips = [p for p in recus if p.lower().endswith(".zip") or zipfile.is_zipfile(os.path.join(temp, p))]
-            if not zips:
-                raise ErreurKaggle(self._diagnostic_aucune_archive(ref, temp))
-            attendu = f"{nom_archive}.zip"
-            choisi = next((p for p in zips if os.path.basename(p) == attendu), zips[0])
-            extrait = os.path.join(temp, "_extrait")
-            os.makedirs(extrait, exist_ok=True)
-            _kaggle_extraire_zip_sur(os.path.join(temp, choisi), extrait)
-            if os.path.basename(choisi) != attendu:
-                # enveloppe Kaggle : l'archive du profil est dedans (son nom peut differer du nom deduit du titre)
-                interne = os.path.join(extrait, attendu)
-                if not os.path.isfile(interne):
-                    contenu = [f for f in os.listdir(extrait) if f != "meta.json"]
-                    interne = os.path.join(extrait, contenu[0]) if (
-                        len(contenu) == 1 and contenu[0].lower().endswith(".zip")
-                        and os.path.isfile(os.path.join(extrait, contenu[0]))) else ""
-                if interne and os.path.isfile(interne):
-                    sous = os.path.join(temp, "_interne")
-                    os.makedirs(sous, exist_ok=True)
-                    _kaggle_extraire_zip_sur(interne, sous)
-                    shutil.rmtree(extrait)
-                    extrait = sous
+            chemin_meta = os.path.join(racine, "meta.json")
+            meta_lu: dict = {}
+            if os.path.isfile(chemin_meta):
+                try:
+                    with open(chemin_meta, encoding="utf-8") as f:
+                        meta_lu = json.load(f) or {}
+                    if not isinstance(meta_lu, dict):
+                        meta_lu = {}
+                    self._j(f"meta.json lu : taille annoncee {meta_lu.get('taille', '?')} o, "
+                            f"fichiers annonces {meta_lu.get('nb_fichiers', '?')}, dossier annonce {meta_lu.get('taille_dossier', '?')} o")
+                except (OSError, ValueError):
+                    meta_lu = {}
+                    avert("meta.json illisible")
+            else:
+                self._j("meta.json absent (ancien dataset ou telechargement partiel) : controles bases sur la liste Kaggle seulement")
+            # --- controle : tout ce que Kaggle liste est bien arrive
+            nb_r, taille_r = _kg_stats_dossier(racine)
+            if os.path.isfile(chemin_meta):
+                nb_r -= 1
+                taille_r -= os.path.getsize(chemin_meta)
+            if nb_r < recu["nb_hors_meta"] or taille_r < recu["taille_hors_meta"]:
+                raise ErreurKaggle(f"Recu incomplet : {nb_r} fichier(s) / {taille_r} o au lieu de "
+                                   f"{recu['nb_hors_meta']} / {recu['taille_hors_meta']} o listes par Kaggle ; profil local NON modifie.")
+            self._j(f"Controle de reception : {nb_r}/{recu['nb_hors_meta']} fichier(s), {taille_r}/{recu['taille_hors_meta']} o. OK.")
+            # --- restauration
+            contenu = sorted(f for f in os.listdir(racine) if f != "meta.json")
+            fichiers_racine = [f for f in contenu if os.path.isfile(os.path.join(racine, f))]
+            dossiers_racine = [f for f in contenu if os.path.isdir(os.path.join(racine, f))]
+            attendus = _noms_archive_attendus(nom_archive)
+            archive, raison = "", ""
+            for a in attendus:
+                if a in fichiers_racine:
+                    archive, raison = a, "nom attendu a la racine"
+                    break
+            if not archive and len(contenu) == 1 and fichiers_racine and zipfile.is_zipfile(os.path.join(racine, contenu[0])):
+                archive, raison = contenu[0], "seul fichier a la racine et c'est un zip (nom different de celui attendu)"
+            if not archive:
+                trouves = [os.path.relpath(os.path.join(d, f), racine) for d, _, fs in os.walk(racine) for f in fs if f in attendus]
+                if len(trouves) == 1:
+                    archive, raison = trouves[0], "nom attendu trouve dans un sous-dossier"
+            extrait = os.path.join(temp, "_profil")
+            if archive:
+                mode = "archive"
+                autres = [f for f in fichiers_racine if f != archive and zipfile.is_zipfile(os.path.join(racine, f))]
+                self._j(f"Archive interne choisie : {archive} -- {raison}"
+                        + (f" ; autres zips presents, NON utilises : {', '.join(autres)}" if autres else ""))
+                chemin_archive = os.path.join(racine, archive)
+                nb_zip, _nv, taille_zip_contenu = _kg_stats_zip(chemin_archive)
+                os.makedirs(extrait, exist_ok=True)
+                t0 = time.monotonic()
+                _kaggle_extraire_zip_sur(chemin_archive, extrait)
+                nb_ext, taille_ext = _kg_stats_dossier(extrait)
+                self._j(f"Archive extraite en {_kg_duree(t0)} : {nb_ext} fichier(s), {taille_ext} o (le zip en annonce {nb_zip}, {taille_zip_contenu} o)")
+                if nb_ext < nb_zip or taille_ext < taille_zip_contenu:
+                    raise ErreurKaggle(f"Extraction incomplete : {nb_ext}/{nb_zip} fichier(s), {taille_ext}/{taille_zip_contenu} o ; profil local NON modifie.")
+            else:
+                mode = "reconstruction"
+                self._j(f"Aucune archive du profil parmi les fichiers recus : Kaggle a decompresse le zip. "
+                        f"Reconstruction du profil a partir de {nb_r} fichier(s).")
+                if (len(dossiers_racine) == 1 and not fichiers_racine
+                        and detecter_moteur_profil(racine) is None):
+                    self._j(f"Un seul dossier a la racine ('{dossiers_racine[0]}') : son contenu est le profil (sinon il serait imbrique dans lui-meme)")
+                    shutil.move(os.path.join(racine, dossiers_racine[0]), extrait)
+                else:
+                    self._j(f"Racine du profil = racine du dataset ({len(fichiers_racine)} fichier(s), {len(dossiers_racine)} dossier(s))")
+                    os.makedirs(extrait, exist_ok=True)
+                    for entree in contenu:
+                        shutil.move(os.path.join(racine, entree), os.path.join(extrait, entree))
+            nb_final, taille_final = _kg_stats_dossier(extrait)
+            self._j(f"Profil restaure (avant mise en place) : {nb_final} fichier(s), {formater_taille_octets(taille_final)} ({taille_final} o)")
+            if mode == "reconstruction" and (nb_final < nb_r or taille_final < taille_r):
+                raise ErreurKaggle(f"Reconstruction incomplete : {nb_final}/{nb_r} fichier(s), {taille_final}/{taille_r} o ; profil local NON modifie.")
+            # --- comparaison avec ce que meta.json annonce
+            try:
+                annonce_zip = int(meta_lu.get("taille") or 0)
+                annonce_nb = int(meta_lu.get("nb_fichiers") or 0)
+                annonce_dossier = int(meta_lu.get("taille_dossier") or 0)
+            except (TypeError, ValueError):
+                annonce_zip = annonce_nb = annonce_dossier = 0
+            if annonce_zip and taille_final < annonce_zip * 0.95:
+                avert(f"profil restaure plus petit que la taille annoncee par meta.json ({taille_final} o contre {annonce_zip} o)")
+            if annonce_nb and nb_final < annonce_nb:
+                avert(f"{nb_final} fichier(s) restaure(s) contre {annonce_nb} annonces par meta.json")
+            if annonce_dossier and taille_final < annonce_dossier * 0.98:
+                avert(f"{taille_final} o restaures contre {annonce_dossier} o annonces par meta.json")
+            type_meta = str(meta_lu.get("type_instance") or "")
+            sites_meta = meta_lu.get("sites") if "sites" in meta_lu else None  # None = ancien dataset : liste locale intacte
+            badges_meta = meta_lu.get("badges") if isinstance(meta_lu.get("badges"), dict) else None  # None = ancien dataset
+            # --- mise en place : l'ancien profil local est deplace dans la corbeille, jamais supprime
             cible = os.path.join(dossier_profils, nom_local)
             os.makedirs(dossier_profils, exist_ok=True)
-            if os.path.exists(cible):
-                shutil.rmtree(cible)
+            if os.path.lexists(cible):
+                if os.path.isdir(cible) and not os.path.islink(cible) and any(os.scandir(cible)):
+                    ancien = _kg_vers_corbeille(dossier_profils, cible, "avant-telechargement")
+                    self._j(f"Ancien profil local deplace dans la corbeille ({ancien}), conserve {CORBEILLE_KAGGLE_JOURS} jours")
+                elif os.path.isdir(cible) and not os.path.islink(cible):
+                    shutil.rmtree(cible)
+                else:
+                    os.remove(cible)
             shutil.move(extrait, cible)
+            nb_cible, taille_cible = _kg_stats_dossier(cible)
+            if nb_cible != nb_final or taille_cible != taille_final:
+                raise ErreurKaggle(f"Copie vers {cible} incomplete : {nb_cible}/{nb_final} fichier(s), {taille_cible}/{taille_final} o "
+                                   f"(l'ancien profil est dans {NOM_CORBEILLE_KAGGLE}).")
+            self._j(f"Profil en place : {nb_cible} fichier(s), {taille_cible} o. Verification apres copie OK.")
+            type_profil, avert_type = resoudre_type_profil(type_meta, cible)
+            if avert_type:
+                _log_kaggle.warning("%s : %s", nom_local, avert_type)
+            if type_profil:
+                try:
+                    _kg_enregistrer_type_local(nom_local, type_profil)
+                except Exception as e:  # le profil est restaure : un echec d'ecriture de la config ne l'annule pas
+                    _log_kaggle.warning("%s : type '%s' non enregistre : %r", nom_local, type_profil, e)
+            if sites_meta is not None:
+                try:
+                    _kg_enregistrer_sites_local(nom_local, sites_meta)
+                except Exception as e:
+                    _log_kaggle.warning("%s : sites non enregistres : %r", nom_local, e)
+            if badges_meta:
+                try:
+                    _kg_enregistrer_badges_local(nom_local, badges_meta)
+                    self._j(f"Badges restaures : {', '.join(k for k, v in badges_meta.items() if v)}")
+                except Exception as e:
+                    _log_kaggle.warning("%s : badges non enregistres : %r", nom_local, e)
             origine_chemin = os.path.join(dossier_profils, "_kaggle_origine.json")
             try:
                 with open(origine_chemin, encoding="utf-8") as f:
@@ -30672,8 +31368,12 @@ class GestionnaireKaggle:
             origine[nom_local] = nom_archive
             with open(origine_chemin, "w", encoding="utf-8") as f:
                 json.dump(origine, f, ensure_ascii=False, indent=2)
+            _kg_hist_maj(dossier_profils, nom_local, nom_archive=nom_archive, nb_fichiers=nb_cible, taille=taille_cible,
+                         dernier_telechargement=_kaggle_maintenant_iso(), kaggle_mode=mode)
+            self._j(f"Duree totale du telechargement : {_kg_duree(t_debut)}")
             prog("Termine", 100)
-            return {"ok": True, "ref": ref, "nom_local": nom_local, "chemin": cible}
+            return {"ok": True, "ref": ref, "nom_local": nom_local, "chemin": cible, "type_instance": type_profil,
+                    "mode": mode, "nb_fichiers": nb_cible, "taille": taille_cible, "avertissements": avertissements}
         finally:
             shutil.rmtree(temp, ignore_errors=True)
 
@@ -30841,7 +31541,8 @@ def scanner_profils_kaggle(dossier_profils: str, noms_actifs: set) -> list:
             continue
         taille, mtime = _kaggle_taille_et_mtime(chemin)
         sortie.append({"nom": nom, "taille_octets": taille, "modifie_ts": mtime,
-                       "origine_kaggle": origines.get(nom), "actif": nom in noms_actifs})
+                       "origine_kaggle": origines.get(nom), "actif": nom in noms_actifs,
+                       "sites": _kg_sites_declares_local(nom)})
     return sortie
 
 
@@ -30865,13 +31566,24 @@ def traiter_envoi_kaggle(gestionnaire, dossier_profils: str, profil: dict, suppr
     try:
         res = gestionnaire.envoyer_profil(
             chemin, nom_archive, nom_local=nom_local, email=str(profil.get("email", "")), instance=instance,
-            supprimer_local=bool(supprimer_local), zipper=zipper, progression=progression)
+            supprimer_local=bool(supprimer_local), zipper=zipper, progression=progression,
+            sites=(profil.get("sites") if isinstance(profil.get("sites"), list) else None))
     except Exception as e:  # une erreur sur un profil n'arrete jamais les autres
         _log_kaggle.warning("Envoi de %r echoue : %r", nom_local, e)
-        return False, str(e)
+        return False, _kg_message_avec_journal(gestionnaire, str(e))
+    avert = res.get("avertissements") or []
+    suffixe = f" -- {len(avert)} avertissement(s), voir les lignes ci-dessous" if avert else ""
+    mode = (res.get("verification") or {}).get("mode") or ""
     if res.get("dossier_supprime"):
-        return True, "Envoye, verifie sur Kaggle, dossier local supprime."
-    return True, ("Dataset cree" if res.get("cree") else "Dataset mis a jour") + ", verifie sur Kaggle."
+        return True, _kg_message_avec_journal(
+            gestionnaire, f"Envoye, verifie sur Kaggle ({mode}), dossier local deplace dans la corbeille "
+                          f"({CORBEILLE_KAGGLE_JOURS} jours).{suffixe}")
+    if res.get("suppression_refusee"):
+        return True, _kg_message_avec_journal(
+            gestionnaire, "ATTENTION : envoye, mais Kaggle ne contient pas exactement le meme nombre de fichiers / la meme "
+                          f"taille ({mode}) : dossier local CONSERVE.{suffixe}")
+    return True, _kg_message_avec_journal(
+        gestionnaire, ("Dataset cree" if res.get("cree") else "Dataset mis a jour") + f", verifie sur Kaggle ({mode}).{suffixe}")
 
 
 # ---------------------------------------------------------------------------
@@ -31050,11 +31762,18 @@ def traiter_telechargement_kaggle(gestionnaire, dossier_profils: str, profil: di
     if nom_local in noms_actifs:
         return False, "en cours d'execution : telechargement refuse."
     try:
-        gestionnaire.telecharger_profil(slug, dossier_profils, nom_local, nom_archive, progression=progression)
+        res = gestionnaire.telecharger_profil(slug, dossier_profils, nom_local, nom_archive, progression=progression)
     except Exception as e:
         _log_kaggle.warning("Telechargement de %r echoue : %r", slug, e)
-        return False, str(e)
-    return True, "Telecharge et extrait."
+        return False, _kg_message_avec_journal(gestionnaire, str(e))
+    res = res if isinstance(res, dict) else {}
+    type_profil = res.get("type_instance")
+    avert = res.get("avertissements") or []
+    mode = res.get("mode") or ""
+    base = "Telecharge et restaure" + (f" ({mode})" if mode else "") + (f" (moteur : {type_profil})" if type_profil else "")
+    if avert:
+        base += f" -- {len(avert)} avertissement(s), voir les lignes ci-dessous"
+    return True, _kg_message_avec_journal(gestionnaire, base + ".")
 
 
 class FluxTelechargementKaggle:
@@ -31167,9 +31886,10 @@ class ProfilsKaggleScreen(QWidget):
     demande_kaggle_actualiser_datasets = Signal()
     demande_kaggle_envoyer = Signal(dict)
     demande_kaggle_telecharger = Signal(dict)
+    demande_kaggle_supprimer = Signal(dict)  # {id_operation, slug, nom_archive}
 
     LIGNES_JOURNAL_MAX = 500
-    COL_PROFIL, COL_TAILLE, COL_MODIF, COL_GARDER, COL_ARCHIVE, COL_ETAT, COL_PROG = range(7)
+    COL_PROFIL, COL_SITES, COL_TAILLE, COL_MODIF, COL_GARDER, COL_ARCHIVE, COL_ETAT, COL_PROG = range(8)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -31230,110 +31950,194 @@ class ProfilsKaggleScreen(QWidget):
         self.barre_activite_kaggle.setVisible(False)
         layout.addWidget(self.barre_activite_kaggle)
 
-        # --- Bloc A : Envoyer vers Kaggle ---
-        titre_a = QLabel("Envoyer vers Kaggle", self)
+        # --- PATCH (demande utilisateur) : interface en 2 colonnes ---
+        #   gauche : Envoyer vers Kaggle + Journaux ; droite : Telecharger depuis Kaggle uniquement.
+        self._tags_filtres: set = set()
+        separation = QSplitter(Qt.Horizontal, self)
+        separation.setChildrenCollapsible(False)
+        layout.addWidget(separation, stretch=1)
+
+        # ===== Colonne gauche : Envoyer vers Kaggle + Journaux =====
+        colonne_gauche = QWidget(separation)
+        layout_g = QVBoxLayout(colonne_gauche)
+        layout_g.setContentsMargins(0, 0, 6, 0)
+        layout_g.setSpacing(8)
+
+        titre_a = QLabel("Envoyer vers Kaggle", colonne_gauche)
         titre_a.setObjectName("ReglagesLabel")
-        layout.addWidget(titre_a)
+        layout_g.addWidget(titre_a)
 
         ligne_a = QHBoxLayout()
-        self.bouton_actualiser_profils = QPushButton(" Actualiser les profils", self)
+        self.bouton_actualiser_profils = QPushButton(" Actualiser les profils", colonne_gauche)
         self.bouton_actualiser_profils.setIcon(qta.icon("mdi6.refresh", color=Mocha.text))
         self.bouton_actualiser_profils.setCursor(Qt.PointingHandCursor)
         self.bouton_actualiser_profils.clicked.connect(self._sur_clic_actualiser_profils)
         ligne_a.addWidget(self.bouton_actualiser_profils)
         ligne_a.addStretch(1)
-        layout.addLayout(ligne_a)
+        layout_g.addLayout(ligne_a)
 
-        self.arbre_envoi = QTreeWidget(self)
+        self.arbre_envoi = QTreeWidget(colonne_gauche)
         self.arbre_envoi.setObjectName("ProfilsKaggleEnvoiTable")
+        self.arbre_envoi.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)  # pas de barre horizontale (defilement : molette / Maj+molette)
         self.arbre_envoi.setUniformRowHeights(True)
         self.arbre_envoi.setHeaderLabels(
-            ["Profil", "Taille", "Derniere modification", "Garder le nom", "Nom d'archive", "Etat", "Progression"])
+            ["Profil", "Sites", "Taille", "Derniere modification", "Garder le nom", "Nom d'archive", "Etat",
+             "Progression"])
         self.arbre_envoi.setSelectionMode(QAbstractItemView.NoSelection)
         self.arbre_envoi.header().setStretchLastSection(True)
-        self.arbre_envoi.setColumnWidth(self.COL_PROFIL, 230)
-        self.arbre_envoi.setColumnWidth(self.COL_ARCHIVE, 220)
-        self.arbre_envoi.setColumnWidth(self.COL_ETAT, 210)
+        self.arbre_envoi.setColumnWidth(self.COL_PROFIL, 200)
+        self.arbre_envoi.setColumnWidth(self.COL_SITES, 130)
+        self.arbre_envoi.setColumnWidth(self.COL_ARCHIVE, 170)
+        self.arbre_envoi.setColumnWidth(self.COL_ETAT, 160)
         self.arbre_envoi.itemChanged.connect(self._sur_case_changee)
-        layout.addWidget(self.arbre_envoi, stretch=3)
+        layout_g.addWidget(self.arbre_envoi, stretch=3)
 
-        self.case_supprimer = QCheckBox("Supprimer du sAutoniax apres envoi (uniquement apres envoi verifie)", self)
+        self.case_supprimer = QCheckBox("Supprimer du sAutoniax apres envoi (uniquement apres envoi verifie)", colonne_gauche)
         self.case_supprimer.setChecked(True)
-        layout.addWidget(self.case_supprimer)
+        layout_g.addWidget(self.case_supprimer)
 
-        self.bouton_envoyer = QPushButton(" Arreter + Archiver + Envoyer", self)
+        self.bouton_envoyer = QPushButton(" Arreter + Archiver + Envoyer", colonne_gauche)
         self.bouton_envoyer.setIcon(qta.icon("mdi6.cloud-upload-outline", color=Mocha.text))
         self.bouton_envoyer.setCursor(Qt.PointingHandCursor)
         self.bouton_envoyer.setEnabled(False)
         self.bouton_envoyer.clicked.connect(self._sur_clic_envoyer)
-        layout.addWidget(self.bouton_envoyer)
+        layout_g.addWidget(self.bouton_envoyer)
 
-        separateur = QFrame(self)
+        separateur = QFrame(colonne_gauche)
         separateur.setObjectName("ReglagesSeparateur")
         separateur.setFixedHeight(1)
-        layout.addWidget(separateur)
+        layout_g.addWidget(separateur)
 
-        # --- Bloc B : Telecharger depuis Kaggle ---
-        titre_b = QLabel("Telecharger depuis Kaggle", self)
-        titre_b.setObjectName("ReglagesLabel")
-        layout.addWidget(titre_b)
-
-        ligne_b = QHBoxLayout()
-        self.bouton_actualiser_datasets = QPushButton(" Actualiser", self)
-        self.bouton_actualiser_datasets.setIcon(qta.icon("mdi6.refresh", color=Mocha.text))
-        self.bouton_actualiser_datasets.setCursor(Qt.PointingHandCursor)
-        self.bouton_actualiser_datasets.clicked.connect(self._sur_clic_actualiser_datasets)
-        ligne_b.addWidget(self.bouton_actualiser_datasets)
-        self.label_tri = QLabel("", self)
-        self.label_tri.setObjectName("PlaceholderSubtitle")
-        ligne_b.addWidget(self.label_tri, stretch=1)
-        layout.addLayout(ligne_b)
-
-        milieu = QHBoxLayout()
-        self.table_datasets = QTreeWidget(self)
-        self.table_datasets.setObjectName("ProfilsKaggleDatasetsTable")
-        self.table_datasets.setRootIsDecorated(False)
-        self.table_datasets.setUniformRowHeights(True)
-        self.table_datasets.setHeaderLabels(["Nom d'archive", "Taille", "Cree le", "Mis a jour le"])
-        self.table_datasets.setColumnWidth(0, 260)
-        self.table_datasets.header().setStretchLastSection(True)
-        self.table_datasets.header().setSectionsClickable(True)
-        self.table_datasets.header().sectionClicked.connect(self._sur_clic_entete_datasets)
-        self.table_datasets.itemChanged.connect(lambda *_: self._rafraichir_boutons())
-        milieu.addWidget(self.table_datasets, stretch=3)
-
-        colonne_cibles = QVBoxLayout()
-        label_cibles = QLabel("sAutoniax cibles", self)
-        label_cibles.setObjectName("ReglagesLabel")
-        colonne_cibles.addWidget(label_cibles)
-        self.liste_cibles = QListWidget(self)
-        self.liste_cibles.setObjectName("ProfilsKaggleCibles")
-        self.liste_cibles.itemChanged.connect(lambda *_: self._rafraichir_boutons())
-        colonne_cibles.addWidget(self.liste_cibles, stretch=1)
-        milieu.addLayout(colonne_cibles, stretch=1)
-        layout.addLayout(milieu, stretch=3)
-
-        self.bouton_telecharger = QPushButton(" Repartir et telecharger", self)
-        self.bouton_telecharger.setIcon(qta.icon("mdi6.cloud-download-outline", color=Mocha.text))
-        self.bouton_telecharger.setCursor(Qt.PointingHandCursor)
-        self.bouton_telecharger.setEnabled(False)
-        self.bouton_telecharger.clicked.connect(self._sur_clic_telecharger)
-        layout.addWidget(self.bouton_telecharger)
-
-        # --- Journal (QListWidget, jamais d'editeur de texte) ---
-        self.journal = QListWidget(self)
+        titre_j = QLabel("Journaux", colonne_gauche)
+        titre_j.setObjectName("ReglagesLabel")
+        layout_g.addWidget(titre_j)
+        # Journal (QListWidget, jamais d'editeur de texte)
+        self.journal = QListWidget(colonne_gauche)
         self.journal.setObjectName("ProfilsKaggleJournal")
+        self.journal.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)  # pas de barre horizontale (defilement : molette / Maj+molette)
         self.journal.setSelectionMode(QAbstractItemView.NoSelection)
-        self.journal.setMaximumHeight(130)
+        self.journal.setMinimumHeight(110)
         ligne_journal = QHBoxLayout()
         ligne_journal.addWidget(self.journal, stretch=1)
-        self.bouton_copier_logs = QPushButton(" Copier les logs", self)
+        self.bouton_copier_logs = QPushButton(" Copier les logs", colonne_gauche)
         self.bouton_copier_logs.setIcon(qta.icon("mdi6.content-copy", color=Mocha.text))
         self.bouton_copier_logs.setCursor(Qt.PointingHandCursor)
         self.bouton_copier_logs.setToolTip("Copie tout le journal (horodaté) dans le presse-papiers.")
         self.bouton_copier_logs.clicked.connect(self._sur_clic_copier_logs)
         ligne_journal.addWidget(self.bouton_copier_logs, alignment=Qt.AlignTop)
-        layout.addLayout(ligne_journal)
+        layout_g.addLayout(ligne_journal, stretch=1)
+
+        # ===== Colonne droite : Telecharger depuis Kaggle (uniquement) =====
+        colonne_droite = QWidget(separation)
+        layout_d = QVBoxLayout(colonne_droite)
+        layout_d.setContentsMargins(6, 0, 0, 0)
+        layout_d.setSpacing(8)
+
+        titre_b = QLabel("Telecharger depuis Kaggle", colonne_droite)
+        titre_b.setObjectName("ReglagesLabel")
+        layout_d.addWidget(titre_b)
+
+        ligne_b = QHBoxLayout()
+        self.bouton_actualiser_datasets = QPushButton(" Actualiser", colonne_droite)
+        self.bouton_actualiser_datasets.setIcon(qta.icon("mdi6.refresh", color=Mocha.text))
+        self.bouton_actualiser_datasets.setCursor(Qt.PointingHandCursor)
+        self.bouton_actualiser_datasets.clicked.connect(self._sur_clic_actualiser_datasets)
+        ligne_b.addWidget(self.bouton_actualiser_datasets)
+        self.label_tri = QLabel("", colonne_droite)
+        self.label_tri.setObjectName("PlaceholderSubtitle")
+        self.label_tri.setWordWrap(True)
+        ligne_b.addWidget(self.label_tri, stretch=1)
+        layout_d.addLayout(ligne_b)
+
+        # Longue liste : prend toute la hauteur disponible de la colonne.
+        self.table_datasets = QTreeWidget(colonne_droite)
+        self.table_datasets.setObjectName("ProfilsKaggleDatasetsTable")
+        self.table_datasets.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)  # pas de barre horizontale (defilement : molette / Maj+molette)
+        self.table_datasets.setRootIsDecorated(False)
+        self.table_datasets.setUniformRowHeights(True)
+        self.table_datasets.setHeaderLabels(["Nom d'archive", "Taille", "Cree le", "Mis a jour le", "Sites"])
+        self.table_datasets.setColumnWidth(0, 210)
+        self.table_datasets.header().setStretchLastSection(True)
+        self.table_datasets.header().setSectionsClickable(True)
+        self.table_datasets.header().sectionClicked.connect(self._sur_clic_entete_datasets)
+        self.table_datasets.itemChanged.connect(lambda *_: self._rafraichir_boutons())
+        self.table_datasets.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table_datasets.customContextMenuRequested.connect(self._afficher_menu_datasets)
+        layout_d.addWidget(self.table_datasets, stretch=1)
+
+        # --- Configuration (en bas de la colonne) ---
+        separateur_cfg = QFrame(colonne_droite)
+        separateur_cfg.setObjectName("ReglagesSeparateur")
+        separateur_cfg.setFixedHeight(1)
+        layout_d.addWidget(separateur_cfg)
+
+        ligne_filtre = QHBoxLayout()
+        label_filtre = QLabel("Filtrer par tags", colonne_droite)
+        label_filtre.setObjectName("ReglagesLabel")
+        ligne_filtre.addWidget(label_filtre)
+        self.case_tags_et = QCheckBox("Tous les tags (ET)", colonne_droite)
+        self.case_tags_et.setChecked(True)
+        self.case_tags_et.setToolTip("Coche : un profil doit avoir TOUS les tags choisis.\n"
+                                     "Decoche : il suffit d'en avoir UN (OU).")
+        self.case_tags_et.toggled.connect(lambda *_: self._appliquer_filtre_tags())
+        ligne_filtre.addWidget(self.case_tags_et)
+        ligne_filtre.addStretch(1)
+        self.label_resultats = QLabel("", colonne_droite)
+        self.label_resultats.setObjectName("PlaceholderSubtitle")
+        ligne_filtre.addWidget(self.label_resultats)
+        layout_d.addLayout(ligne_filtre)
+
+        # Liste des tags globaux : un clic coche le tag (il entre dans le filtre), un autre clic le retire.
+        self.liste_tags = QListWidget(colonne_droite)
+        self.liste_tags.setObjectName("ProfilsKaggleTags")
+        self.liste_tags.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.liste_tags.setSelectionMode(QAbstractItemView.MultiSelection)  # clic = bascule coche / decoche
+        self.liste_tags.setFlow(QListView.LeftToRight)
+        self.liste_tags.setWrapping(True)
+        self.liste_tags.setResizeMode(QListView.Adjust)
+        self.liste_tags.setSpacing(2)
+        self.liste_tags.setFixedHeight(84)
+        self.liste_tags.itemSelectionChanged.connect(self._sur_selection_tags)
+        layout_d.addWidget(self.liste_tags)
+
+        # Selection automatique : "Selectionner les candidats" + nombre d'elements (premiers du resultat filtre).
+        ligne_auto = QHBoxLayout()
+        self.bouton_selection_auto = QPushButton(" Selectionner les candidats", colonne_droite)
+        self.bouton_selection_auto.setIcon(qta.icon("mdi6.checkbox-multiple-marked-outline", color=Mocha.text))
+        self.bouton_selection_auto.setCursor(Qt.PointingHandCursor)
+        self.bouton_selection_auto.setToolTip("Coche les N premiers profils du resultat filtre (remplace la selection actuelle).\n"
+                                              "Si le resultat contient moins de N profils, ils sont tous coches.")
+        self.bouton_selection_auto.clicked.connect(self._sur_clic_selection_auto)
+        ligne_auto.addWidget(self.bouton_selection_auto)
+        self.spin_nb_candidats = QSpinBox(colonne_droite)
+        self.spin_nb_candidats.setRange(1, 99999)
+        self.spin_nb_candidats.setValue(10)
+        self.spin_nb_candidats.setFixedWidth(90)
+        ligne_auto.addWidget(self.spin_nb_candidats)
+        ligne_auto.addStretch(1)
+        layout_d.addLayout(ligne_auto)
+
+        label_cibles = QLabel("sAutoniax cibles", colonne_droite)
+        label_cibles.setObjectName("ReglagesLabel")
+        layout_d.addWidget(label_cibles)
+        self.liste_cibles = QListWidget(colonne_droite)
+        self.liste_cibles.setObjectName("ProfilsKaggleCibles")
+        self.liste_cibles.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)  # pas de barre horizontale (defilement : molette / Maj+molette)
+        self.liste_cibles.setMaximumHeight(110)
+        self.liste_cibles.itemChanged.connect(lambda *_: self._rafraichir_boutons())
+        layout_d.addWidget(self.liste_cibles)
+
+        self.bouton_telecharger = QPushButton(" Repartir et telecharger", colonne_droite)
+        self.bouton_telecharger.setIcon(qta.icon("mdi6.cloud-download-outline", color=Mocha.text))
+        self.bouton_telecharger.setCursor(Qt.PointingHandCursor)
+        self.bouton_telecharger.setEnabled(False)
+        self.bouton_telecharger.clicked.connect(self._sur_clic_telecharger)
+        layout_d.addWidget(self.bouton_telecharger)
+
+        separation.addWidget(colonne_gauche)
+        separation.addWidget(colonne_droite)
+        separation.setStretchFactor(0, 1)
+        separation.setStretchFactor(1, 1)
 
         self.label_correspondance.setText("Aucune correspondance importee.")  # reel des que definir_reglages() est appele
         self._rafraichir_libelle_tri()
@@ -31380,7 +32184,8 @@ class ProfilsKaggleScreen(QWidget):
         if not noms and not correspondance:
             self.ajouter_journal("Rien à copier : aucun profil chargé et aucune correspondance enregistrée.")
             return
-        texte = construire_texte_correspondance_ia(noms, correspondance)
+        texte = construire_texte_correspondance_ia(
+            noms, correspondance, getattr(self._reglages_courants(), "kaggle_correspondance_sites", None))
         QGuiApplication.clipboard().setText(texte)
         nb_entrees = len(json.loads(texte[len(PROMPT_CORRESPONDANCE_IA):]))
         self.ajouter_journal(f"Prompt + JSON copiés dans le presse-papiers ({nb_entrees} entrée(s)).")
@@ -31495,8 +32300,9 @@ class ProfilsKaggleScreen(QWidget):
                     nom_local = str(p.get("nom", ""))
                     origine = p.get("origine_kaggle")
                     coche, garder = self._etat_cases.get((id_executant, nom_local), (True, bool(origine)))
-                    it = QTreeWidgetItem([nom_local, formater_taille_octets(p.get("taille_octets")),
+                    it = QTreeWidgetItem([nom_local, "", formater_taille_octets(p.get("taille_octets")),
                                           formater_horodatage(p.get("modifie_ts")), "", "", "", ""])
+                    it.setData(self.COL_SITES, Qt.UserRole, list(p.get("sites") or []))
                     it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
                     it.setCheckState(self.COL_PROFIL, Qt.Checked if coche else Qt.Unchecked)
                     it.setCheckState(self.COL_GARDER, Qt.Checked if garder else Qt.Unchecked)
@@ -31531,6 +32337,7 @@ class ProfilsKaggleScreen(QWidget):
             self._rafraichir_boutons()
             return
         lignes = self._lignes()
+        sites_corr = dict(getattr(self._reglages_courants(), "kaggle_correspondance_sites", None) or {})
         self._plan_courant = planifier_envoi(lignes, self._correspondance())
         self._lignes_courantes_cache = lignes
         self._maj_en_cours = True
@@ -31561,7 +32368,13 @@ class ProfilsKaggleScreen(QWidget):
                 it.setText(self.COL_ARCHIVE, archive)
                 it.setText(self.COL_ETAT, etat)
                 it.setText(self.COL_PROG, "")
-                for col in range(7):
+                # tags : ceux du JSON de l'IA s'ils existent (ce sont eux qui partiront), sinon ceux du profil
+                tags = sites_corr.get(ligne["nom_local"])
+                if tags is None:
+                    tags = it.data(self.COL_SITES, Qt.UserRole) or []
+                it.setText(self.COL_SITES, ", ".join(tags))
+                it.setToolTip(self.COL_SITES, ("Tags : " + ", ".join(tags)) if tags else "Aucun tag")
+                for col in range(8):
                     it.setForeground(col, QBrush(QColor(couleur)) if couleur else QBrush())
                 it.setToolTip(self.COL_ARCHIVE, infobulle)
                 it.setToolTip(self.COL_ETAT, infobulle)
@@ -31593,7 +32406,7 @@ class ProfilsKaggleScreen(QWidget):
         detail = (f"{r['total']} profil(s) sur {r['sautoniax']} sAutoniax.\n"
                   + ("Archives : liste Kaggle non chargee (creation ou mise a jour inconnue).\n" if r["inconnus"]
                      else f"Archives : {r['crees']} creee(s), {r['maj']} mise(s) a jour.\n")
-                  + "Les executions de ces profils seront ARRETEES avant l'archivage.\n"
+                  + "Les profils en cours seront FERMES (navigateur arrete) avant l'archivage.\n"
                   + f"Suppression du dossier sur le sAutoniax apres envoi verifie : {'OUI' if supprimer else 'non'}.\n")
         if r["bloques"]:
             detail += f"\n{r['bloques']} ligne(s) bloquee(s) (erreur de nommage) : non envoyees."
@@ -31603,13 +32416,17 @@ class ProfilsKaggleScreen(QWidget):
                                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
             return
         corr = self._correspondance()
+        sites_corr = dict(getattr(self._reglages_courants(), "kaggle_correspondance_sites", None) or {})
         profils = []
         for ligne, p in zip(lignes, plan):
             if not p["partira"]:
                 continue
-            profils.append({"id_executant": ligne["id_executant"], "nom_executant": ligne["nom_executant"],
-                            "nom_local": ligne["nom_local"], "nom_archive": p["nom_archive"], "slug": p["slug"],
-                            "email": corr.get(ligne["nom_local"], ""), "modifie_ts": ligne["modifie_ts"]})
+            entree = {"id_executant": ligne["id_executant"], "nom_executant": ligne["nom_executant"],
+                      "nom_local": ligne["nom_local"], "nom_archive": p["nom_archive"], "slug": p["slug"],
+                      "email": corr.get(ligne["nom_local"], ""), "modifie_ts": ligne["modifie_ts"]}
+            if ligne["nom_local"] in sites_corr:  # absent = ancien format : les tags du profil ne sont pas touches
+                entree["sites"] = list(sites_corr[ligne["nom_local"]])
+            profils.append(entree)
         self._operation_id = uuid.uuid4().hex[:12]
         self._marquer_lignes_en_attente({(p["id_executant"], p["nom_local"]) for p in profils})
         self._rafraichir_boutons()
@@ -31646,12 +32463,11 @@ class ProfilsKaggleScreen(QWidget):
             it.setText(self.COL_ETAT, "envoye" if ok else "ERREUR")
             if ok:
                 it.setText(self.COL_PROG, "100 %")
-            for col in range(7):
+            for col in range(8):
                 it.setForeground(col, QBrush(QColor(Mocha.green if ok else Mocha.red)))
             it.setToolTip(self.COL_ETAT, message or "")
             self._maj_en_cours = False
-        self.ajouter_journal(f"{self._sautoniax.get(id_executant, id_executant)} / {nom_local} : {'OK' if ok else 'ERREUR'}"
-                             + (f" ({message})" if message else ""))
+        self._journaliser_resultat(id_executant, nom_local, ok, message)
 
     # ------------------------------------------------------------------
     # Bloc B : datasets
@@ -31673,13 +32489,120 @@ class ProfilsKaggleScreen(QWidget):
         self.table_datasets.clear()
         for d in trier_datasets(self._datasets, self._tri_datasets):
             it = QTreeWidgetItem([d.get("nom_archive", ""), formater_taille_octets(d.get("taille_octets")),
-                                  formater_horodatage(d.get("cree_le")), formater_horodatage(d.get("maj_le"))])
+                                  formater_horodatage(d.get("cree_le")), formater_horodatage(d.get("maj_le")),
+                                  ", ".join(d.get("sites") or [])])
             it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
             it.setCheckState(0, coches.get(d["slug"], Qt.Unchecked))
             it.setData(0, Qt.UserRole, d["slug"])
+            it.setData(0, Qt.UserRole + 1, list(d.get("sites") or []))
             self.table_datasets.addTopLevelItem(it)
         self.table_datasets.blockSignals(False)
+        self._reconstruire_liste_tags()
+        self._appliquer_filtre_tags()
+
+    # --- Filtre par tags + selection automatique (colonne "Telecharger depuis Kaggle") ---
+    def _reconstruire_liste_tags(self):
+        """Liste des tags globaux (union des tags de tous les datasets). L'etat du filtre est conserve."""
+        tags = sorted({str(t) for d in self._datasets for t in (d.get("sites") or []) if str(t)}, key=str.lower)
+        self._tags_filtres &= set(tags)  # un tag qui a disparu quitte le filtre
+        self.liste_tags.blockSignals(True)
+        self.liste_tags.clear()
+        for t in tags:
+            it = QListWidgetItem(t)
+            it.setData(Qt.UserRole, t)
+            self.liste_tags.addItem(it)
+            it.setSelected(t in self._tags_filtres)
+        self.liste_tags.blockSignals(False)
+        self._rafraichir_texte_tags()
+
+    def _rafraichir_texte_tags(self):
+        for r in range(self.liste_tags.count()):
+            it = self.liste_tags.item(r)
+            tag = it.data(Qt.UserRole)
+            it.setText(("\u2611 " if it.isSelected() else "\u2610 ") + tag)
+
+    def _sur_selection_tags(self):
+        self._tags_filtres = {self.liste_tags.item(r).data(Qt.UserRole)
+                              for r in range(self.liste_tags.count()) if self.liste_tags.item(r).isSelected()}
+        self._rafraichir_texte_tags()
+        self._appliquer_filtre_tags()
+
+    def _passe_filtre_tags(self, sites) -> bool:
+        if not self._tags_filtres:
+            return True
+        s = set(sites or [])
+        return self._tags_filtres <= s if self.case_tags_et.isChecked() else bool(self._tags_filtres & s)
+
+    def _appliquer_filtre_tags(self):
+        total = self.table_datasets.topLevelItemCount()
+        visibles = 0
+        for r in range(total):
+            it = self.table_datasets.topLevelItem(r)
+            passe = self._passe_filtre_tags(it.data(0, Qt.UserRole + 1))
+            it.setHidden(not passe)
+            visibles += 1 if passe else 0
+        self.label_resultats.setText(f"{visibles} / {total} profil(s) affiche(s)")
         self._rafraichir_boutons()
+
+    def _sur_clic_selection_auto(self):
+        """Coche les N premiers profils du resultat filtre (ordre d'affichage). Remplace la selection actuelle."""
+        n = int(self.spin_nb_candidats.value())
+        self.table_datasets.blockSignals(True)
+        restant = n
+        coches = 0
+        for r in range(self.table_datasets.topLevelItemCount()):
+            it = self.table_datasets.topLevelItem(r)
+            if not it.isHidden() and restant > 0:
+                it.setCheckState(0, Qt.Checked)
+                restant -= 1
+                coches += 1
+            else:
+                it.setCheckState(0, Qt.Unchecked)
+        self.table_datasets.blockSignals(False)
+        self.ajouter_journal(f"Selection automatique : {coches} profil(s) coche(s) (demande : {n}).")
+        self._rafraichir_boutons()
+
+    def _afficher_menu_datasets(self, position):
+        item = self.table_datasets.itemAt(position)
+        if item is None:
+            return
+        self.table_datasets.setCurrentItem(item)
+        slug = item.data(0, Qt.UserRole)
+        menu = QMenu(self)
+        action = menu.addAction(qta.icon("mdi6.delete-outline", color=Mocha.red), "Supprimer")
+        action.setEnabled(self._operation_id is None)
+        if menu.exec(self.table_datasets.viewport().mapToGlobal(position)) is action:
+            self._sur_clic_supprimer_dataset(slug)
+
+    def _sur_clic_supprimer_dataset(self, slug: str):
+        if self._operation_id is not None:
+            return
+        d = next((x for x in self._datasets if x.get("slug") == slug), None)
+        if d is None:
+            return
+        nom = d.get("nom_archive") or slug
+        detail = (f"Supprimer définitivement le profil « {nom} » de Kaggle ?\n\n"
+                  f"Dataset : {d.get('ref', slug)}\nTaille : {formater_taille_octets(d.get('taille_octets'))}\n\n"
+                  "Action IRRÉVERSIBLE : le dataset disparaît de Kaggle.\n"
+                  "Les profils déjà présents sur les sAutoniax ne sont pas touchés.")
+        if QMessageBox.question(self, "Supprimer de Kaggle", detail,
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        self._operation_id = uuid.uuid4().hex[:12]
+        self._rafraichir_boutons()
+        self.ajouter_journal(f"Suppression de {nom} sur Kaggle (operation {self._operation_id}).")
+        self.demande_kaggle_supprimer.emit({"id_operation": self._operation_id, "slug": slug, "nom_archive": nom})
+
+    def sur_resultat_suppression(self, id_operation: str, slug: str, ok: bool, message: str):
+        if id_operation != self._operation_id:
+            return
+        if ok:
+            self.ajouter_journal(f"Suppression de {slug} : OK.")
+            self._datasets = [d for d in self._datasets if d.get("slug") != slug]
+            self._reconstruire_table_datasets()
+        else:
+            self.ajouter_journal(f"Suppression de {slug} : ERREUR ({message})")
+            QMessageBox.warning(self, "Supprimer de Kaggle", f"La suppression a échoué :\n\n{message}")
 
     def _datasets_coches(self) -> list:
         """Datasets coches, dans l'ordre d'affichage."""
@@ -31687,7 +32610,7 @@ class ProfilsKaggleScreen(QWidget):
         sortie = []
         for r in range(self.table_datasets.topLevelItemCount()):
             it = self.table_datasets.topLevelItem(r)
-            if it.checkState(0) == Qt.Checked and it.data(0, Qt.UserRole) in par_slug:
+            if not it.isHidden() and it.checkState(0) == Qt.Checked and it.data(0, Qt.UserRole) in par_slug:
                 sortie.append(par_slug[it.data(0, Qt.UserRole)])
         return sortie
 
@@ -31728,8 +32651,7 @@ class ProfilsKaggleScreen(QWidget):
 
     def sur_resultat_telechargement(self, id_operation: str, id_executant: str, nom_local: str, ok: bool, message: str):
         if id_operation == self._operation_id:
-            self.ajouter_journal(f"{self._sautoniax.get(id_executant, id_executant)} / {nom_local} : {'OK' if ok else 'ERREUR'}"
-                                 + (f" ({message})" if message else ""))
+            self._journaliser_resultat(id_executant, nom_local, ok, message)
 
     # ------------------------------------------------------------------
     # Etat, journal
@@ -31764,6 +32686,18 @@ class ProfilsKaggleScreen(QWidget):
         self.bouton_actualiser_datasets.setEnabled(libre)
         self.bouton_envoyer.setEnabled(libre and any(p["partira"] for p in plan))
         self.bouton_telecharger.setEnabled(libre and bool(self._datasets_coches()) and bool(self._cibles_cochees()))
+        self.bouton_selection_auto.setEnabled(libre and self.table_datasets.topLevelItemCount() > 0)
+
+    def _journaliser_resultat(self, id_executant: str, nom_local: str, ok: bool, message: str):
+        """Resultat d'un transfert : 1re ligne = verdict, lignes suivantes = detail (fichiers, tailles, durees, avertissements)."""
+        lignes = str(message or "").split("\n")
+        entete = f"{self._sautoniax.get(id_executant, id_executant)} / {nom_local} : {'OK' if ok else 'ERREUR'}"
+        if lignes and lignes[0].strip():
+            entete += f" ({lignes[0].strip()})"
+        self.ajouter_journal(entete)
+        for ligne in lignes[1:]:
+            if ligne.strip():
+                self.ajouter_journal("      " + ligne.rstrip())
 
     def ajouter_journal(self, texte: str):
         self.journal.addItem(f"{time.strftime('%H:%M:%S')}  {texte}")
@@ -31771,14 +32705,21 @@ class ProfilsKaggleScreen(QWidget):
             self.journal.takeItem(0)
         self.journal.scrollToBottom()
 
+    def demarrer_au_lancement(self):
+        """PATCH (demande utilisateur) : connexion + actualisation Kaggle des le demarrage de l'app, sans
+        attendre l'affichage de l'onglet. Idempotent. Les sAutoniax qui se connectent plus tard demandent
+        leurs profils eux-memes (cf. definir_sautoniax_disponibles, _deja_affiche = True)."""
+        if self._deja_affiche:
+            return
+        self._deja_affiche = True
+        self.definir_activite_kaggle(True, "Connexion a Kaggle en cours...")
+        self.demande_kaggle_verifier_connexion.emit()
+        if self._sautoniax:
+            self.demande_kaggle_actualiser_profils.emit(sorted(self._sautoniax))
+
     def showEvent(self, event):
         super().showEvent(event)
-        if not self._deja_affiche:
-            self._deja_affiche = True
-            self.definir_activite_kaggle(True, "Connexion a Kaggle en cours...")
-            self.demande_kaggle_verifier_connexion.emit()
-            if self._sautoniax:
-                self.demande_kaggle_actualiser_profils.emit(sorted(self._sautoniax))
+        self.demarrer_au_lancement()
 
 
 class ControleurKaggle(QObject):
@@ -31790,6 +32731,7 @@ class ControleurKaggle(QObject):
 
     _connexion_prete = Signal(bool, str, object)
     _datasets_prets = Signal(object)
+    _suppression_prete = Signal(str, str, bool, str)
 
     def __init__(self, client_serveur_t, ecran, fabrique_gestionnaire=None, parent=None):
         super().__init__(parent)
@@ -31803,6 +32745,7 @@ class ControleurKaggle(QObject):
         self._thread_liste: Optional[threading.Thread] = None
         self._connexion_prete.connect(self._sur_connexion_prete)
         self._datasets_prets.connect(self._sur_datasets_prets)
+        self._suppression_prete.connect(self._sur_suppression_prete)
         self._minuteur = QTimer(self)
         self._minuteur.setInterval(1000)
         self._minuteur.timeout.connect(self._sur_minuteur)
@@ -31813,13 +32756,14 @@ class ControleurKaggle(QObject):
         ecran.demande_kaggle_actualiser_datasets.connect(self.actualiser_datasets)
         ecran.demande_kaggle_envoyer.connect(self.demarrer_envoi)
         ecran.demande_kaggle_telecharger.connect(self.demarrer_telechargement)
+        ecran.demande_kaggle_supprimer.connect(self.supprimer_dataset)
         # reseau -> controleur
         client_serveur_t.kaggle_profils_recus.connect(self._sur_profils_recus)
         client_serveur_t.kaggle_progression_recue.connect(self._sur_progression)
         client_serveur_t.kaggle_resultat_recu.connect(self._sur_resultat)
         client_serveur_t.kaggle_ack_recu.connect(self._sur_ack)
-        client_serveur_t.arreter_execution_profil_resultat.connect(self._sur_ack_arret)
-        client_serveur_t.arreter_execution_profil_resultat_reel_recu.connect(self._sur_arret_reel)
+        client_serveur_t.kill_profil_resultat.connect(self._sur_ack_arret)
+        client_serveur_t.kill_profil_resultat_reel_recu.connect(self._sur_kill_reel)
 
     # -- connexion Kaggle, quota, datasets (thread) ------------------------
     def verifier_connexion(self):
@@ -31841,6 +32785,22 @@ class ControleurKaggle(QObject):
             except Exception as e:
                 self._connexion_prete.emit(False, str(e), None)
         threading.Thread(target=travail, name="kaggle-datasets", daemon=True).start()
+
+    def supprimer_dataset(self, charge: dict):
+        id_operation = charge.get("id_operation", "")
+        slug = str(charge.get("slug", ""))
+
+        def travail():
+            try:
+                self._fabrique().supprimer_dataset(slug)
+                self._suppression_prete.emit(id_operation, slug, True, "")
+            except Exception as e:
+                self._suppression_prete.emit(id_operation, slug, False, str(e))
+        threading.Thread(target=travail, name="kaggle-suppression", daemon=True).start()
+
+    def _sur_suppression_prete(self, id_operation, slug, ok, message):
+        self._ecran.sur_resultat_suppression(id_operation, slug, bool(ok), message or "")
+        self._ecran.terminer_operation(id_operation)  # libere l'ecran et recharge la liste des datasets
 
     def _sur_connexion_prete(self, ok, message, quota):
         self._ecran.definir_etat_connexion(bool(ok), message or "", quota)
@@ -31899,15 +32859,21 @@ class ControleurKaggle(QObject):
         self._flux.demarrer()
 
     def _arreter_profil(self, id_executant, nom_local):
-        self._ecran.ajouter_journal(f"Arret de l'execution : {self._ecran._sautoniax.get(id_executant, id_executant)} / {nom_local}")
-        self._client.arreter_execution_profil(id_executant, nom_local)
+        # kill_profil ferme le navigateur et vide les registres ; "Arreter" (arreter_execution_profil) n'arrete que le
+        # code et laisse le profil actif, donc l'archive etait refusee ("arret non confirme").
+        self._ecran.ajouter_journal(f"Fermeture du profil : {self._ecran._sautoniax.get(id_executant, id_executant)} / {nom_local}")
+        self._client.kill_profil(id_executant, nom_local)
 
     def _envoyer_profil(self, id_executant, profil):
+        entree = {"nom_local": profil["nom_local"], "nom_archive": profil["nom_archive"],
+                  "email": profil.get("email", "")}
+        # FIX badges/sites : "sites" etait perdu ici (liste blanche de champs). Absent = ancien format -> tags locaux intacts.
+        if isinstance(profil.get("sites"), list):
+            entree["sites"] = list(profil["sites"])
         self._client.envoyer_ordre_kaggle(
             "kaggle_envoyer_profils", id_executant, self._operation or "",
             supprimer_local=self._supprimer_local,
-            profils=[{"nom_local": profil["nom_local"], "nom_archive": profil["nom_archive"],
-                      "email": profil.get("email", "")}])
+            profils=[entree])
 
     def _flux_actif(self):
         return self._flux if (self._flux is not None and not self._flux.est_termine()) else None
@@ -31938,6 +32904,10 @@ class ControleurKaggle(QObject):
     def _sur_arret_reel(self, id_executant, nom_profil, ok, message):
         if self._flux is not None:
             self._flux.sur_arret(id_executant, nom_profil, bool(ok), message)
+
+    def _sur_kill_reel(self, id_executant, nom_profil, redemarrer, ok, message):
+        if not redemarrer:
+            self._sur_arret_reel(id_executant, nom_profil, ok, message)
 
     def sur_executants_connectes(self, executants: dict):
         if self._flux is not None:
@@ -33327,6 +34297,7 @@ class ReseauScreen(QWidget):
         self.profils_screen.demande_envoi_profil_vers_sautoniax.connect(self.demande_envoi_profil_vers_sautoniax)
         self.profils_screen.demande_telechargement_local_profil.connect(self.demande_telechargement_local_profil)
         self.onglets.addTab(self.profils_screen, "Profils")
+        self.profils_screen.sous_onglets.setCurrentWidget(self.profils_screen.kaggle_screen)
         # PATCH (Patch 4.4.b) : onglet "Projets Distribués", inséré juste
         # après "Profils" (cf. spec §4/structure cible à 6 onglets :
         # "Git | Instances | Profils | Projets Distribués | Notebook
@@ -33387,6 +34358,9 @@ class ReseauScreen(QWidget):
     def _sur_changement_onglet_reseau(self, index: int):
         if self.onglets.widget(index) is self.instances_screen:
             self.instances_screen.actualiser_selection_courante()
+        elif self.onglets.widget(index) is self.profils_screen:
+            # PATCH (demande utilisateur) : le sous-onglet "Profils Kaggle" est toujours celui actif a l'ouverture.
+            self.profils_screen.sous_onglets.setCurrentWidget(self.profils_screen.kaggle_screen)
 
 
 class Sidebar(QWidget):
@@ -38953,7 +39927,7 @@ class PanneauRenduInstance(QWidget):
         self.fps_auto_spin.setObjectName("ReglagesSpin")
         self.fps_auto_spin.setRange(0.2, 30.0)
         self.fps_auto_spin.setSingleStep(0.5)
-        self.fps_auto_spin.setValue(2.0)  # défaut volontairement bas -- jamais un flux lourd sans que
+        self.fps_auto_spin.setValue(1.0)  # PATCH : 1 im/s par défaut partout (demande utilisateur) -- défaut volontairement bas -- jamais un flux lourd sans que
         # l'utilisateur ait explicitement choisi un taux plus élevé
         self.fps_auto_spin.setSuffix(" im/s")
         layout_ligne_taux.addWidget(self.fps_auto_spin)
@@ -63445,6 +64419,8 @@ class FenetreRenduTaskReseau(QWidget):
             "Rendu de l'instance distante (sAutoniax)", self,
             mode_bitmap_direct_capture=True,
         )
+        # PATCH (demande utilisateur) : pilote distant -> 1 image/s par defaut (les ecrans locaux gardent 2).
+        self.panneau.fps_auto_spin.setValue(1.0)
         layout_racine.addWidget(self.panneau, stretch=1)
 
         # --- PATCH barre d'onglets horizontale (cf. BarreOngletsReseau) :
@@ -86214,66 +87190,46 @@ def _zipper_dossier_profil(chemin_dossier: str) -> Path:
     geoip/proxy/cookies/historique intacts, y compris ces 3 clés qui
     restent valides SUR CETTE machine précise). Seule la copie qui part
     vers une autre machine est nettoyée."""
-    chemin_zip_sans_extension = Path(tempfile.gettempdir()) / f"autoniax_profil_{uuid.uuid4().hex}"
-    chemin_zip_str = shutil.make_archive(
-        str(chemin_zip_sans_extension), "zip", root_dir=chemin_dossier,
-    )
-    chemin_zip = Path(chemin_zip_str)
-
-    # Nettoyage du fingerprint DANS LE ZIP (cf. docstring ci-dessus) --
-    # défensif de bout en bout : un zip sans fingerprint (ancien profil,
-    # ou profil créé sans proxy/config robuste) ne pose aucun problème
-    # (rien à nettoyer, no-op) ; un JSON illisible/corrompu ne doit
-    # jamais faire échouer l'ENVOI du profil pour autant -- seul le
-    # nettoyage est sauté, journalisé, le zip original (non nettoyé)
-    # part quand même (repli identique au comportement actuel).
+    # PATCH VITESSE (demande utilisateur : "le plus rapide possible, je veux juste envelopper") -- ZIP_STORED : les
+    # fichiers sont simplement empaquetes, AUCUNE compression (zero CPU, vitesse limitee par le disque). Un seul
+    # passage : le fingerprint est nettoye a la volee, sans reconstruire un second zip.
+    chemin_zip = Path(tempfile.gettempdir()) / f"autoniax_profil_{uuid.uuid4().hex}.zip"
     nom_entree_fingerprint = "camoufox_fingerprint.json"
     cles_machine_specifiques = ("executable_path", "user_data_dir", "headless")
+    racine = os.path.abspath(chemin_dossier)
     try:
-        with zipfile.ZipFile(chemin_zip, "r") as zf_lecture:
-            noms_presents = zf_lecture.namelist()
-            if nom_entree_fingerprint not in noms_presents:
-                return chemin_zip  # aucun fingerprint dans ce profil -- rien à nettoyer
-            fingerprint_brut = zf_lecture.read(nom_entree_fingerprint)
-        fingerprint_dict = json.loads(fingerprint_brut)
-        cles_retirees = [c for c in cles_machine_specifiques if c in fingerprint_dict]
-        if not cles_retirees:
-            return chemin_zip  # déjà propre -- rien à réécrire
-        for cle in cles_retirees:
-            fingerprint_dict.pop(cle, None)
-        fingerprint_nettoye = json.dumps(fingerprint_dict, indent=2).encode("utf-8")
-
-        # zipfile ne permet pas de remplacer une entrée en place -- on
-        # reconstruit un second zip (même patron que shutil.make_archive
-        # : fichier temporaire dédié, jamais le zip original modifié
-        # partiellement en cas d'erreur en cours de route) puis on
-        # substitue l'ancien.
-        chemin_zip_nettoye = chemin_zip.with_name(chemin_zip.stem + "_nettoye.zip")
-        with zipfile.ZipFile(chemin_zip, "r") as zf_lecture, \
-             zipfile.ZipFile(chemin_zip_nettoye, "w", zipfile.ZIP_DEFLATED) as zf_ecriture:
-            for item in zf_lecture.infolist():
-                if item.filename == nom_entree_fingerprint:
-                    zf_ecriture.writestr(item, fingerprint_nettoye)
-                else:
-                    zf_ecriture.writestr(item, zf_lecture.read(item.filename))
+        with zipfile.ZipFile(chemin_zip, "w", zipfile.ZIP_STORED, allowZip64=True) as zf:
+            for dossier, sous_dossiers, fichiers in os.walk(racine):
+                sous_dossiers.sort()
+                rel_dossier = os.path.relpath(dossier, racine)
+                if rel_dossier != ".":
+                    zf.write(dossier, rel_dossier.replace(os.sep, "/") + "/")
+                for nom in sorted(fichiers):
+                    chemin = os.path.join(dossier, nom)
+                    # lien symbolique casse (ex. 'lock' de Firefox/Camoufox -> "ip:+pid", laisse apres un arret) :
+                    # il ne pointe sur rien et zf.write() leverait [Errno 2] -> ignore, jamais utile dans l'archive
+                    if os.path.islink(chemin) and not os.path.exists(chemin):
+                        continue
+                    rel = os.path.relpath(chemin, racine).replace(os.sep, "/")
+                    if rel == nom_entree_fingerprint:
+                        try:
+                            with open(chemin, "rb") as f:
+                                fp = json.loads(f.read())
+                            retirees = [c for c in cles_machine_specifiques if c in fp]
+                            if retirees:
+                                for c in retirees:
+                                    fp.pop(c, None)
+                                zf.writestr(rel, json.dumps(fp, indent=2).encode("utf-8"))
+                                log.info(f"[camoufox] profil zippe pour envoi -- cle(s) {retirees} retiree(s) de "
+                                         f"{nom_entree_fingerprint} dans le zip (fichier local inchange).")
+                                continue
+                        except Exception as exc_nettoyage:  # JSON illisible : le fichier part tel quel
+                            log.warning(f"[camoufox] nettoyage de {nom_entree_fingerprint} impossible "
+                                        f"({exc_nettoyage!r}) -- envoye tel quel.")
+                    zf.write(chemin, rel)
+    except Exception:
         chemin_zip.unlink(missing_ok=True)
-        chemin_zip_nettoye.rename(chemin_zip)
-        log.info(
-            f"[camoufox] profil zippé pour envoi -- clé(s) machine-spécifique(s) "
-            f"{cles_retirees} retirée(s) de {nom_entree_fingerprint} dans le zip "
-            f"(le fichier local du profil reste inchangé)."
-        )
-    except Exception as exc_nettoyage:
-        # Défensif -- cf. docstring : un échec de nettoyage ne doit
-        # jamais bloquer l'envoi, seulement le dégrader (zip envoyé tel
-        # quel, non nettoyé -- comportement identique à avant ce patch).
-        log.warning(
-            f"[camoufox] échec du nettoyage machine-spécifique de "
-            f"{nom_entree_fingerprint} dans le zip du profil ({exc_nettoyage!r}) -- "
-            f"le zip part tel quel, non nettoyé (le destinataire s'appuiera sur le "
-            f"repli de camoufox_demarrer_navigateur au rechargement)."
-        )
-
+        raise
     return chemin_zip
 
 
@@ -113453,6 +114409,8 @@ class MainWindow(QMainWindow):
         reseau_screen.profils_screen.definir_reglages_kaggle(self.reglages)
         self.controleur_kaggle = ControleurKaggle(
             self.client_serveur_t, reseau_screen.profils_screen.kaggle_screen, parent=self)
+        # PATCH : lancement immediat (boucle d'evenements deja active) au lieu d'attendre le showEvent de l'onglet.
+        QTimer.singleShot(0, reseau_screen.profils_screen.kaggle_screen.demarrer_au_lancement)
         self.client_serveur_t.executants_detail_change.connect(
             lambda executants: self.controleur_kaggle.sur_executants_connectes(
                 {e.get("id", ""): e.get("nom") or e.get("id", "") for e in executants if e.get("id")}))
@@ -117253,6 +118211,7 @@ def charger_registre_profils_config() -> dict[str, dict]:
             "type_instance": type_instance, "proxy": proxy, "pays": pays, "youtube": youtube,
             "ip": ip, "tiktok": tiktok, "ia": ia, "favori": favori, "test": test,
             "proxy_natif": proxy_natif, "bloquer_media": bloquer_media,
+            "sites": normaliser_sites(config.get("sites")),
         }
     return resultat
 
@@ -117651,6 +118610,8 @@ def obtenir_config_profil(nom: str) -> dict:
     # que "proxy_natif"/"tiktok"/"ia"/"favori" ci-dessus, pour une config
     # existante écrite AVANT ce patch.
     config.setdefault("bloquer_media", False)
+    # PATCH (tags "sites connectes" par profil) -- liste vide par defaut ; copie pour ne jamais partager la liste.
+    config["sites"] = normaliser_sites(config.get("sites"))
     return config
 
 
@@ -117757,6 +118718,60 @@ def definir_youtube_config_profil(nom: str, youtube: bool) -> bool:
     config_existante["youtube"] = bool(youtube)
     configs[nom] = config_existante
     return sauvegarder_registre_profils_config(configs)
+
+
+# ---------------------------------------------------------------------------
+# Tags "sites connectes" d'un profil (google, youtube, tiktok...) : liste libre, saisie a la main.
+# Sert plus tard a trier/filtrer les profils par service. Transmise dans le meta.json Kaggle.
+# ---------------------------------------------------------------------------
+SITES_SUGGERES = ("google", "youtube", "tiktok", "facebook", "instagram", "x", "amazon", "microsoft", "discord", "telegram")
+_LONGUEUR_MAX_SITE = 40
+_NB_MAX_SITES = 100
+
+
+def normaliser_site(valeur) -> str:
+    """Un tag : minuscules, sans espaces autour ni caracteres de controle, espaces internes -> '-'. '' si invalide."""
+    if not isinstance(valeur, str):
+        return ""
+    s = "".join(c for c in valeur.strip().lower() if c.isprintable())
+    s = "-".join(s.split())
+    return s[:_LONGUEUR_MAX_SITE]
+
+
+def normaliser_sites(valeur) -> list:
+    """Liste de tags propre : normalisee, sans doublon ni vide, triee. Tout ce qui n'est pas une liste -> []."""
+    if isinstance(valeur, str):
+        valeur = [valeur]
+    if not isinstance(valeur, (list, tuple, set)):
+        return []
+    vus = {normaliser_site(v) for v in valeur}
+    vus.discard("")
+    return sorted(vus)[:_NB_MAX_SITES]
+
+
+def definir_sites_config_profil(nom: str, sites) -> bool:
+    """Remplace la liste des sites connectes d'un profil. Cree l'entree (valeurs par defaut) si besoin.
+    Retourne le succes reel de l'ecriture."""
+    nom = str(nom)
+    configs = charger_registre_profils_config()
+    config_existante = configs.get(nom) or dict(CONFIG_PROFIL_PAR_DEFAUT)
+    config_existante["sites"] = normaliser_sites(sites)
+    configs[nom] = config_existante
+    return sauvegarder_registre_profils_config(configs)
+
+
+def ajouter_site_config_profil(nom: str, site: str) -> bool:
+    """Ajoute un tag (ignore les doublons). False si le tag est invalide ou si l'ecriture echoue."""
+    site = normaliser_site(site)
+    if not site:
+        return False
+    return definir_sites_config_profil(nom, obtenir_config_profil(nom)["sites"] + [site])
+
+
+def retirer_site_config_profil(nom: str, site: str) -> bool:
+    """Retire un tag (sans effet s'il n'y est pas). False seulement si l'ecriture echoue."""
+    site = normaliser_site(site)
+    return definir_sites_config_profil(nom, [s for s in obtenir_config_profil(nom)["sites"] if s != site])
 
 
 def definir_tiktok_config_profil(nom: str, tiktok: bool) -> bool:
