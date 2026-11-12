@@ -1323,6 +1323,51 @@ def renumeroter_instance_id_notebook(numero: int) -> None:
         f.write("\n")
 
 
+# Binaires que le notebook sAutoniax telecharge/installe au demarrage : (variable du notebook, libelle).
+# Tout est coche par defaut ; decocher un binaire inutilise evite son telechargement sur Kaggle.
+BINAIRES_SAUTONIAX = (
+    ("INSTALLER_CAMOUFOX", "Camoufox"),
+    ("INSTALLER_CHROME", "Chrome"),
+    ("INSTALLER_CLOAKBROWSER", "CloakBrowser"),
+    ("INSTALLER_TESSERACT", "Tesseract (OCR)"),
+)
+
+
+def configurer_binaires_notebook(options: dict, chemin: Optional[Path] = None) -> None:
+    """Reecrit en place les lignes `INSTALLER_X = True/False` du notebook sAutoniax (celui que
+    l'utilisateur glisse vers Kaggle) selon `options` ({variable: bool}). Ne touche a rien d'autre.
+    FileNotFoundError si le notebook n'a jamais ete depose, ValueError si une variable est
+    introuvable (notebook trop ancien : redeposer la derniere version)."""
+    chemin = chemin or get_notebook_execution_path()
+    if not chemin.is_file():
+        raise FileNotFoundError(f"{chemin.name} n'existe pas encore -- dépose d'abord le notebook.")
+    with open(chemin, "r", encoding="utf-8") as f:
+        notebook = json.load(f)
+    manquantes = []
+    for variable, valeur in options.items():
+        motif = re.compile(r"^(\s*)" + re.escape(variable) + r"\s*=\s*(True|False)")
+        trouve = False
+        for cell in notebook.get("cells", []):
+            if cell.get("cell_type") != "code":
+                continue
+            source = cell.get("source", [])
+            for i, ligne in enumerate(source):
+                if motif.match(ligne):
+                    source[i] = motif.sub(lambda m: f"{m.group(1)}{variable} = {bool(valeur)}", ligne)
+                    trouve = True
+            if trouve:
+                break
+        if not trouve:
+            manquantes.append(variable)
+    if manquantes:
+        raise ValueError(
+            f"{', '.join(manquantes)} introuvable dans {chemin.name} -- dépose la dernière version du notebook."
+        )
+    with open(chemin, "w", encoding="utf-8") as f:
+        json.dump(notebook, f, ensure_ascii=False, indent=1)
+        f.write("\n")
+
+
 def get_notebook_serveurt_path() -> Path:
     """PATCH (migration Render -> Colab+tunnel Cloudflare) -- pendant EXACT
     de get_notebook_execution_path() juste au-dessus (même docstring
@@ -32729,7 +32774,11 @@ class NotebookManagerScreen(QWidget):
             return
 
         self.label_statut_drop.setText(f"{chemin_cible.name} mis à jour ({depot.nom_affiche}).")
+        self._apres_depot_notebook()
         event.acceptProposedAction()
+
+    def _apres_depot_notebook(self) -> None:
+        """Hook : appele apres l'ecriture d'un notebook depose (rien par defaut)."""
 
 
 
@@ -32826,6 +32875,51 @@ class SAutoniaxManagerScreen(NotebookManagerScreen):
         self.label_statut_numero_instance.setAlignment(Qt.AlignCenter)
         self.label_statut_numero_instance.setWordWrap(True)
         self.layout().addWidget(self.label_statut_numero_instance)
+
+        # Binaires a telecharger au demarrage du notebook : tout coche par defaut ; decocher ce qui
+        # n'est pas utilise (ex. tout sauf Camoufox) reecrit les INSTALLER_* du notebook sur disque.
+        label_binaires = QLabel("Binaires à télécharger au démarrage", self)
+        label_binaires.setObjectName("PlaceholderSubtitle")
+        label_binaires.setAlignment(Qt.AlignCenter)
+        self.layout().addWidget(label_binaires)
+        conteneur_binaires = QWidget(self)
+        ligne_binaires = QHBoxLayout(conteneur_binaires)
+        ligne_binaires.setContentsMargins(0, 0, 0, 0)
+        ligne_binaires.setSpacing(14)
+        self._cases_binaires = {}
+        for variable, libelle in BINAIRES_SAUTONIAX:
+            case = QCheckBox(libelle, conteneur_binaires)
+            case.setChecked(True)
+            case.setCursor(Qt.PointingHandCursor)
+            case.toggled.connect(self._sur_changement_binaires)
+            self._cases_binaires[variable] = case
+            ligne_binaires.addWidget(case)
+        self.layout().addWidget(conteneur_binaires, 0, Qt.AlignCenter)
+        self.label_statut_binaires = QLabel("", self)
+        self.label_statut_binaires.setObjectName("PlaceholderSubtitle")
+        self.label_statut_binaires.setAlignment(Qt.AlignCenter)
+        self.label_statut_binaires.setWordWrap(True)
+        self.layout().addWidget(self.label_statut_binaires)
+
+    def _options_binaires(self) -> dict:
+        return {variable: case.isChecked() for variable, case in self._cases_binaires.items()}
+
+    def _sur_changement_binaires(self, _etat=None) -> None:
+        self._appliquer_binaires()
+
+    def _appliquer_binaires(self) -> None:
+        options = self._options_binaires()
+        try:
+            configurer_binaires_notebook(options)
+        except (FileNotFoundError, ValueError, OSError, json.JSONDecodeError) as e:
+            self.label_statut_binaires.setText(f"Échec : {e}")
+            return
+        coches = [libelle for variable, libelle in BINAIRES_SAUTONIAX if options[variable]]
+        self.label_statut_binaires.setText("Binaires du notebook : " + (", ".join(coches) if coches else "aucun") + ".")
+
+    def _apres_depot_notebook(self) -> None:
+        """Un notebook vient d'etre depose : on lui applique les cases cochees actuelles."""
+        self._appliquer_binaires()
 
     def _sur_changement_numero_instance(self, numero: int) -> None:
         """Appelée au clic sur l'un des 31 boutons radio (0 à 30) -- réécrit
