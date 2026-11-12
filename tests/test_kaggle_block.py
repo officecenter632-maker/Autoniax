@@ -182,6 +182,8 @@ class FauxKaggle:
         self.appels.append("version")
         return Obj(error="")
     def dataset_list(self, user=None, mine=False, page=1, **kw):
+        if mine and user:
+            raise ValueError("Cannot specify both mine and a user")
         if page > 1:
             return []
         return [Obj(ref=r, title=d["title"], subtitle=d["subtitle"], total_bytes=sum(d["fichiers"].values()),

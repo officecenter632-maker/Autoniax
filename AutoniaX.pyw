@@ -30267,7 +30267,7 @@ class GestionnaireKaggle:
         vus: set = set()
         page = 1
         while page <= 50:
-            lot = api.dataset_list(user=KAGGLE_USERNAME, mine=True, page=page) or []
+            lot = api.dataset_list(mine=True, page=page)  # mine et user sont exclusifs cote API or []
             nouveaux = 0
             for d in lot:
                 ref = str(getattr(d, "ref", "") or "")
