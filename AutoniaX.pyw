@@ -85094,21 +85094,20 @@ DRIVE_CLE_URL_TUNNEL = DRIVE_PREFIXE_SERVEURT + "url_tunnel.txt"
 DRIVE_PREFIXE_APP = "App/"
 DRIVE_CLE_AUTONIAX = DRIVE_PREFIXE_APP + "AutoniaX.py"  # ancienne cle (non compressee), lue en repli par le notebook sAutoniax
 DRIVE_CLE_AUTONIAX_XZ = DRIVE_PREFIXE_APP + "AutoniaX.pyw.xz"  # cle actuelle : fichier compresse avant envoi
+PRESET_XZ_MAJ = 3  # 0 (le plus rapide) a 9 (le plus lent) : 3 = bon compromis vitesse / taille
 
 
 def compresser_xz_maximal(donnees: bytes) -> bytes:
-    """Compresse en XZ (LZMA2, preset 9 | EXTREME, controle CRC64) et VERIFIE la relecture
-    avant de rendre le resultat. dict_size : 128 Mo au plus, ramene a la puissance de 2 qui
-    couvre le fichier (meme taux, bien moins de memoire pour un fichier de quelques Mo)."""
+    """Compresse en XZ (LZMA2, preset rapide, controle CRC64) et VERIFIE la relecture avant de
+    rendre le resultat. Preset 3 : ~2,5x plus rapide que le preset 9 | EXTREME pour ~18 % de
+    taille en plus (le format XZ reste lisible tel quel par le notebook sAutoniax)."""
     import lzma
-    dict_size = 1 << 20
-    while dict_size < len(donnees) and dict_size < 128 * 1024 * 1024:
-        dict_size <<= 1
-    filtres = [{"id": lzma.FILTER_LZMA2, "preset": 9 | lzma.PRESET_EXTREME, "dict_size": dict_size}]
-    compresse = lzma.compress(donnees, format=lzma.FORMAT_XZ, check=lzma.CHECK_CRC64, filters=filtres)
+    compresse = lzma.compress(donnees, format=lzma.FORMAT_XZ, check=lzma.CHECK_CRC64, preset=PRESET_XZ_MAJ)
     if lzma.decompress(compresse) != donnees:
         raise RuntimeError("Verification de la compression XZ echouee (relecture differente de l'original).")
     return compresse
+
+
 DRIVE_CLE_MOUSE_DATA = DRIVE_PREFIXE_APP + "mouseData.sqlite3"
 DRIVE_CLE_PROJECT_JSON = DRIVE_PREFIXE_APP + "project.json"
 DRIVE_CLE_SERVICE_API_ZIP = DRIVE_PREFIXE_APP + "service_api.zip"

@@ -7,7 +7,9 @@ RACINE = Path(__file__).resolve().parent.parent
 src = (RACINE / "AutoniaX.pyw").read_text(encoding="utf-8")
 i = src.index("def compresser_xz_maximal(")
 fn = src[i: src.index("    return compresse\n", i) + len("    return compresse\n")]
-ns = {}
+import re, time
+preset = int(re.search(r"^PRESET_XZ_MAJ = (\d+)", src, re.M).group(1))
+ns = {"PRESET_XZ_MAJ": preset}
 exec(fn, ns)
 nb = 0
 def ok(c, m):
@@ -26,6 +28,9 @@ os.unlink(f.name)
 ok(r.returncode == 0, "xz -t valide l'archive")
 ok(xz[:6] == b"\xfd7zXZ\x00" and xz[6:8] == b"\x00\x04", "format XZ, controle CRC64")
 ok(lzma.decompress(ns["compresser_xz_maximal"](b"")) == b"", "fichier vide")
+ok(preset == 3, "preset rapide (3) retenu")
+t0 = time.time(); ns["compresser_xz_maximal"](data); duree = time.time() - t0
+ok(duree < 60, f"compression rapide ({duree:.1f}s)")
 ok('DRIVE_CLE_AUTONIAX_XZ = DRIVE_PREFIXE_APP + "AutoniaX.pyw.xz"' in src, "cle .xz declaree")
 ok('cle_drive = DRIVE_CLE_AUTONIAX_XZ' in src and "compresser_xz_maximal, contenu" in src, "envoi autoniax : cle .xz + compression")
 
