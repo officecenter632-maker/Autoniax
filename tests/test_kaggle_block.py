@@ -428,4 +428,48 @@ f, ev, h = faire_flux([])
 f.demarrer()
 ok(ev["fin"] == 1, "flux : aucun profil -> termine")
 
+# ---- phase 4 : flux B ------------------------------------------------------
+with tempfile.TemporaryDirectory() as tmp:
+    api4 = FauxKaggle(); g4 = faire_gestionnaire(api4)
+    dp = Path(tmp) / "sp"; (dp / "Alice").mkdir(parents=True); (dp / "Alice" / "f.txt").write_text("1")
+    zt = Path(tmp) / "z"; zt.mkdir(); zp = faux_zipper_factory(zt)
+    ok(ns["traiter_envoi_kaggle"](g4, str(dp), {"nom_local": "Alice", "nom_archive": "alice@x.com"}, False, set(), zipper=zp)[0], "prepa : dataset sur le faux Kaggle")
+    api4.datasets["mikereichlin/ax-alice-x-com"]["contenu_zip"] = str(zp(str(dp / "Alice")))
+    td = ns["traiter_telechargement_kaggle"]
+    cible = Path(tmp) / "cible"
+    pr = {"slug": "ax-alice-x-com", "nom_archive": "alice@x.com", "nom_local": "alice@x.com"}
+    r = td(g4, str(cible), pr, {"alice@x.com"})
+    ok(r[0] is False and "en cours d'execution" in r[1] and not cible.exists(), "telechargement refuse si le profil tourne")
+    r = td(g4, str(cible), pr, set())
+    ok(r[0] and (cible / "alice@x.com" / "f.txt").read_text() == "1", "telechargement + extraction")
+    ok(ns["lire_origines_kaggle"](str(cible)) == {"alice@x.com": "alice@x.com"}, "origine Kaggle notee")
+    for mauvais in ("../x", "a/b", "_kaggle_origine.json", ".."):
+        ok(td(g4, str(cible), dict(pr, nom_local=mauvais), set())[0] is False, f"nom local refuse {mauvais!r}")
+    ok(td(g4, str(cible), {"slug": "", "nom_archive": ""}, set())[0] is False, "ordre incomplet")
+    ok(td(g4, str(cible), dict(pr, slug="ax-inconnu"), set())[0] is False, "dataset inconnu : erreur sans plantage")
+
+def faire_flux_b(rep, **kw):
+    ev = {"envoyer": [], "notif": [], "fin": 0}
+    h = Horloge()
+    f = ns["FluxTelechargementKaggle"](rep, envoyer=lambda i, p: ev["envoyer"].append((i, p["nom_archive"])),
+        notifier=lambda i, n, o, m: ev["notif"].append((i, n, o)),
+        terminer=lambda: ev.__setitem__("fin", ev["fin"] + 1), horloge=h, **kw)
+    return f, ev, h
+def Q(*noms): return [{"slug": "ax-" + n, "nom_archive": n} for n in noms]
+rep = ns["repartir_equitablement"]([{"slug": "ax-%d" % i, "nom_archive": str(i)} for i in range(10)], ["s1", "s2", "s3"])
+ok(sorted(len(v) for v in rep.values()) == [3, 3, 4], "repartition 10 -> 4,3,3")
+f, ev, h = faire_flux_b([{"id_executant": "s1", "profils": Q("a", "b")}, {"id_executant": "s2", "profils": Q("c")}])
+f.demarrer()
+ok(ev["envoyer"] == [("s1", "a"), ("s2", "c")], "flux B : 1 envoi a la fois par sAutoniax")
+f.sur_resultat("s1", "a", False, "refus"); f.sur_resultat("s2", "c", True, "ok")
+ok(("s1", "b") in ev["envoyer"] and ev["fin"] == 0, "flux B : une erreur n'arrete pas les autres")
+f.sur_executants_connectes({"s2"})
+ok(ev["fin"] == 1 and ("s1", "b", False) in ev["notif"], "flux B : deconnexion -> erreur, fin")
+f, ev, h = faire_flux_b([{"id_executant": "s%d" % i, "profils": Q("p%d" % i)} for i in range(5)])
+f.demarrer(); ok(len(ev["envoyer"]) == 3, "flux B : 3 simultanes au plus")
+f, ev, h = faire_flux_b([{"id_executant": "s1", "profils": Q("a")}])
+f.demarrer(); h.t += ns["DELAI_INACTIVITE_ENVOI_S"] + 1; f.verifier_delais()
+ok(ev["fin"] == 1 and ev["notif"][0][2] is False, "flux B : inactivite -> erreur")
+f, ev, h = faire_flux_b([]); f.demarrer(); ok(ev["fin"] == 1, "flux B : vide -> termine")
+
 print(f"OK -- {nb} verifications passees")

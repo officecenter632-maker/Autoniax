@@ -104,7 +104,7 @@ Classe `ProfilsKaggleScreen`, ajoutée dans `ProfilsScreen` après « Profils Lo
 5. Le disque de session est vidé par le notebook à chaque démarrage (section 3) : ces profils ne survivent pas à un redémarrage de la session. C'est le comportement actuel, il n'est pas modifié.
 
 ## 9. Protocole serveurT
-**Constat (phase 3) :** le relais n'est pas générique, chaque type est déclaré. `serveur.py` porte deux branches :
+**Constat (phases 3 et 4) :** le relais n'est pas générique, chaque type est déclaré. `serveur.py` porte deux branches :
 pilote → sAutoniax (`kaggle_lister_profils`, `kaggle_envoyer_profils`, `kaggle_telecharger_profils`, accusé `<type>_ack`, `id_pilote` ajouté) et sAutoniax → pilote (`kaggle_lister_profils_resultat`, `kaggle_progression`, `kaggle_resultat`, `id_executant` ajouté).
 Le pilote envoie **un profil par ordre** d'envoi et borne lui-même à `MAX_TRANSFERTS_SIMULTANES`. Le flux A commence par un listage frais (`actif` par profil), arrête les profils actifs, puis envoie ; un profil dont l'arrêt n'est pas confirmé n'est pas archivé.
 

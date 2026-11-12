@@ -165,4 +165,22 @@ C.kaggle_ack_recu.emit("kaggle_lister_profils", "s1", op2, False, "serveurT hors
 C.kaggle_ack_recu.emit("kaggle_lister_profils", "s2", op2, False, "serveurT hors ligne")
 ok(E._operation_id is None, "echec de transmission : l'ecran est libere, pas de blocage")
 
+# --- flux B via le controleur
+C.ordres.clear()
+E.definir_datasets([{"ref": "u/ax-x", "slug": "ax-x", "titre": "AX x@x.com", "nom_archive": "x@x.com", "taille_octets": 1,
+                     "cree_le": None, "maj_le": "2026-02-01 10:00:00", "prive": True}])
+E.table_datasets.topLevelItem(0).setCheckState(0, Qt.Checked)
+E.liste_cibles.item(0).setCheckState(Qt.Checked)
+E._rafraichir_boutons()
+E._sur_clic_telecharger()
+opb = E._operation_id
+ok(opb is not None, "telechargement demarre")
+dl = [o for o in C.ordres if o[0] == "kaggle_telecharger_profils"]
+ok(len(dl) == 1 and dl[0][3]["profils"][0]["slug"] == "ax-x", "ordre de telechargement envoye")
+C.kaggle_progression_recue.emit(opb, dl[0][1], "x@x.com", "Extraction", 60)
+C.kaggle_resultat_recu.emit(opb, dl[0][1], "x@x.com", True, "ok")
+ok(E._operation_id is None, "telechargement termine, ecran libere")
+jr = [E.journal.item(r).text() for r in range(E.journal.count())]
+ok(any("x@x.com : Extraction 60 %" in l for l in jr) and any("x@x.com : OK" in l for l in jr), "progression et resultat de telechargement")
+
 print(f"OK -- {nb} verifications du controleur passees")
