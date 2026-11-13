@@ -31905,6 +31905,9 @@ class ProfilsKaggleScreen(QWidget):
         self._deja_affiche = False
         self._maj_en_cours = False
         self._plan_courant: list = []
+        self._corr_effective: dict = {}
+        self._sites_effectifs: dict = {}
+        self._noms_perimes: set = set()
         self._supprimer_operation = False
         self._lignes_courantes_cache: list = []
         self._arbre_perime = False
@@ -32182,27 +32185,15 @@ class ProfilsKaggleScreen(QWidget):
     def _sur_clic_copier_ia(self):
         # PATCH (demande utilisateur) : seuls les profils COCHES vont dans le prompt (les decoches n'y figurent jamais).
         noms = sorted({nom for (_i, nom), it in self._items.items() if it.checkState(self.COL_PROFIL) == Qt.Checked})
-        correspondance = self._correspondance()
         if not noms:
             self.ajouter_journal("Rien à copier : aucun profil coché dans « Envoyer vers Kaggle ».")
             return
-        # Profil NEUF (pas venu de Kaggle) dont l'email enregistre correspond deja a une archive presente sur Kaggle :
-        # c'est l'email d'un AUTRE compte (meme nom de profil reutilise) -> le prompt le propose vide.
-        slugs_kaggle = {d.get("slug") for d in self._datasets}
-        sites_enreg = dict(getattr(self._reglages_courants(), "kaggle_correspondance_sites", None) or {})
-        plan_par_nom = {l["nom_local"]: p for l, p in zip(self._lignes_courantes_cache, self._plan_courant)}
-        neufs_reinitialises = []
-        for (_i, nom), it in self._items.items():
-            plan = plan_par_nom.get(nom)
-            if (nom in noms and not it.data(self.COL_GARDER, Qt.UserRole) and plan and plan.get("slug") in slugs_kaggle
-                    and nom in correspondance and nom not in neufs_reinitialises):
-                neufs_reinitialises.append(nom)
-        for nom in neufs_reinitialises:
-            correspondance.pop(nom, None)
-            sites_enreg.pop(nom, None)
-        if neufs_reinitialises:
-            self.ajouter_journal("Email deja utilise par une archive Kaggle -> propose vide pour : "
-                                 + ", ".join(sorted(neufs_reinitialises)))
+        if self._operation_id is None:
+            self._recalculer_noms()
+        correspondance, sites_enreg, perimes = self._corr_effective, self._sites_effectifs, self._noms_perimes
+        if perimes & set(noms):
+            self.ajouter_journal("Email enregistre deja utilise par une archive existante -> propose vide pour : "
+                                 + ", ".join(sorted(perimes & set(noms))))
         texte = construire_texte_correspondance_ia(
             noms, correspondance, sites_enreg)
         QGuiApplication.clipboard().setText(texte)
@@ -32373,14 +32364,44 @@ class ProfilsKaggleScreen(QWidget):
         if colonne in (self.COL_PROFIL, self.COL_GARDER):
             self._recalculer_noms()
 
+    def _correspondance_effective(self, lignes: list) -> tuple:
+        """(correspondance, sites, noms_perimes) REELLEMENT utilises (affichage, prompt IA, envoi).
+        Un profil NEUF (pas venu de Kaggle, 'Garder le nom' decoche) dont l'email enregistre mene a une archive qui
+        existe deja (sur Kaggle, ou profil restaure present localement) est un AUTRE compte qui reutilise le meme nom
+        de profil : l'entree enregistree est ignoree (a refaire), jamais appliquee a tort."""
+        corr = self._correspondance()
+        sites = dict(getattr(self._reglages_courants(), "kaggle_correspondance_sites", None) or {})
+        slugs_pris = {d.get("slug") for d in self._datasets}
+        for (_i, _n), it in self._items.items():
+            origine = it.data(self.COL_GARDER, Qt.UserRole)
+            if origine:
+                slugs_pris.add(slug_depuis_nom(str(origine)))
+            elif it.checkState(self.COL_GARDER) == Qt.Checked:
+                slugs_pris.add(slug_depuis_nom(_n))
+        slugs_pris.discard("")
+        origines = {nom: (self._items[(i, nom)].data(self.COL_GARDER, Qt.UserRole) if (i, nom) in self._items else "")
+                    for i, nom in {(l["id_executant"], l["nom_local"]) for l in lignes}}
+        perimes = set()
+        for l in lignes:
+            nom = l["nom_local"]
+            if l["garder_nom"] or origines.get(nom) or nom not in corr:
+                continue
+            if slug_depuis_nom(str(corr[nom] or "").strip()) in slugs_pris:
+                perimes.add(nom)
+        if perimes:
+            corr = {k: v for k, v in corr.items() if k not in perimes}
+            sites = {k: v for k, v in sites.items() if k not in perimes}
+        return corr, sites, perimes
+
     def _recalculer_noms(self):
         """Resout les noms d'archive et colore les lignes (rouge = erreur, gris = ignoree)."""
         if self._operation_id is not None:
             self._rafraichir_boutons()
             return
         lignes = self._lignes()
-        sites_corr = dict(getattr(self._reglages_courants(), "kaggle_correspondance_sites", None) or {})
-        self._plan_courant = planifier_envoi(lignes, self._correspondance())
+        corr_eff, sites_corr, perimes = self._correspondance_effective(lignes)
+        self._corr_effective, self._sites_effectifs, self._noms_perimes = corr_eff, sites_corr, perimes
+        self._plan_courant = planifier_envoi(lignes, corr_eff)
         self._lignes_courantes_cache = lignes
         self._maj_en_cours = True
         try:
@@ -32394,7 +32415,11 @@ class ProfilsKaggleScreen(QWidget):
                     couleur = Mocha.overlay1
                 elif plan["erreur"]:
                     etat, archive, infobulle = "erreur de nommage", plan["nom_archive"], plan["erreur"]
-                    couleur = Mocha.red
+                    if ligne["nom_local"] in self._noms_perimes:
+                        etat, infobulle = "correspondance a refaire", (
+                            "L'email enregistre pour ce nom est deja utilise par une archive existante (autre compte) : "
+                            "il est ignore. Utilise « Copier pour IA » puis « Importer la correspondance ».")
+                    couleur = Mocha.yellow
                 elif plan["ignore"]:
                     etat, archive, infobulle = "ignore (copie plus ancienne)", "", plan["avertissement"] or ""
                     couleur = Mocha.overlay1
@@ -32457,8 +32482,7 @@ class ProfilsKaggleScreen(QWidget):
         if QMessageBox.question(self, "Arreter + Archiver + Envoyer", detail + "\n\nConfirmer ?",
                                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
             return
-        corr = self._correspondance()
-        sites_corr = dict(getattr(self._reglages_courants(), "kaggle_correspondance_sites", None) or {})
+        corr, sites_corr = dict(self._corr_effective), dict(self._sites_effectifs)
         profils = []
         for ligne, p in zip(lignes, plan):
             if not p["partira"]:
