@@ -127017,9 +127017,21 @@ async def action_go_forward(page) -> bool:
     return True
 
 
+# VERROU (demande utilisateur : "il faut éviter absolument d'effacer les données du navigateur") -- tant que cette constante
+# vaut True, AUCUN code de l'application (reset_interface(vider_donnees=True), vider_donnees_navigation(), clearBrowsingData,
+# nodriver comme Camoufox/CloakBrowser) n'efface cookies, localStorage, sessionStorage, IndexedDB, caches ou permissions :
+# l'appel est ignoré et journalisé. Mettre False uniquement pour réactiver volontairement le vidage.
+PROTEGER_DONNEES_NAVIGATEUR = True
+
+
 # AJOUT -- clearBrowsingData côté nodriver (Chrome/Vivaldi piloté par CDP) : cache, cookies, tous les types de stockage de toutes les origines.
 async def action_clear_browsing_data(page) -> dict:
     rapport = {"ok": False, "cdp": [], "erreurs": []}
+    if PROTEGER_DONNEES_NAVIGATEUR:
+        log.warning("clearBrowsingData IGNORE : PROTEGER_DONNEES_NAVIGATEUR est actif (aucune donnee du navigateur effacee).")
+        rapport["erreurs"].append("vidage ignore : donnees du navigateur protegees")
+        rapport["protege"] = True
+        return rapport
     etapes = [("cache", lambda: cdp.network.clear_browser_cache()), ("cookies", lambda: cdp.network.clear_browser_cookies()),
               ("stockage", lambda: cdp.storage.clear_data_for_origin(origin="*", storage_types="all"))]
     for nom, fabrique in etapes:
@@ -131701,6 +131713,11 @@ async def action_camoufox_clear_browsing_data(context) -> dict:
     """clearBrowsingData -- retourne un rapport {"ok": bool, "cookies": bool, "permissions": bool, "cdp": [...], "pages_nettoyees": int, "erreurs": [...]}.
     ok=True si AU MOINS les cookies ont été vidés sans erreur bloquante."""
     rapport = {"ok": False, "cookies": False, "permissions": False, "cdp": [], "pages_nettoyees": 0, "erreurs": []}
+    if PROTEGER_DONNEES_NAVIGATEUR:
+        log.warning("[camoufox] clearBrowsingData IGNORE : PROTEGER_DONNEES_NAVIGATEUR est actif (aucune donnee du navigateur effacee).")
+        rapport["erreurs"].append("vidage ignore : donnees du navigateur protegees")
+        rapport["protege"] = True
+        return rapport
     pages = [p for p in list(context.pages) if not p.is_closed()]
     origines = set()
     # 1) stockage de chaque onglet (JS) : fonctionne aussi sur Firefox/Camoufox
