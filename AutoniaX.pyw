@@ -31905,7 +31905,6 @@ class ProfilsKaggleScreen(QWidget):
         self._deja_affiche = False
         self._maj_en_cours = False
         self._plan_courant: list = []
-        self._a_purger: set = set()              # {(id_executant, nom_local)} envoyes avec suppression : correspondance a effacer
         self._supprimer_operation = False
         self._lignes_courantes_cache: list = []
         self._arbre_perime = False
@@ -32187,8 +32186,25 @@ class ProfilsKaggleScreen(QWidget):
         if not noms:
             self.ajouter_journal("Rien à copier : aucun profil coché dans « Envoyer vers Kaggle ».")
             return
+        # Profil NEUF (pas venu de Kaggle) dont l'email enregistre correspond deja a une archive presente sur Kaggle :
+        # c'est l'email d'un AUTRE compte (meme nom de profil reutilise) -> le prompt le propose vide.
+        slugs_kaggle = {d.get("slug") for d in self._datasets}
+        sites_enreg = dict(getattr(self._reglages_courants(), "kaggle_correspondance_sites", None) or {})
+        plan_par_nom = {l["nom_local"]: p for l, p in zip(self._lignes_courantes_cache, self._plan_courant)}
+        neufs_reinitialises = []
+        for (_i, nom), it in self._items.items():
+            plan = plan_par_nom.get(nom)
+            if (nom in noms and not it.data(self.COL_GARDER, Qt.UserRole) and plan and plan.get("slug") in slugs_kaggle
+                    and nom in correspondance and nom not in neufs_reinitialises):
+                neufs_reinitialises.append(nom)
+        for nom in neufs_reinitialises:
+            correspondance.pop(nom, None)
+            sites_enreg.pop(nom, None)
+        if neufs_reinitialises:
+            self.ajouter_journal("Email deja utilise par une archive Kaggle -> propose vide pour : "
+                                 + ", ".join(sorted(neufs_reinitialises)))
         texte = construire_texte_correspondance_ia(
-            noms, correspondance, getattr(self._reglages_courants(), "kaggle_correspondance_sites", None))
+            noms, correspondance, sites_enreg)
         QGuiApplication.clipboard().setText(texte)
         nb_entrees = len(json.loads(texte[len(PROMPT_CORRESPONDANCE_IA):]))
         self.ajouter_journal(f"Prompt + JSON copiés dans le presse-papiers ({nb_entrees} entrée(s)).")
@@ -32242,37 +32258,30 @@ class ProfilsKaggleScreen(QWidget):
         if id_executant not in self._sautoniax:
             return
         self._profils_par_sautoniax[id_executant] = list(profils or [])
-        self._purger_correspondances_obsoletes(id_executant, profils or [])
         self._reconstruire_arbre()
         self.ajouter_journal(f"{self._sautoniax.get(id_executant, id_executant)} : {len(profils or [])} profil(s).")
 
-    def _purger_correspondances_obsoletes(self, id_executant: str, profils: list):
-        """PATCH (demande utilisateur) : un profil envoye puis supprime du sAutoniax ne laisse plus sa correspondance
-        (email / sites) derriere lui : un profil neuf du meme nom repart de zero, sans heriter du nommage du precedent."""
-        if self._operation_id is not None or not self._a_purger:
-            return
-        presents = {str(p.get("nom", "")) for p in profils}
-        concernes = {(i, n) for (i, n) in self._a_purger if i == id_executant}
-        if not concernes:
-            return
-        self._a_purger -= concernes
+    def _purger_correspondance(self, noms: set):
+        """Retire (et enregistre) l'email / les sites de profils deja envoyes puis supprimes du sAutoniax :
+        un profil neuf du meme nom (ex. iaX1) repart de zero, il n'herite jamais de l'email d'un autre compte."""
         r = self._reglages_courants()
-        noms_purges = []
-        for (_i, n) in concernes:
-            if n in presents:
-                continue  # le dossier existe encore (suppression non faite) : on garde sa correspondance
-            retire = r.kaggle_correspondance_noms.pop(n, None) is not None
-            retire = (getattr(r, "kaggle_correspondance_sites", {}).pop(n, None) is not None) or retire
-            if retire:
-                noms_purges.append(n)
-        if noms_purges:
-            try:
-                r.save()
-            except Exception as e:
-                self.ajouter_journal(f"Correspondance : enregistrement impossible ({e}).")
-                return
-            self.ajouter_journal("Correspondance retiree (profil envoye puis supprime) : " + ", ".join(sorted(noms_purges)))
-            self._rafraichir_resume_correspondance()
+        sites = getattr(r, "kaggle_correspondance_sites", None)
+        retires = []
+        for n in noms:
+            a_retire = r.kaggle_correspondance_noms.pop(n, None) is not None
+            if isinstance(sites, dict):
+                a_retire = (sites.pop(n, None) is not None) or a_retire
+            if a_retire:
+                retires.append(n)
+        if not retires:
+            return
+        try:
+            r.save()
+        except Exception as e:
+            self.ajouter_journal(f"Correspondance : enregistrement impossible ({e}).")
+            return
+        self.ajouter_journal("Correspondance retiree (profil envoye puis supprime) : " + ", ".join(sorted(retires)))
+        self._rafraichir_resume_correspondance()
 
     def definir_activite_kaggle(self, en_cours: bool, texte: str = ""):
         """Indicateur visible d'une requete Kaggle en cours : barre indeterminee + libelle + ligne de journal."""
@@ -32339,6 +32348,7 @@ class ProfilsKaggleScreen(QWidget):
                     it.setCheckState(self.COL_PROFIL, Qt.Checked if coche else Qt.Unchecked)
                     it.setCheckState(self.COL_GARDER, Qt.Checked if garder else Qt.Unchecked)
                     it.setData(self.COL_PROFIL, Qt.UserRole, float(p.get("modifie_ts") or 0))
+                    it.setData(self.COL_GARDER, Qt.UserRole, origine or "")
                     if origine:
                         it.setToolTip(self.COL_GARDER, f"Profil venu de Kaggle (archive : {origine}).")
                     parent.addChild(it)
@@ -32495,7 +32505,7 @@ class ProfilsKaggleScreen(QWidget):
             self._maj_en_cours = True
             it.setText(self.COL_ETAT, "envoye" if ok else "ERREUR")
             if ok and self._supprimer_operation:
-                self._a_purger.add((id_executant, nom_local))
+                self._purger_correspondance({nom_local})
             if ok:
                 it.setText(self.COL_PROG, "100 %")
             for col in range(8):
