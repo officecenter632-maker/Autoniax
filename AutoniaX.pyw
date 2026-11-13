@@ -31905,6 +31905,8 @@ class ProfilsKaggleScreen(QWidget):
         self._deja_affiche = False
         self._maj_en_cours = False
         self._plan_courant: list = []
+        self._a_purger: set = set()              # {(id_executant, nom_local)} envoyes avec suppression : correspondance a effacer
+        self._supprimer_operation = False
         self._lignes_courantes_cache: list = []
         self._arbre_perime = False
 
@@ -32179,10 +32181,11 @@ class ProfilsKaggleScreen(QWidget):
             QMessageBox.information(self, "Correspondance Kaggle", "Importee avec avertissement(s) :\n\n" + "\n".join(avertissements[:15]))
 
     def _sur_clic_copier_ia(self):
-        noms = [str(p.get("nom", "")) for profils in self._profils_par_sautoniax.values() for p in profils]
+        # PATCH (demande utilisateur) : seuls les profils COCHES vont dans le prompt (les decoches n'y figurent jamais).
+        noms = sorted({nom for (_i, nom), it in self._items.items() if it.checkState(self.COL_PROFIL) == Qt.Checked})
         correspondance = self._correspondance()
-        if not noms and not correspondance:
-            self.ajouter_journal("Rien à copier : aucun profil chargé et aucune correspondance enregistrée.")
+        if not noms:
+            self.ajouter_journal("Rien à copier : aucun profil coché dans « Envoyer vers Kaggle ».")
             return
         texte = construire_texte_correspondance_ia(
             noms, correspondance, getattr(self._reglages_courants(), "kaggle_correspondance_sites", None))
@@ -32239,8 +32242,37 @@ class ProfilsKaggleScreen(QWidget):
         if id_executant not in self._sautoniax:
             return
         self._profils_par_sautoniax[id_executant] = list(profils or [])
+        self._purger_correspondances_obsoletes(id_executant, profils or [])
         self._reconstruire_arbre()
         self.ajouter_journal(f"{self._sautoniax.get(id_executant, id_executant)} : {len(profils or [])} profil(s).")
+
+    def _purger_correspondances_obsoletes(self, id_executant: str, profils: list):
+        """PATCH (demande utilisateur) : un profil envoye puis supprime du sAutoniax ne laisse plus sa correspondance
+        (email / sites) derriere lui : un profil neuf du meme nom repart de zero, sans heriter du nommage du precedent."""
+        if self._operation_id is not None or not self._a_purger:
+            return
+        presents = {str(p.get("nom", "")) for p in profils}
+        concernes = {(i, n) for (i, n) in self._a_purger if i == id_executant}
+        if not concernes:
+            return
+        self._a_purger -= concernes
+        r = self._reglages_courants()
+        noms_purges = []
+        for (_i, n) in concernes:
+            if n in presents:
+                continue  # le dossier existe encore (suppression non faite) : on garde sa correspondance
+            retire = r.kaggle_correspondance_noms.pop(n, None) is not None
+            retire = (getattr(r, "kaggle_correspondance_sites", {}).pop(n, None) is not None) or retire
+            if retire:
+                noms_purges.append(n)
+        if noms_purges:
+            try:
+                r.save()
+            except Exception as e:
+                self.ajouter_journal(f"Correspondance : enregistrement impossible ({e}).")
+                return
+            self.ajouter_journal("Correspondance retiree (profil envoye puis supprime) : " + ", ".join(sorted(noms_purges)))
+            self._rafraichir_resume_correspondance()
 
     def definir_activite_kaggle(self, en_cours: bool, texte: str = ""):
         """Indicateur visible d'une requete Kaggle en cours : barre indeterminee + libelle + ligne de journal."""
@@ -32428,6 +32460,7 @@ class ProfilsKaggleScreen(QWidget):
                 entree["sites"] = list(sites_corr[ligne["nom_local"]])
             profils.append(entree)
         self._operation_id = uuid.uuid4().hex[:12]
+        self._supprimer_operation = bool(supprimer)
         self._marquer_lignes_en_attente({(p["id_executant"], p["nom_local"]) for p in profils})
         self._rafraichir_boutons()
         self.ajouter_journal(f"Envoi : {len(profils)} profil(s) (operation {self._operation_id}).")
@@ -32461,6 +32494,8 @@ class ProfilsKaggleScreen(QWidget):
         if it is not None:
             self._maj_en_cours = True
             it.setText(self.COL_ETAT, "envoye" if ok else "ERREUR")
+            if ok and self._supprimer_operation:
+                self._a_purger.add((id_executant, nom_local))
             if ok:
                 it.setText(self.COL_PROG, "100 %")
             for col in range(8):
