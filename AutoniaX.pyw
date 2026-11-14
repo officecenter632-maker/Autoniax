@@ -30333,6 +30333,10 @@ _DIAG_KAGGLE: dict = {"total_datasets_vus": None}  # diagnostic du dernier listi
 MAX_TRANSFERTS_SIMULTANES = 10  # global, tous sAutoniax confondus
 NB_TENTATIVES = 3
 DELAIS_TENTATIVES_S = (5, 15, 45)
+# CORRECTIF 429 (log du 14/11/2026 : 7 envois en parallele -> "429 Too Many Requests" sur GetDatasetStatus pendant
+# l'attente de traitement, profil marque ERREUR alors que le dataset etait deja cree) : pauses (secondes, + un
+# peu d'aleatoire pour desynchroniser les envois paralleles) puis reprise automatique, sans compter comme echec.
+ATTENTES_429_S = (10, 20, 40, 60, 60, 60, 60, 60)
 DELAI_PRET_KAGGLE_S = 600
 QUOTA_PRIVE_GO = 100  # affichage seulement
 KAGGLE_SLUG_MIN = 6
@@ -31005,11 +31009,34 @@ class GestionnaireKaggle:
         return f"{KAGGLE_USERNAME}/{slug}"
 
     # -- utilitaires -------------------------------------------------------
+    @staticmethod
+    def _est_429(e: Exception) -> bool:
+        code = getattr(getattr(e, "response", None), "status_code", None)
+        txt = str(e)
+        return code == 429 or "429 Client Error" in txt or "Too Many Requests" in txt or "RESOURCE_EXHAUSTED" in txt
+
+    def _avec_429(self, libelle: str, fonction):
+        """Appelle `fonction` ; sur une 429 (trop de requetes Kaggle) fait une pause puis reessaie
+        (ATTENTES_429_S), au lieu d'echouer. Toute autre erreur est relancee telle quelle."""
+        essai = 0
+        while True:
+            try:
+                return fonction()
+            except ErreurCorrespondance:
+                raise
+            except Exception as e:
+                if not self._est_429(e) or essai >= len(ATTENTES_429_S):
+                    raise
+                attente = ATTENTES_429_S[essai] + random.uniform(0, 3)
+                essai += 1
+                self._j(f"429 (trop de requetes) sur '{libelle}' : pause {int(attente)} s puis essai {essai + 1}")
+                self._pause(attente)
+
     def _avec_tentatives(self, libelle: str, fonction):
         derniere = None
         for n in range(1, NB_TENTATIVES + 1):
             try:
-                return fonction()
+                return self._avec_429(libelle, fonction)
             except ErreurCorrespondance:
                 raise
             except Exception as e:
@@ -31045,7 +31072,7 @@ class GestionnaireKaggle:
         _DIAG_KAGGLE["total_datasets_vus"] = None
         page = 1
         while page <= 50:
-            lot = api.dataset_list(mine=True, page=page) or []  # mine et user sont exclusifs cote API
+            lot = self._avec_429("Liste des datasets", lambda p=page: api.dataset_list(mine=True, page=p)) or []  # mine et user sont exclusifs cote API
             nouveaux = 0
             for d in lot:
                 ref = str(getattr(d, "ref", "") or "")
@@ -31367,7 +31394,7 @@ class GestionnaireKaggle:
         est 'ready' quand sa liste de fichiers (ou ta liste de datasets) le montre, sinon 'queued'."""
         api = self.authentifier()
         try:
-            return str(api.dataset_status(ref))
+            return str(self._avec_429(f"Statut de {ref}", lambda: api.dataset_status(ref)))
         except Exception as e:
             if not self._est_403(e):
                 raise
