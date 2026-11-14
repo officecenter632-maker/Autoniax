@@ -30330,7 +30330,10 @@ KAGGLE_API_TOKEN = "KGAT_af3ac4a714d020b6a4a8034cf1bf8792"  # en dur (decision e
 KAGGLE_PAQUET_PIP = "kaggle==2.2.5"  # minimum 1.8.0 ; meme epinglage dans le notebook sAutoniax
 PREFIXE_DATASET = "ax-"
 _DIAG_KAGGLE: dict = {"total_datasets_vus": None}  # diagnostic du dernier listing (tous les datasets du compte)
-MAX_TRANSFERTS_SIMULTANES = 10  # global, tous sAutoniax confondus
+MAX_TRANSFERTS_SIMULTANES = 10  # global, tous sAutoniax confondus (plafond du reglage de l'ecran)
+NB_ENVOIS_SIMULTANES_DEFAUT = 3  # valeur par defaut du widget "Envois simultanes" (ecran Profils Kaggle)
+DELAI_ENTRE_GROUPES_DEFAUT_S = 30  # valeur par defaut du widget "Delai entre groupes" (secondes)
+DELAI_ENTRE_GROUPES_MAX_S = 3600
 NB_TENTATIVES = 3
 DELAIS_TENTATIVES_S = (5, 15, 45)
 # CORRECTIF 429 (log du 14/11/2026 : 7 envois en parallele -> "429 Too Many Requests" sur GetDatasetStatus pendant
@@ -32117,7 +32120,7 @@ DELAI_INACTIVITE_ENVOI_S = DELAI_PRET_KAGGLE_S + 900
 
 class FluxEnvoiKaggle:
     def __init__(self, profils: list, lister, arreter, envoyer, notifier, terminer, horloge=None,
-                 max_simultanes: int = MAX_TRANSFERTS_SIMULTANES):
+                 max_simultanes: int = MAX_TRANSFERTS_SIMULTANES, delai_groupes_s=None, journaliser=None):
         """profils : [{id_executant, nom_local, nom_archive, email, ...}] ; callbacks :
         lister(id_executant), arreter(id_executant, nom_local), envoyer(id_executant, profil),
         notifier(id_executant, nom_local, ok, message), terminer()."""
@@ -32125,6 +32128,13 @@ class FluxEnvoiKaggle:
         self._notifier, self._terminer = notifier, terminer
         self._horloge = horloge or time.monotonic
         self._max = max_simultanes
+        # Mode GROUPES (delai_groupes_s != None) : on lance jusqu'a `max_simultanes` envois ; le groupe suivant ne part
+        # que quand TOUT le groupe precedent est termine ET que `delai_groupes_s` secondes se sont ecoulees depuis.
+        # None = ancien comportement (fenetre glissante : un envoi termine libere tout de suite sa place).
+        self._delai_groupes = None if delai_groupes_s is None else max(0.0, float(delai_groupes_s))
+        self._journaliser = journaliser
+        self._groupe_ouvert = False
+        self._prochain_groupe = 0.0
         self._entrees = [{"profil": p, "id": p["id_executant"], "nom": p["nom_local"],
                           "etat": "liste", "echeance": 0.0, "timeout": False} for p in profils]
         self._attente_liste: set = set()
@@ -32241,12 +32251,35 @@ class FluxEnvoiKaggle:
         self._pomper()
 
     # -- ordonnancement ----------------------------------------------------
+    def _signaler(self, texte: str) -> None:
+        if self._journaliser is not None:
+            try:
+                self._journaliser(texte)
+            except Exception:
+                pass
+
     def _pomper(self):
         if self._termine or not self._demarre:
             return
         en_cours = [e for e in self._entrees if e["etat"] == "envoi"]
         occupes = {e["id"] for e in en_cours}
-        libres = self._max - len(en_cours)
+        if self._delai_groupes is None:
+            libres = self._max - len(en_cours)
+        else:
+            if self._groupe_ouvert and not en_cours:
+                self._groupe_ouvert = False
+                self._prochain_groupe = self._horloge() + self._delai_groupes
+                if self._delai_groupes > 0 and any(e["etat"] != "fini" for e in self._entrees):
+                    self._signaler(f"Groupe termine : pause de {int(self._delai_groupes)} s avant le prochain groupe.")
+            if en_cours or self._horloge() < self._prochain_groupe:
+                libres = 0  # groupe en cours, ou pause entre deux groupes
+            else:
+                # Les profils deviennent "prets" au fil des reponses des sAutoniax (liste, arret du profil) : on
+                # attend d'avoir un groupe complet, sauf s'il ne reste plus rien en preparation (dernier groupe).
+                prets = {e["id"] for e in self._entrees if e["etat"] == "pret"}
+                en_preparation = any(e["etat"] in ("liste", "arret") for e in self._entrees)
+                libres = self._max if (len(prets) >= self._max or not en_preparation) else 0
+        lance = False
         for e in self._entrees:
             if libres <= 0:
                 break
@@ -32255,7 +32288,10 @@ class FluxEnvoiKaggle:
                 e["echeance"] = self._horloge() + DELAI_INACTIVITE_ENVOI_S
                 occupes.add(e["id"])
                 libres -= 1
+                lance = True
                 self._envoyer(e["id"], e["profil"])
+        if lance and self._delai_groupes is not None:
+            self._groupe_ouvert = True
         if all(e["etat"] == "fini" for e in self._entrees):
             self._termine = True
             self._terminer()
@@ -32565,6 +32601,33 @@ class ProfilsKaggleScreen(QWidget):
         self.bouton_effacer_logs.setToolTip("Vide le journal affiche (n'efface rien sur Kaggle ni sur les sAutoniax).")
         self.bouton_effacer_logs.clicked.connect(self._sur_clic_effacer_logs)
         colonne_boutons_journal.addWidget(self.bouton_effacer_logs)
+        # Reglages de l'envoi, juste en dessous de "Effacer les logs" : taille d'un groupe d'envois simultanes et
+        # pause entre deux groupes (Kaggle limite le debit de facon dynamique : trop d'envois a la fois -> 429).
+        colonne_boutons_journal.addSpacing(10)
+        label_simultanes = QLabel("Envois simultanes", colonne_gauche)
+        label_simultanes.setObjectName("PlaceholderSubtitle")
+        label_simultanes.setWordWrap(True)
+        colonne_boutons_journal.addWidget(label_simultanes)
+        self.spin_envois_simultanes = QSpinBox(colonne_gauche)
+        self.spin_envois_simultanes.setRange(1, MAX_TRANSFERTS_SIMULTANES)
+        self.spin_envois_simultanes.setValue(NB_ENVOIS_SIMULTANES_DEFAUT)
+        self.spin_envois_simultanes.setToolTip(
+            "Nombre de profils envoyes vers Kaggle en meme temps (taille d'un groupe).\n"
+            "Trop eleve : Kaggle repond 429 (trop de requetes). Au plus 1 envoi a la fois par sAutoniax.")
+        colonne_boutons_journal.addWidget(self.spin_envois_simultanes)
+        label_delai_groupes = QLabel("Delai entre groupes", colonne_gauche)
+        label_delai_groupes.setObjectName("PlaceholderSubtitle")
+        label_delai_groupes.setWordWrap(True)
+        colonne_boutons_journal.addWidget(label_delai_groupes)
+        self.spin_delai_groupes = QSpinBox(colonne_gauche)
+        self.spin_delai_groupes.setRange(0, DELAI_ENTRE_GROUPES_MAX_S)
+        self.spin_delai_groupes.setValue(DELAI_ENTRE_GROUPES_DEFAUT_S)
+        self.spin_delai_groupes.setSuffix(" s")
+        self.spin_delai_groupes.setToolTip(
+            "Pause (en secondes) entre la fin d'un groupe d'envois et le depart du groupe suivant.\n"
+            "Le groupe suivant ne part que lorsque TOUS les envois du groupe precedent sont termines.\n"
+            "0 = enchainer directement.")
+        colonne_boutons_journal.addWidget(self.spin_delai_groupes)
         colonne_boutons_journal.addStretch(1)
         ligne_journal.addLayout(colonne_boutons_journal)
         layout_g.addLayout(ligne_journal, stretch=1)
@@ -33186,8 +33249,12 @@ class ProfilsKaggleScreen(QWidget):
         self._marquer_lignes_en_attente({(p["id_executant"], p["nom_local"]) for p in profils})
         self._rafraichir_boutons()
         self.ajouter_journal(f"Envoi : {len(profils)} profil(s) (operation {self._operation_id}).")
+        max_simultanes = int(self.spin_envois_simultanes.value())
+        delai_groupes_s = int(self.spin_delai_groupes.value())
+        self.ajouter_journal(f"Envois par groupes de {max_simultanes}, pause de {delai_groupes_s} s entre deux groupes.")
         self.demande_kaggle_envoyer.emit({"id_operation": self._operation_id, "supprimer_local": supprimer,
-                                          "profils": profils})
+                                          "profils": profils, "max_simultanes": max_simultanes,
+                                          "delai_groupes_s": delai_groupes_s})
 
     def _marquer_lignes_en_attente(self, cles: set):
         self._maj_en_cours = True
@@ -33743,6 +33810,16 @@ class ControleurKaggle(QObject):
         self._operation = id_operation
         self._type_operation = "envoi"
         self._supprimer_local = bool(charge.get("supprimer_local"))
+        try:
+            brut = charge.get("max_simultanes")
+            max_simultanes = MAX_TRANSFERTS_SIMULTANES if brut is None else max(1, min(int(brut), MAX_TRANSFERTS_SIMULTANES))
+        except (TypeError, ValueError):
+            max_simultanes = MAX_TRANSFERTS_SIMULTANES
+        try:
+            brut = charge.get("delai_groupes_s")
+            delai_groupes_s = None if brut is None else max(0.0, float(brut))
+        except (TypeError, ValueError):
+            delai_groupes_s = None
         self._flux = FluxEnvoiKaggle(
             profils,
             lister=lambda i: self._client.envoyer_ordre_kaggle("kaggle_lister_profils", i, id_operation),
@@ -33750,6 +33827,9 @@ class ControleurKaggle(QObject):
             envoyer=self._envoyer_profil,
             notifier=lambda i, n, ok, m: self._ecran.sur_resultat_envoi(id_operation, i, n, ok, m),
             terminer=lambda: self._ecran.terminer_operation(id_operation),
+            max_simultanes=max_simultanes,
+            delai_groupes_s=delai_groupes_s,
+            journaliser=self._ecran.ajouter_journal,
         )
         self._flux.demarrer()
 
