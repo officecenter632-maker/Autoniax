@@ -69,6 +69,180 @@ if sys.stdout is None or sys.stderr is None:
     if sys.stderr is None:
         sys.stderr = _flux_pyw
 
+# ============================================================================
+# PATCH « crash.txt » -- journal brut des CRASHS de l'application.
+# Demande utilisateur : « un log qui enregistre les erreurs de crash brutes de l'app : dès qu'une
+# erreur survient et cause le crash, la sauvegarder dans crash.txt, au même emplacement que le fichier
+# Python du logiciel ».
+# Fichier : <dossier de AutoniaX.pyw>/crash.txt (repli sur le dossier utilisateur, puis le dossier temporaire,
+# si ce dossier n'est pas inscriptible). Écriture en AJOUT, jamais d'écrasement : un crash = un bloc daté.
+# Installé TOUT EN HAUT du fichier (avant les imports lourds et avant Qt) pour couvrir aussi les crashs au
+# démarrage ; chaque process lancé depuis ce fichier (app, --serveur, --instance-id, --sautoniax,
+# --mode-executeur) l'installe pour lui-même et écrit dans le même crash.txt (le PID et le mode figurent dans
+# chaque bloc). Capte :
+#   1) exception Python non interceptée du thread principal        (sys.excepthook)
+#   2) exception non interceptée d'un thread d'arrière-plan         (threading.excepthook)
+#   3) exception « imprévisible » levée dans un destructeur/callback (sys.unraisablehook)
+#   4) plantage natif brut : violation d'accès, segfault, abort, erreur fatale Qt/DLL
+#      (faulthandler : pile Python de TOUS les threads, écrite directement dans crash.txt)
+#   5) message fatal Qt (qFatal : « Could not load the Qt platform plugin », etc.) -- cf. main()
+# Les hooks d'origine restent appelés ensuite : la sortie console / ~/AutoniaX_pyw.log est inchangée.
+# Défensif par construction : rien ici ne peut empêcher l'application de démarrer ni lever une exception.
+# ============================================================================
+_CRASH_ETAT = {"chemin": None, "fh": None, "verrou": None}
+
+
+def _crash_mode_process() -> str:
+    argv = sys.argv
+    for drapeau, nom in (("--serveur", "serveur"), ("--sautoniax", "sautoniax"), ("--mode-executeur", "executeur"),
+                         ("--instance-id", "instance"), ("--generer-instance-legere", "instance-legere")):
+        if drapeau in argv:
+            return nom
+    return "application"
+
+
+def _crash_ecrire(titre: str, detail: str) -> None:
+    """Ajoute un bloc daté à crash.txt (flush + fsync, pour survivre à une mort immédiate du process)."""
+    try:
+        import time as _t_c
+        import threading as _th_c
+        chemin = _CRASH_ETAT.get("chemin")
+        if not chemin:
+            return
+        if _CRASH_ETAT["verrou"] is None:
+            _CRASH_ETAT["verrou"] = _th_c.Lock()
+        try:
+            nom_thread = _th_c.current_thread().name
+        except Exception:
+            nom_thread = "?"
+        entete = (
+            "=" * 100 + "\n"
+            "[%s] %s\n"
+            "PID %s | mode : %s | thread : %s | Python %s | %s\n"
+            "argv : %r\n" + "-" * 100 + "\n"
+        ) % (
+            _t_c.strftime("%Y-%m-%d %H:%M:%S"), titre, os.getpid(), _crash_mode_process(), nom_thread,
+            sys.version.split()[0], sys.platform, list(sys.argv),
+        )
+        with _CRASH_ETAT["verrou"]:
+            with open(chemin, "a", encoding="utf-8", errors="replace") as f:
+                f.write(entete + detail.rstrip("\n") + "\n\n")
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def _installer_crash_txt() -> None:
+    try:
+        import traceback as _tb_c
+        import faulthandler as _fh_c
+        import tempfile as _tmp_c
+
+        candidats = []
+        try:
+            candidats.append(os.path.dirname(os.path.abspath(__file__)))
+        except Exception:
+            pass
+        candidats.append(os.path.expanduser("~"))
+        candidats.append(_tmp_c.gettempdir())
+        chemin = None
+        fh = None
+        for dossier in candidats:
+            try:
+                cible = os.path.join(dossier, "crash.txt")
+                # garde-fou taille : au-delà de 5 Mo, on ne garde que les derniers 512 Ko
+                try:
+                    if os.path.getsize(cible) > 5 * 1024 * 1024:
+                        with open(cible, "rb") as f_old:
+                            f_old.seek(-512 * 1024, os.SEEK_END)
+                            fin = f_old.read()
+                        with open(cible, "wb") as f_new:
+                            f_new.write(b"[... debut tronque (fichier > 5 Mo) ...]\n" + fin)
+                except OSError:
+                    pass
+                fh = open(cible, "a", encoding="utf-8", errors="replace", buffering=1)
+                chemin = cible
+                break
+            except Exception:
+                fh = None
+        if chemin is None or fh is None:
+            return
+        _CRASH_ETAT["chemin"] = chemin
+        _CRASH_ETAT["fh"] = fh      # garder une référence : faulthandler écrit sur ce descripteur jusqu'à la mort du process
+
+        # 4) plantage natif brut (segfault / violation d'accès / abort) -> pile de tous les threads dans crash.txt
+        try:
+            _fh_c.enable(file=fh, all_threads=True)
+        except Exception:
+            pass
+
+        # 1) thread principal
+        _hook_orig = sys.excepthook
+
+        def _hook_principal(type_exc, valeur, trace):
+            try:
+                if not issubclass(type_exc, KeyboardInterrupt):
+                    _crash_ecrire("EXCEPTION NON INTERCEPTEE (thread principal)",
+                                  "".join(_tb_c.format_exception(type_exc, valeur, trace)))
+            except Exception:
+                pass
+            try:
+                _hook_orig(type_exc, valeur, trace)
+            except Exception:
+                pass
+        sys.excepthook = _hook_principal
+
+        # 2) threads d'arrière-plan
+        _hook_thread_orig = getattr(__import__("threading"), "excepthook", None)
+
+        def _hook_thread(args):
+            try:
+                if args.exc_type is not SystemExit:
+                    _crash_ecrire(
+                        "EXCEPTION NON INTERCEPTEE (thread « %s »)" % (getattr(args.thread, "name", "?"),),
+                        "".join(_tb_c.format_exception(args.exc_type, args.exc_value, args.exc_traceback)))
+            except Exception:
+                pass
+            try:
+                if _hook_thread_orig is not None:
+                    _hook_thread_orig(args)
+            except Exception:
+                pass
+        try:
+            __import__("threading").excepthook = _hook_thread
+        except Exception:
+            pass
+
+        # 3) exceptions impossibles à propager (destructeurs, callbacks C)
+        _hook_unraisable_orig = getattr(sys, "unraisablehook", None)
+
+        def _hook_unraisable(args):
+            try:
+                _crash_ecrire(
+                    "EXCEPTION INPROPAGEABLE (%s)" % (getattr(args, "err_msg", None) or "destructeur / callback",),
+                    "objet : %r\n%s" % (getattr(args, "object", None),
+                                        "".join(_tb_c.format_exception(args.exc_type, args.exc_value, args.exc_traceback))))
+            except Exception:
+                pass
+            try:
+                if _hook_unraisable_orig is not None:
+                    _hook_unraisable_orig(args)
+            except Exception:
+                pass
+        try:
+            sys.unraisablehook = _hook_unraisable
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+_installer_crash_txt()
+
 # PATCH « instance légère » : `AutoniaX.pyw --generer-instance-legere` régénère
 # AutoniaX_instance.py SANS charger Qt ni le reste du fichier (sinon la
 # régénération coûterait un démarrage complet de l'app). Le code du générateur
@@ -361,6 +535,40 @@ def _sortie_logs_coupee(instance_id: str = "") -> bool:
     return os.environ.get("AUTONIAX_LOGS_PAR_DEFAUT", "0") != "1"
 
 
+# PATCH (demande utilisateur : « ce paramètre doit couper la sortie de logs dans le NOTEBOOK DE DÉMARRAGE, pas
+# dans les exécutions sAutoniax »). Le drapeau de sortie de logs ne gouverne donc PLUS la sortie des cellules
+# exécutées (print envoyés au pilote : toujours envoyés), mais UNIQUEMENT les logs écrits dans la console du
+# process sAutoniax (= ce qui s'affiche sous la cellule du notebook Kaggle de démarrage). Le journal par profil
+# (fichier .journal) et le tampon « Copier tous les logs » restent complets, quel que soit le drapeau.
+# Les messages de niveau >= NIVEAU_CONSOLE_TOUJOURS_VISIBLE (erreurs) restent visibles même sortie coupée,
+# pour ne pas rendre un échec de démarrage invisible (mettre logging.CRITICAL + 1 pour tout couper).
+NIVEAU_CONSOLE_TOUJOURS_VISIBLE = logging.ERROR
+
+
+class _FiltreConsoleNotebookDemarrage(logging.Filter):
+    """Filtre posé sur les handlers CONSOLE du process sAutoniax. Un enregistrement porte éventuellement
+    `instance_id_logs` (extra=) : le drapeau de CE profil décide ; sinon le défaut global (coupé, sauf
+    AUTONIAX_LOGS_PAR_DEFAUT=1)."""
+    def filter(self, record):
+        try:
+            if record.levelno >= NIVEAU_CONSOLE_TOUJOURS_VISIBLE:
+                return True
+            return not _sortie_logs_coupee(getattr(record, "instance_id_logs", "") or "")
+        except Exception:
+            return True
+
+
+def _couper_logs_console_notebook_demarrage() -> None:
+    """À appeler au début de main_sautoniax() uniquement (jamais côté pilote mAutoniax)."""
+    try:
+        filtre = _FiltreConsoleNotebookDemarrage()
+        for h in logging.getLogger().handlers:
+            if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
+                h.addFilter(filtre)
+    except Exception:
+        pass
+
+
 _VERROU_JOURNAL_INSTANCE = threading.Lock()
 _JOURNAL_MAX_OCTETS = 2_000_000
 _JOURNAL_LIGNES_GARDEES = 5000
@@ -527,6 +735,16 @@ logging.getLogger().addHandler(tampon_journal)
 # contenu était ensuite routé vers le mauvais session_id (symptôme
 # observé : une sortie contenant plusieurs "True" accumulés dès la
 # toute première exécution d'un profil).
+# PATCH sortie des THREADS de la tâche (process EXÉCUTEUR uniquement) -- bug « je ne vois plus la sortie de mon notebook exécuté dans
+# AutoniaX » : un print() fait par un thread que le code de la cellule a lancé (agent Ingxai : surveillance, battement, journal...)
+# n'a AUCUN tampon enregistré pour son thread -> il partait vers le stdout du process exécuteur, donc vers la console du
+# notebook Kaggle de démarrage (celle que le bouton « logs » coupe) et JAMAIS vers AutoniaX. Dans le process exécuteur,
+# main_executeur_sautoniax() renseigne ici le flux en direct de la dernière cellule ; ces écritures-là vont alors au pilote, comme la
+# sortie de la cellule elle-même, quel que soit le drapeau de logs. Reste None partout ailleurs (process principal, pilote) :
+# comportement inchangé. Le logging n'est pas concerné (ses handlers écrivent sur le flux d'origine, jamais sur ce routeur).
+_FLUX_DEFAUT_EXECUTEUR: dict = {"flux": None}
+
+
 class _FluxStdoutParThread:
     """Remplace sys.stdout (ou sys.stderr) UNE SEULE FOIS pour tout le
     process. write()/flush() routent vers le tampon io.StringIO
@@ -562,11 +780,11 @@ class _FluxStdoutParThread:
             return self._tampons_par_thread.get(threading.get_ident())
 
     def write(self, texte: str) -> int:
-        tampon = self._tampon_courant()
+        tampon = self._tampon_courant() or _FLUX_DEFAUT_EXECUTEUR["flux"]
         return (tampon or self._flux_original).write(texte)
 
     def flush(self) -> None:
-        tampon = self._tampon_courant()
+        tampon = self._tampon_courant() or _FLUX_DEFAUT_EXECUTEUR["flux"]
         (tampon or self._flux_original).flush()
 
     # Quelques attributs/méthodes que du code tiers (ou exec() lui-même)
@@ -654,6 +872,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
+    QGraphicsOpacityEffect,
     QApplication,
     QMainWindow,
     QWidget,
@@ -22876,8 +23095,8 @@ class PanneauProprietesSautoniax(QWidget):
             bouton_logs.setEnabled(not logs_en_cours)
             bouton_logs.setToolTip(
                 "Changement en cours..." if logs_en_cours
-                else ("Sortie de logs COUPÉE (défaut) -- clic pour l'activer pour ce profil."
-                      if logs_coupes else "Sortie de logs active pour ce profil -- clic pour la couper.")
+                else ("Logs du notebook de démarrage COUPÉS (défaut) -- clic pour les activer pour ce profil. La sortie des cellules n'est pas concernée."
+                      if logs_coupes else "Logs du notebook de démarrage ACTIFS pour ce profil -- clic pour les couper. La sortie des cellules n'est pas concernée.")
             )
             bouton_logs.clicked.connect(
                 lambda: self._sur_clic_toggle_logs_profil(id_executant, nom_profil, instance_id_logs, not logs_coupes)
@@ -23399,7 +23618,7 @@ class PanneauProprietesSautoniax(QWidget):
                 else:
                     _INSTANCES_LOGS_ACTIVES_PILOTE.add(instance_id_logs)
                 self._afficher_statut_temporaire(
-                    "Sortie de logs coupée pour ce profil." if coupee_demandee else "Sortie de logs réactivée pour ce profil."
+                    "Logs du notebook de démarrage coupés pour ce profil." if coupee_demandee else "Logs du notebook de démarrage réactivés pour ce profil."
                 )
             else:
                 self._afficher_statut_temporaire(
@@ -24156,7 +24375,15 @@ class InstancesConnecteesScreen(QWidget):
         # setUniformRowHeights(True) figerait toutes les lignes à la
         # hauteur d'une ligne texte-seul et rognerait les boutons.
         self.table_executants.setUniformRowHeights(False)
-        self.table_executants.setSortingEnabled(True)
+        # CORRECTIF CRASH (access violation, 14/11/2026 -- cf. crash.txt) :
+        # le tri natif Qt (setSortingEnabled(True)) rappelait en C++ la
+        # surcharge Python QTreeWidgetItem.__lt__ de _ItemExecutantTriable
+        # pendant la reconstruction de la table ; Shiboken retrouvait alors
+        # une méthode périmée (un lambda de _construire_widget_actions_ligne)
+        # -> TypeError dans un callback C++ -> plantage natif. Le tri est
+        # désormais fait ENTIEREMENT en Python (cf. _executants_tries et
+        # _sur_clic_entete_tri), Qt ne trie plus jamais cette table.
+        self.table_executants.setSortingEnabled(False)
         self.table_executants.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table_executants.setSelectionBehavior(QAbstractItemView.SelectRows)
         # PATCH C (cf. cahier des charges patchs.md, section C) --
@@ -24197,7 +24424,13 @@ class InstancesConnecteesScreen(QWidget):
         # disponible en cliquant sur son en-tête si besoin -- cf.
         # docstring de _ItemExecutantTriable, comportement Qt standard
         # inchangé pour le choix manuel d'une autre colonne de tri).
-        self.table_executants.sortByColumn(0, Qt.AscendingOrder)
+        self._colonne_tri = 0
+        self._ordre_tri = Qt.AscendingOrder
+        _entete_tri = self.table_executants.header()
+        _entete_tri.setSectionsClickable(True)
+        _entete_tri.setSortIndicatorShown(True)
+        _entete_tri.setSortIndicator(self._colonne_tri, self._ordre_tri)
+        _entete_tri.sectionClicked.connect(self._sur_clic_entete_tri)
         layout.addWidget(self.table_executants, stretch=1)
 
         self.label_legende = QLabel("instance(s) AutoniaX connectée(s) -- clic droit ou boutons pour les actions", self)
@@ -24482,10 +24715,10 @@ class InstancesConnecteesScreen(QWidget):
 
         self.table_executants.setSortingEnabled(False)
         self.table_executants.clear()
-        for id_executant, infos in sorted(self._executants.items(), key=lambda kv: _cle_tri_numerique_generique(kv[1].get("nom", ""))):
+        for id_executant, infos in self._executants_tries():
             connecte_le = infos.get("connecte_le", "")
             en_chargement = infos.get("role") == "executant" and id_executant not in self._sautoniax_prets
-            item = _ItemExecutantTriable()
+            item = QTreeWidgetItem()  # CORRECTIF CRASH : plus de surcharge Python de __lt__
             # AJOUT (SPEC_lot_corrections_2026-09.md section 13) : case à
             # cocher posée AVANT addTopLevelItem (même patron EXACT que
             # PanneauExecutionClone/PanneauProprietesSautoniax, cf. leurs
@@ -24535,9 +24768,55 @@ class InstancesConnecteesScreen(QWidget):
             self.table_executants.setItemWidget(
                 item, 5, self._construire_widget_actions_ligne(id_executant, infos, en_chargement)
             )
-        self.table_executants.setSortingEnabled(True)
         for i in range(4):
             self.table_executants.resizeColumnToContents(i)
+
+    def _executants_tries(self) -> list:
+        """CORRECTIF CRASH -- tri fait en Python (colonne/ordre mémorisés
+        dans self._colonne_tri / self._ordre_tri, modifiés par un clic sur
+        l'en-tête, cf. _sur_clic_entete_tri) au lieu du tri natif Qt qui
+        rappelait la surcharge Python de QTreeWidgetItem.__lt__. Mêmes
+        règles qu'avant : colonne 0 numérique (sAutoniax-2 < sAutoniax-10),
+        colonne 3 sur l'horodatage ISO brut, colonnes 1 et 2 en texte."""
+        colonne = getattr(self, "_colonne_tri", 0)
+        decroissant = getattr(self, "_ordre_tri", Qt.AscendingOrder) == Qt.DescendingOrder
+
+        def cle(kv):
+            id_executant, infos = kv
+            cle_nom = _cle_tri_numerique_generique(infos.get("nom") or id_executant)
+            if colonne == 1:
+                principale = (str(id_executant).lower(),)
+            elif colonne == 2:
+                en_chargement = infos.get("role") == "executant" and id_executant not in self._sautoniax_prets
+                texte = (
+                    "Chargement des dépendances..." if en_chargement
+                    else self._libelle_statut_connectivite(id_executant, infos.get("statut", ""))
+                )
+                principale = (str(texte).lower(),)
+            elif colonne == 3:
+                principale = (infos.get("connecte_le", "") or "",)
+            else:
+                return (cle_nom,)
+            return (principale, cle_nom)
+
+        return sorted(self._executants.items(), key=cle, reverse=decroissant)
+
+    def _sur_clic_entete_tri(self, colonne: int):
+        """CORRECTIF CRASH -- clic sur l'en-tête : bascule l'ordre si c'est
+        la même colonne, sinon trie croissant sur la nouvelle colonne, puis
+        reconstruit la table (la sélection est conservée par id_executant).
+        Les colonnes Téléchargement/Actions (widgets) ne sont pas triables."""
+        if colonne not in (0, 1, 2, 3):
+            return
+        if colonne == self._colonne_tri:
+            self._ordre_tri = (
+                Qt.DescendingOrder if self._ordre_tri == Qt.AscendingOrder else Qt.AscendingOrder
+            )
+        else:
+            self._colonne_tri = colonne
+            self._ordre_tri = Qt.AscendingOrder
+        self.table_executants.header().setSortIndicator(self._colonne_tri, self._ordre_tri)
+        self.sur_executants_detail_change(list(self._executants.values()))
 
     def _sur_item_changed_executant(self, item: QTreeWidgetItem, colonne: int):
         """AJOUT (SPEC_lot_corrections_2026-09.md section 13) -- même
@@ -30051,7 +30330,7 @@ KAGGLE_API_TOKEN = "KGAT_af3ac4a714d020b6a4a8034cf1bf8792"  # en dur (decision e
 KAGGLE_PAQUET_PIP = "kaggle==2.2.5"  # minimum 1.8.0 ; meme epinglage dans le notebook sAutoniax
 PREFIXE_DATASET = "ax-"
 _DIAG_KAGGLE: dict = {"total_datasets_vus": None}  # diagnostic du dernier listing (tous les datasets du compte)
-MAX_TRANSFERTS_SIMULTANES = 3  # global, tous sAutoniax confondus
+MAX_TRANSFERTS_SIMULTANES = 10  # global, tous sAutoniax confondus
 NB_TENTATIVES = 3
 DELAIS_TENTATIVES_S = (5, 15, 45)
 DELAI_PRET_KAGGLE_S = 600
@@ -30064,8 +30343,26 @@ KAGGLE_PREFIXE_SOUS_TITRE = "ax;cree="
 KAGGLE_REGLAGE_CORRESPONDANCE = "kaggle_correspondance_noms"
 
 # Le jeton doit etre dans l'environnement AVANT tout import du paquet kaggle.
-os.environ["KAGGLE_USERNAME"] = KAGGLE_USERNAME
-os.environ["KAGGLE_API_TOKEN"] = KAGGLE_API_TOKEN
+# IDENTITE STABLE : un notebook Kaggle injecte ses propres variables KAGGLE_* (KAGGLE_USER_SECRETS_TOKEN,
+# KAGGLE_DATA_PROXY_TOKEN, KAGGLE_API_V1_TOKEN...) qui font agir la bibliotheque sous le compte PROPRIETAIRE DU NOTEBOOK
+# (ex. futuradevdevelopers) au lieu de KAGGLE_USERNAME : creation de dataset refusee ("slugs and hashlink are all null").
+# On les ecarte donc de l'environnement du process des le demarrage, quelle que soit la machine.
+_GARDE_ENV_KAGGLE = frozenset({"KAGGLE_USERNAME", "KAGGLE_API_TOKEN", "KAGGLE_KEY"})
+
+
+def _isoler_identite_kaggle() -> dict:
+    """Retire les variables KAGGLE_* injectees par le notebook (garde notre identifiant et notre jeton) et impose
+    notre identite. Idempotent. Retourne les variables retirees (diagnostic)."""
+    retirees = {}
+    for _k in list(os.environ):
+        if _k.upper().startswith("KAGGLE") and _k not in _GARDE_ENV_KAGGLE:
+            retirees[_k] = os.environ.pop(_k)
+    os.environ["KAGGLE_USERNAME"] = KAGGLE_USERNAME
+    os.environ["KAGGLE_API_TOKEN"] = KAGGLE_API_TOKEN
+    return retirees
+
+
+_ENV_KAGGLE_NOTEBOOK = _isoler_identite_kaggle()
 
 _log_kaggle = logging.getLogger("autoniax.kaggle")
 
@@ -30159,8 +30456,39 @@ def sites_depuis_sous_titre(sous_titre: Optional[str]) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Correspondance {nom_profil_local: email} (JSON via presse-papiers)
+# Correspondance {"<sAutoniax>/<nom_profil_local>": {email, sites}} (JSON via presse-papiers)
+# PATCH : un profil = (sAutoniax, nom local). Un meme nom de profil present sur plusieurs sAutoniax = des profils
+# DIFFERENTS (machines differentes), chacun a sa propre entree. Le '/' ne peut pas figurer dans un nom de dossier.
+# Ancien format (cle = nom seul) : encore accepte, sert de repli pour toute machine sans entree propre.
 # ---------------------------------------------------------------------------
+def cle_correspondance(nom_sautoniax, nom_local) -> str:
+    """Cle JSON d'un profil : 'sAutoniax-1/iaX1'. Sans nom de sAutoniax : le nom local seul (ancien format)."""
+    sauto, nom = str(nom_sautoniax or "").strip(), str(nom_local or "")
+    return f"{sauto}/{nom}" if sauto else nom
+
+
+def separer_cle_correspondance(cle) -> tuple:
+    """'sAutoniax-1/iaX1' -> ('sAutoniax-1', 'iaX1') ; 'iaX1' (ancien format) -> ('', 'iaX1')."""
+    cle = str(cle or "")
+    if "/" in cle:
+        sauto, nom = cle.split("/", 1)
+        return sauto.strip(), nom.strip()
+    return "", cle.strip()
+
+
+def chercher_correspondance(dico: Optional[dict], nom_sautoniax, nom_local, defaut=None):
+    """Valeur d'un profil precis ; repli sur l'entree ancien format (nom local seul)."""
+    dico = dico or {}
+    cle = cle_correspondance(nom_sautoniax, nom_local)
+    if cle in dico:
+        return dico[cle]
+    return dico.get(str(nom_local or ""), defaut)
+
+
+def _cle_naturelle(texte: str) -> list:
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", str(texte))]
+
+
 def valider_correspondance(texte: str) -> tuple:
     """Parse et valide le JSON. Retourne (correspondance, avertissements) ou
     leve ErreurCorrespondance. Ne modifie rien."""
@@ -30186,14 +30514,26 @@ def valider_correspondance_complete(texte: str) -> tuple:
     avertissements: list = []
     for cle, valeur in donnees.items():
         sites_valeur = None
+        coche_valeur = None
         if isinstance(valeur, dict):
+            # Tolerance : cle sans '/' mais champs "sautoniax" + "profil" presents -> cle reconstruite.
+            if isinstance(cle, str) and "/" not in cle and str(valeur.get("sautoniax") or "").strip():
+                cle = cle_correspondance(valeur.get("sautoniax"), valeur.get("profil") or cle)
             sites_valeur = valeur.get("sites")
             if sites_valeur is not None and not isinstance(sites_valeur, (list, str)):
                 raise ErreurCorrespondance(f"'sites' doit etre une liste de textes : {cle!r}.")
+            coche_valeur = valeur.get("coche")
+            if coche_valeur is not None and not isinstance(coche_valeur, bool):
+                raise ErreurCorrespondance(f"'coche' doit etre true ou false : {cle!r}.")
             valeur = valeur.get("email")
+            if valeur is None and coche_valeur is False:
+                valeur = ""
         if not isinstance(cle, str) or not isinstance(valeur, str):
             raise ErreurCorrespondance(f"Cle ou valeur qui n'est pas une chaine : {cle!r}.")
         c, v = cle.strip(), valeur.strip()
+        if c and not v and coche_valeur is False:
+            # PATCH : profil decoche par le JSON et sans e-mail -> aucune entree d'e-mail enregistree (il n'est pas envoye).
+            continue
         if not c or not v:
             raise ErreurCorrespondance(f"Cle ou valeur vide : {cle!r} -> {valeur!r}.")
         if c in resultat:
@@ -30212,15 +30552,44 @@ def valider_correspondance_complete(texte: str) -> tuple:
     return resultat, sites_par_profil, avertissements
 
 
+def coches_depuis_texte(texte: str) -> dict:
+    """{cle 'sAutoniax-N/nom_profil': bool} pour les entrees du JSON qui portent un champ booleen \"coche\".
+    Sert a cocher/decocher les cases de l'arbre « Envoyer vers Kaggle ». Ne leve jamais d'erreur (le JSON a deja
+    ete valide par valider_correspondance_complete) ; les entrees sans \"coche\" ne touchent pas aux cases."""
+    try:
+        donnees = json.loads(texte)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return {}
+    coches: dict = {}
+    if not isinstance(donnees, dict):
+        return coches
+    for cle, valeur in donnees.items():
+        if not isinstance(valeur, dict) or not isinstance(valeur.get("coche"), bool):
+            continue
+        if isinstance(cle, str) and "/" not in cle and str(valeur.get("sautoniax") or "").strip():
+            cle = cle_correspondance(valeur.get("sautoniax"), valeur.get("profil") or cle)
+        if isinstance(cle, str) and cle.strip():
+            coches[cle.strip()] = valeur["coche"]
+    return coches
+
+
 PROMPT_CORRESPONDANCE_IA = (
     "Tu vas corriger un JSON de correspondance pour une application.\n"
-    "FORMAT EXIGÉ : un objet JSON { \"nom_profil_local\": { \"email\": \"email@domaine.com\", "
-    "\"sites\": [\"google\", \"tiktok\"] } }.\n"
-    "- Chaque clé est un nom de profil local : recopie-la EXACTEMENT telle quelle (même casse, mêmes "
-    "caractères). Ne renomme, n'ajoute et ne supprime aucune clé.\n"
-    "- \"email\" : l'adresse e-mail complète du compte (avec @), jamais vide. Les valeurs vides "
-    "\"\" sont à compléter ; corrige aussi celles qui sont fausses.\n"
-    "- Deux clés ne doivent jamais avoir le même email.\n"
+    "FORMAT EXIGÉ : un objet JSON { \"sAutoniax-N/nom_profil_local\": { \"sautoniax\": \"sAutoniax-N\", "
+    "\"profil\": \"nom_profil_local\", \"email\": \"email@domaine.com\", \"sites\": [\"google\", \"tiktok\"], "
+    "\"coche\": true } }.\n"
+    "- Chaque entrée = UN profil sur UNE machine (un sAutoniax = une machine distincte). Un même nom de profil "
+    "présent sur plusieurs sAutoniax donne plusieurs entrées DIFFÉRENTES (comptes différents) : ne les fusionne jamais.\n"
+    "- Chaque clé (ex. \"sAutoniax-1/iaX1\") et les champs \"sautoniax\" et \"profil\" : recopie-les EXACTEMENT "
+    "tels quels (même casse, mêmes caractères). Ne renomme, n'ajoute et ne supprime aucune entrée.\n"
+    "- \"email\" : l'adresse e-mail complète du compte (avec @), prise telle quelle dans la liste brute (e-mail + "
+    "sAutoniax) que je te donne. Les valeurs vides \"\" sont à compléter ; corrige aussi celles qui sont fausses. "
+    "Ne rattache jamais l'e-mail d'une ligne à un autre sAutoniax que le sien ; une ligne de la liste brute dont le "
+    "sAutoniax n'est pas dans le JSON actuel est ignorée.\n"
+    "- \"coche\" : true si le sAutoniax de l'entrée a une ligne (donc un e-mail) dans la liste brute ; false s'il n'en a "
+    "aucune. Dans ce cas l'entrée reste dans le JSON (ne la supprime pas), avec \"email\": \"\" et \"coche\": false : "
+    "le profil est simplement décoché dans l'application.\n"
+    "- Deux entrées ne doivent jamais avoir le même email (les e-mails vides des entrées décochées sont exemptés).\n"
     "- \"sites\" : la liste des sites/services sur lesquels le compte est déjà connecté, en minuscules, "
     "un mot par site (ex. google, youtube, tiktok, facebook). Complète-la d'après les informations que je te "
     "donne ; garde les sites déjà présents ; mets [] si tu n'en sais rien.\n"
@@ -30230,21 +30599,26 @@ PROMPT_CORRESPONDANCE_IA = (
 )
 
 
-def construire_texte_correspondance_ia(noms_profils: list, correspondance: dict, sites: Optional[dict] = None) -> str:
-    """Texte a coller dans une IA : un court prompt puis le JSON {nom_profil_local: {"email", "sites"}}.
-    Contient tous les profils actuellement listes (email "" et sites [] si rien d'enregistre), puis les entrees
-    enregistrees qui ne correspondent a aucun profil liste. L'IA renvoie ce meme JSON corrige, directement
-    importable par « Importer la correspondance »."""
+MARQUEUR_JSON_CORRESPONDANCE_IA = "JSON actuel :\n"
+
+
+def construire_texte_correspondance_ia(cles_profils: list, correspondance: dict, sites: Optional[dict] = None) -> str:
+    """Texte a coller dans une IA : un court prompt puis le JSON complet des profils.
+    cles_profils : liste de cles 'sAutoniax-N/nom_profil' (voir cle_correspondance) -- une entree PAR profil et PAR
+    sAutoniax, meme si plusieurs profils portent le meme nom. Email "" et sites [] si rien d'enregistre. L'IA renvoie
+    ce meme JSON corrige, directement importable par « Importer la correspondance »."""
     correspondance = correspondance or {}
     sites = sites or {}
-    # Seuls les profils actuellement listes sont proposes : les anciennes entrees enregistrees (profil deja envoye
-    # puis supprime du sAutoniax, par ex.) ne reviennent plus dans le JSON. Repli sur l'enregistre si rien n'est liste.
-    noms = {str(n) for n in noms_profils if str(n).strip()}
-    if not noms:
-        noms = {str(n) for n in correspondance} | {str(n) for n in sites}
+    cles = {str(c) for c in cles_profils if str(c).strip()}
+    if not cles:
+        cles = {str(n) for n in correspondance} | {str(n) for n in sites}
     contenu: dict = {}
-    for nom in sorted(noms, key=lambda n: n.lower()):
-        contenu[nom] = {"email": str(correspondance.get(nom, "") or ""), "sites": normaliser_sites(sites.get(nom))}
+    for cle in sorted(cles, key=lambda c: (_cle_naturelle(separer_cle_correspondance(c)[0]),
+                                           separer_cle_correspondance(c)[1].lower())):
+        sauto, nom = separer_cle_correspondance(cle)
+        contenu[cle] = {"sautoniax": sauto, "profil": nom,
+                        "email": str(correspondance.get(cle, "") or ""), "sites": normaliser_sites(sites.get(cle)),
+                        "coche": True}
     return PROMPT_CORRESPONDANCE_IA + json.dumps(contenu, ensure_ascii=False, indent=2)
 
 
@@ -30304,7 +30678,7 @@ def resoudre_noms_archive(profils: list, correspondance: dict) -> list:
         if garder:
             nom_archive = nom_local
         else:
-            nom_archive = (correspondance.get(nom_local) or "").strip()
+            nom_archive = (chercher_correspondance(correspondance, p.get("nom_executant"), nom_local) or "").strip()
             if not nom_archive:
                 erreur = "Absent de la correspondance (case 'Garder le nom' decochee)."
         if not erreur and not nom_archive:
@@ -30601,11 +30975,28 @@ class GestionnaireKaggle:
         if self._fabrique_api is not None:
             api = self._fabrique_api()
         else:
-            os.environ["KAGGLE_USERNAME"] = KAGGLE_USERNAME
-            os.environ["KAGGLE_API_TOKEN"] = KAGGLE_API_TOKEN
+            _isoler_identite_kaggle()
             from kaggle.api.kaggle_api_extended import KaggleApi
             api = KaggleApi()
         api.authenticate()
+        # IDENTITE STABLE : on verifie que la bibliotheque agit bien sous KAGGLE_USERNAME ; sinon on reconstruit une API
+        # neuve apres avoir de nouveau ecarte les variables du notebook, et on le dit dans le journal.
+        if self._fabrique_api is None:
+            try:
+                utilisateur = str(api.get_config_value("username") or "")
+            except Exception:
+                utilisateur = KAGGLE_USERNAME
+            if utilisateur != KAGGLE_USERNAME:
+                self._j(f"ATTENTION identite Kaggle inattendue : '{utilisateur}' au lieu de '{KAGGLE_USERNAME}' -> reconstruction")
+                _isoler_identite_kaggle()
+                api = KaggleApi()
+                api.authenticate()
+                try:
+                    utilisateur = str(api.get_config_value("username") or "")
+                except Exception:
+                    utilisateur = KAGGLE_USERNAME
+                if utilisateur != KAGGLE_USERNAME:
+                    self._j(f"ATTENTION identite Kaggle toujours inattendue : '{utilisateur}'")
         self._api = api
         return api
 
@@ -30909,6 +31300,62 @@ class GestionnaireKaggle:
                     os.remove(str(zip_source))
             except OSError:
                 pass
+
+    def _sonde_environnement(self, api) -> None:
+        """DIAG : identite Kaggle reellement utilisee par CETTE machine, variables d'environnement KAGGLE*
+        (valeurs secretes masquees), fichiers d'identifiants, IP publique, comptage des datasets du compte."""
+        def _masque(nom: str, val: str) -> str:
+            if any(m in nom.upper() for m in ("TOKEN", "KEY", "SECRET", "PASS", "AUTH")):
+                return f"<{len(val)} car., debut {val[:4]!r}>"
+            return val if len(val) <= 120 else val[:120] + "..."
+        try:
+            noms = sorted(k for k in os.environ if "KAGGLE" in k.upper() or k.upper().startswith(("KERNEL", "GOOGLE_", "GCE_", "NB_")))
+            self._j("DIAG ENV variables : " + " | ".join(f"{k}={_masque(k, os.environ[k])}" for k in noms))
+        except Exception as e:
+            self._j(f"DIAG ENV variables illisibles : {e!r}")
+        try:
+            for nom in ("username", "path", "proxy", "competition"):
+                try:
+                    self._j(f"DIAG ENV config {nom} = {api.get_config_value(nom)!r}")
+                except Exception as e:
+                    self._j(f"DIAG ENV config {nom} : {type(e).__name__} {e}")
+        except Exception:
+            pass
+        try:
+            for chemin in ("~/.kaggle/kaggle.json", "~/.kaggle/access_token", "~/.config/kaggle/kaggle.json",
+                           "/kaggle/input", "/kaggle/lib", "/root/.kaggle"):
+                c = os.path.expanduser(chemin)
+                self._j(f"DIAG ENV fichier {chemin} : {'present' if os.path.exists(c) else 'absent'}")
+        except Exception:
+            pass
+        try:
+            import urllib.request as _ur
+            for url in ("https://api.ipify.org", "https://ifconfig.me/ip"):
+                try:
+                    ip = _ur.urlopen(url, timeout=4).read().decode().strip()
+                    self._j(f"DIAG ENV ip publique ({url}) : {ip}")
+                    break
+                except Exception as e:
+                    self._j(f"DIAG ENV ip publique ({url}) : {type(e).__name__}")
+        except Exception:
+            pass
+        try:
+            n = 0
+            page = 1
+            while page <= 20:
+                lot = api.dataset_list(mine=True, page=page) or []
+                if not lot:
+                    break
+                n += len(lot)
+                page += 1
+            self._j(f"DIAG ENV datasets visibles du compte par cette machine : {n}")
+        except Exception as e:
+            self._j(f"DIAG ENV liste datasets : {type(e).__name__} {e}")
+        try:
+            import kagglesdk as _k
+            self._j(f"DIAG ENV kagglesdk : {getattr(_k, '__file__', '?')}")
+        except Exception:
+            pass
 
     @staticmethod
     def _est_403(e: Exception) -> bool:
@@ -31451,36 +31898,78 @@ def trier_datasets(datasets: list, cle: str = "maj") -> list:
     return connus + inconnus
 
 
+def date_dataset(d: dict) -> str:
+    """Date affichee/triee d'un dataset : mise a jour, a defaut creation (jamais mis a jour = date de creation)."""
+    return d.get("maj_le") or d.get("cree_le") or ""
+
+
+def trier_datasets_par_date(datasets: list, recent_d_abord: bool = True) -> list:
+    """Tri sur la date (mise a jour, sinon creation). Les dates inconnues restent en dernier dans les deux sens."""
+    connus = [d for d in datasets if cle_tri_date(date_dataset(d))]
+    inconnus = [d for d in datasets if not cle_tri_date(date_dataset(d))]
+    connus.sort(key=lambda d: cle_tri_date(date_dataset(d)), reverse=bool(recent_d_abord))
+    return connus + inconnus
+
+
+class DelegueDateKaggle(QStyledItemDelegate):
+    """Colonne Date : jour et heure:minute en couleurs differentes, police agrandie. Le jour alterne de couleur d'un
+    jour calendaire a l'autre pour distinguer d'un coup d'oeil les groupes de profils."""
+    ROLE_JOUR = Qt.UserRole + 10
+    ROLE_HEURE = Qt.UserRole + 11
+    ROLE_PARITE = Qt.UserRole + 12
+
+    def _document(self, option, index):
+        jour = index.data(self.ROLE_JOUR) or ""
+        heure = index.data(self.ROLE_HEURE) or ""
+        couleur_jour = Mocha.blue if int(index.data(self.ROLE_PARITE) or 0) % 2 == 0 else Mocha.mauve
+        couleur_heure = Mocha.peach
+        if option.state & QStyle.State_Selected:
+            # ligne selectionnee (fond clair) : texte FONCE, sinon illisible ; jour et heure restent distincts
+            couleur_jour = "#11111b"
+            couleur_heure = "#7a3b00"
+        police = QFont(option.font)
+        police.setPointSizeF(max(police.pointSizeF(), 9.0) + 3.0)
+        police.setBold(True)
+        doc = QTextDocument()
+        doc.setDefaultFont(police)
+        doc.setDocumentMargin(0)
+        doc.setHtml(f'<span style="color:{couleur_jour};">{jour}</span>&nbsp;&nbsp;'
+                    f'<span style="color:{couleur_heure};">{heure}</span>')
+        return doc
+
+    def sizeHint(self, option, index):
+        doc = self._document(option, index)
+        base = super().sizeHint(option, index)
+        return QSize(int(doc.idealWidth()) + 12, max(base.height(), int(doc.size().height()) + 6))
+
+    def paint(self, painter, option, index):
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        opt.text = ""
+        style = opt.widget.style() if opt.widget else QApplication.style()
+        style.drawControl(QStyle.CE_ItemViewItem, opt, painter, opt.widget)
+        doc = self._document(option, index)
+        painter.save()
+        painter.translate(option.rect.left() + 6, option.rect.top() + (option.rect.height() - doc.size().height()) / 2)
+        doc.drawContents(painter)
+        painter.restore()
+
+
 def planifier_envoi(lignes: list, correspondance: dict) -> list:
     """lignes : [{"id_executant","nom_executant","nom_local","garder_nom","coche","modifie_ts"}].
     Retourne (meme ordre) [{"cle","nom_archive","slug","erreur","ignore","avertissement","partira"}].
     - seules les lignes cochees sont planifiees ;
-    - meme profil (meme nom local) sur plusieurs sAutoniax : seule la copie
-      modifiee le plus recemment est envoyee, les autres sont ignorees (avertissement) ;
+    - PATCH : un meme nom de profil sur plusieurs sAutoniax = des profils DIFFERENTS (machines differentes) : chacun
+      est planifie, avec sa propre entree de correspondance 'sAutoniax-N/nom' (plus de « copie la plus recente ») ;
     - puis resolution des noms : absents du JSON, doublons d'email, collisions."""
     sortie = [{"cle": (l.get("id_executant"), l.get("nom_local")), "nom_archive": "", "slug": "",
                "erreur": None, "ignore": False, "avertissement": None, "partira": False} for l in lignes]
-    groupes: dict = {}
-    for i, l in enumerate(lignes):
-        if l.get("coche"):
-            groupes.setdefault(l.get("nom_local"), []).append(i)
-    gagnants: list = []
-    for nom_local, indices in groupes.items():
-        gagnant = max(indices, key=lambda i: (float(lignes[i].get("modifie_ts") or 0), -i))
-        gagnants.append(gagnant)
-        if len(indices) > 1:
-            sortie[gagnant]["avertissement"] = (
-                f"Present sur {len(indices)} sAutoniax : seule la copie la plus recente est envoyee.")
-            for i in indices:
-                if i != gagnant:
-                    sortie[i]["ignore"] = True
-                    sortie[i]["avertissement"] = (
-                        f"Copie plus ancienne ignoree (la plus recente est sur {lignes[gagnant].get('nom_executant')}).")
-    gagnants.sort()
+    retenus = [i for i, l in enumerate(lignes) if l.get("coche")]
     resolus = resoudre_noms_archive(
-        [{"nom_local": lignes[i]["nom_local"], "garder_nom": lignes[i].get("garder_nom", False)} for i in gagnants],
+        [{"nom_local": lignes[i]["nom_local"], "nom_executant": lignes[i].get("nom_executant", ""),
+          "garder_nom": lignes[i].get("garder_nom", False)} for i in retenus],
         correspondance)
-    for i, r in zip(gagnants, resolus):
+    for i, r in zip(retenus, resolus):
         sortie[i]["nom_archive"] = r["nom_archive"]
         sortie[i]["slug"] = r["slug"]
         sortie[i]["erreur"] = r["erreur"]
@@ -31901,6 +32390,7 @@ class ProfilsKaggleScreen(QWidget):
         self._etat_cases: dict = {}              # (id, nom) -> (coche, garder) conserve entre reconstructions
         self._datasets: list = []
         self._tri_datasets = "maj"
+        self._tri_recent_d_abord = True  # sens du tri par date (bouton sous les tags)
         self._operation_id: Optional[str] = None
         self._deja_affiche = False
         self._maj_en_cours = False
@@ -31911,6 +32401,7 @@ class ProfilsKaggleScreen(QWidget):
         self._supprimer_operation = False
         self._lignes_courantes_cache: list = []
         self._arbre_perime = False
+        self._derniere_demande_profils = 0.0     # monotonic : derniere actualisation auto a l'affichage de l'onglet
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -31936,6 +32427,15 @@ class ProfilsKaggleScreen(QWidget):
         self.bouton_vider.setCursor(Qt.PointingHandCursor)
         self.bouton_vider.clicked.connect(self._sur_clic_vider)
         haut.addWidget(self.bouton_vider)
+        self.bouton_reinit = QPushButton(" Réinit.", self)
+        self.bouton_reinit.setIcon(qta.icon("mdi6.restore", color=Mocha.text))
+        self.bouton_reinit.setCursor(Qt.PointingHandCursor)
+        self.bouton_reinit.setToolTip(
+            "Réinitialise toutes les entrées de la correspondance (e-mail, sites, case) des profils qui N'EXISTENT PAS\n"
+            "sur Kaggle (utile après avoir régénéré de nouveaux profils sur les sAutoniax).\n"
+            "Les entrées dont le dataset existe déjà sur Kaggle sont conservées.")
+        self.bouton_reinit.clicked.connect(self._sur_clic_reinit)
+        haut.addWidget(self.bouton_reinit)
         self.label_correspondance = QLabel("", self)
         self.label_correspondance.setObjectName("ReglagesLabel")
         haut.addWidget(self.label_correspondance, stretch=1)
@@ -32028,7 +32528,18 @@ class ProfilsKaggleScreen(QWidget):
         self.bouton_copier_logs.setCursor(Qt.PointingHandCursor)
         self.bouton_copier_logs.setToolTip("Copie tout le journal (horodaté) dans le presse-papiers.")
         self.bouton_copier_logs.clicked.connect(self._sur_clic_copier_logs)
-        ligne_journal.addWidget(self.bouton_copier_logs, alignment=Qt.AlignTop)
+        # Colonne de boutons du journal : "Copier les logs" puis, juste en dessous, "Effacer les logs".
+        colonne_boutons_journal = QVBoxLayout()
+        colonne_boutons_journal.setSpacing(6)
+        colonne_boutons_journal.addWidget(self.bouton_copier_logs)
+        self.bouton_effacer_logs = QPushButton(" Effacer les logs", colonne_gauche)
+        self.bouton_effacer_logs.setIcon(qta.icon("mdi6.delete-outline", color=Mocha.text))
+        self.bouton_effacer_logs.setCursor(Qt.PointingHandCursor)
+        self.bouton_effacer_logs.setToolTip("Vide le journal affiche (n'efface rien sur Kaggle ni sur les sAutoniax).")
+        self.bouton_effacer_logs.clicked.connect(self._sur_clic_effacer_logs)
+        colonne_boutons_journal.addWidget(self.bouton_effacer_logs)
+        colonne_boutons_journal.addStretch(1)
+        ligne_journal.addLayout(colonne_boutons_journal)
         layout_g.addLayout(ligne_journal, stretch=1)
 
         # ===== Colonne droite : Telecharger depuis Kaggle (uniquement) =====
@@ -32059,8 +32570,11 @@ class ProfilsKaggleScreen(QWidget):
         self.table_datasets.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)  # pas de barre horizontale (defilement : molette / Maj+molette)
         self.table_datasets.setRootIsDecorated(False)
         self.table_datasets.setUniformRowHeights(True)
-        self.table_datasets.setHeaderLabels(["Nom d'archive", "Taille", "Cree le", "Mis a jour le", "Sites"])
+        self.table_datasets.setHeaderLabels(["Nom d'archive", "Taille", "Date", "Sites"])
         self.table_datasets.setColumnWidth(0, 210)
+        self.table_datasets.setColumnWidth(2, 200)
+        self._delegue_date = DelegueDateKaggle(self.table_datasets)
+        self.table_datasets.setItemDelegateForColumn(2, self._delegue_date)
         self.table_datasets.header().setStretchLastSection(True)
         self.table_datasets.header().setSectionsClickable(True)
         self.table_datasets.header().sectionClicked.connect(self._sur_clic_entete_datasets)
@@ -32104,6 +32618,27 @@ class ProfilsKaggleScreen(QWidget):
         self.liste_tags.itemSelectionChanged.connect(self._sur_selection_tags)
         layout_d.addWidget(self.liste_tags)
 
+        ligne_tri_suppr = QHBoxLayout()
+        # Tri par date : un seul bouton qui bascule le sens (applique a la liste affichee, filtres inclus).
+        self.bouton_tri_date = QPushButton("", colonne_droite)
+        self.bouton_tri_date.setCursor(Qt.PointingHandCursor)
+        self.bouton_tri_date.setToolTip("Inverse l'ordre de la liste affichée (filtres par tags pris en compte).")
+        self.bouton_tri_date.clicked.connect(self._sur_clic_tri_date)
+        ligne_tri_suppr.addWidget(self.bouton_tri_date)
+
+        # Suppression sur Kaggle des profils COCHES (visibles apres filtre), avec confirmation.
+        self.bouton_supprimer_coches = QPushButton(" Delete", colonne_droite)
+        self.bouton_supprimer_coches.setIcon(qta.icon("mdi6.delete-outline", color=Mocha.red))
+        self.bouton_supprimer_coches.setCursor(Qt.PointingHandCursor)
+        self.bouton_supprimer_coches.setEnabled(False)
+        self.bouton_supprimer_coches.setToolTip("Supprime DEFINITIVEMENT de Kaggle les profils cochés dans la liste "
+                                                "(seuls ceux visibles après le filtre par tags). Une confirmation est demandée.")
+        self.bouton_supprimer_coches.clicked.connect(self._sur_clic_supprimer_coches)
+        ligne_tri_suppr.addWidget(self.bouton_supprimer_coches)
+        ligne_tri_suppr.addStretch(1)
+        layout_d.addLayout(ligne_tri_suppr)
+        self._rafraichir_libelle_tri()
+
         # Selection automatique : "Selectionner les candidats" + nombre d'elements (premiers du resultat filtre).
         ligne_auto = QHBoxLayout()
         self.bouton_selection_auto = QPushButton(" Selectionner les candidats", colonne_droite)
@@ -32118,6 +32653,19 @@ class ProfilsKaggleScreen(QWidget):
         self.spin_nb_candidats.setValue(10)
         self.spin_nb_candidats.setFixedWidth(90)
         ligne_auto.addWidget(self.spin_nb_candidats)
+        # Deselection automatique : "Deselectionner" + SON PROPRE nombre (independant de celui de la selection).
+        self.bouton_deselection_auto = QPushButton(" Deselectionner", colonne_droite)
+        self.bouton_deselection_auto.setIcon(qta.icon("mdi6.checkbox-multiple-blank-outline", color=Mocha.text))
+        self.bouton_deselection_auto.setCursor(Qt.PointingHandCursor)
+        self.bouton_deselection_auto.setToolTip("Decoche les N premiers profils COCHES du resultat filtre (ordre d'affichage).\n"
+                                                "S'il y en a moins de N, ils sont tous decoches.")
+        self.bouton_deselection_auto.clicked.connect(self._sur_clic_deselection_auto)
+        ligne_auto.addWidget(self.bouton_deselection_auto)
+        self.spin_nb_deselection = QSpinBox(colonne_droite)
+        self.spin_nb_deselection.setRange(1, 99999)
+        self.spin_nb_deselection.setValue(10)
+        self.spin_nb_deselection.setFixedWidth(90)
+        ligne_auto.addWidget(self.spin_nb_deselection)
         ligne_auto.addStretch(1)
         layout_d.addLayout(ligne_auto)
 
@@ -32177,27 +32725,56 @@ class ProfilsKaggleScreen(QWidget):
                                 f"{e}\n\nLa correspondance precedente est conservee.")
             return
         self.ajouter_journal(f"Correspondance importee : {len(correspondance)} entree(s).")
+        self._appliquer_coches_json(coches_depuis_texte(texte))
         self._rafraichir_resume_correspondance()
         self._recalculer_noms()
         if avertissements:
             QMessageBox.information(self, "Correspondance Kaggle", "Importee avec avertissement(s) :\n\n" + "\n".join(avertissements[:15]))
 
+    def _appliquer_coches_json(self, coches: dict):
+        """PATCH : le champ \"coche\" du JSON importe coche/decoche la case de chaque profil correspondant
+        (cle 'sAutoniax-N/nom'). Un profil absent de l'arbre ou sans champ \"coche\" n'est pas touche."""
+        if not coches:
+            return
+        if self._operation_id is not None:
+            self.ajouter_journal("Cases non modifiees : une operation est en cours.")
+            return
+        par_cle = {cle_correspondance(self._sautoniax.get(i, i), nom): it for (i, nom), it in self._items.items()}
+        nb_coches = nb_decoches = 0
+        self._maj_en_cours = True
+        try:
+            for cle, coche in coches.items():
+                it = par_cle.get(cle)
+                if it is None:
+                    continue
+                voulu = Qt.Checked if coche else Qt.Unchecked
+                if it.checkState(self.COL_PROFIL) != voulu:
+                    it.setCheckState(self.COL_PROFIL, voulu)
+                    if coche:
+                        nb_coches += 1
+                    else:
+                        nb_decoches += 1
+        finally:
+            self._maj_en_cours = False
+        self.ajouter_journal(f"Cases mises a jour depuis le JSON : {nb_coches} cochee(s), {nb_decoches} decochee(s).")
+
     def _sur_clic_copier_ia(self):
-        # PATCH (demande utilisateur) : seuls les profils COCHES vont dans le prompt (les decoches n'y figurent jamais).
-        noms = sorted({nom for (_i, nom), it in self._items.items() if it.checkState(self.COL_PROFIL) == Qt.Checked})
-        if not noms:
+        # PATCH (demande utilisateur) : seuls les profils COCHES vont dans le prompt, UNE entree par profil ET par
+        # sAutoniax (cle 'sAutoniax-N/nom') : un meme nom sur plusieurs machines = profils differents.
+        cles = sorted({cle_correspondance(self._sautoniax.get(_i, _i), nom)
+                       for (_i, nom), it in self._items.items() if it.checkState(self.COL_PROFIL) == Qt.Checked})
+        if not cles:
             self.ajouter_journal("Rien à copier : aucun profil coché dans « Envoyer vers Kaggle ».")
             return
         if self._operation_id is None:
             self._recalculer_noms()
         correspondance, sites_enreg, perimes = self._corr_effective, self._sites_effectifs, self._noms_perimes
-        if perimes & set(noms):
+        if perimes & set(cles):
             self.ajouter_journal("Email enregistre deja utilise par une archive existante -> propose vide pour : "
-                                 + ", ".join(sorted(perimes & set(noms))))
-        texte = construire_texte_correspondance_ia(
-            noms, correspondance, sites_enreg)
+                                 + ", ".join(sorted(perimes & set(cles))))
+        texte = construire_texte_correspondance_ia(cles, correspondance, sites_enreg)
         QGuiApplication.clipboard().setText(texte)
-        nb_entrees = len(json.loads(texte[len(PROMPT_CORRESPONDANCE_IA):]))
+        nb_entrees = len(json.loads(texte[texte.rindex(MARQUEUR_JSON_CORRESPONDANCE_IA) + len(MARQUEUR_JSON_CORRESPONDANCE_IA):]))
         self.ajouter_journal(f"Prompt + JSON copiés dans le presse-papiers ({nb_entrees} entrée(s)).")
 
     def texte_journal(self) -> str:
@@ -32210,6 +32787,43 @@ class ProfilsKaggleScreen(QWidget):
             return
         QGuiApplication.clipboard().setText(texte)
         self.ajouter_journal(f"Logs copiés dans le presse-papiers ({self.journal.count()} ligne(s)).")
+
+    def _sur_clic_effacer_logs(self):
+        """Vide le journal affiche (liste uniquement ; aucun effet sur Kaggle ni sur les sAutoniax)."""
+        nb = self.journal.count()
+        self.journal.clear()
+        self.ajouter_journal(f"Journal efface ({nb} ligne(s)).")
+
+    def _sur_clic_reinit(self):
+        """Retire de la correspondance (noms + sites) toute entree dont l'archive n'existe PAS sur Kaggle ; garde celles
+        dont le dataset existe deja. Les profils concernes repartent de zero (email vide)."""
+        if self._operation_id is not None:
+            self.ajouter_journal("Reinitialisation impossible : une operation est en cours.")
+            return
+        if not self._datasets:
+            self.ajouter_journal("Reinitialisation annulee : la liste des datasets Kaggle n'est pas chargee "
+                                 "(rien n'a ete retire).")
+            return
+        r = self._reglages_courants()
+        slugs_kaggle = {d.get("slug") for d in self._datasets}
+        corr = r.kaggle_correspondance_noms or {}
+        sites = getattr(r, "kaggle_correspondance_sites", None)
+        retirer = [k for k, v in corr.items() if slug_depuis_nom(str(v or "").strip()) not in slugs_kaggle]
+        for k in retirer:
+            corr.pop(k, None)
+        if isinstance(sites, dict):
+            for k in [k for k in sites if k not in corr]:
+                sites.pop(k, None)
+        if retirer:
+            try:
+                r.save()
+            except Exception as e:
+                self.ajouter_journal(f"Correspondance : enregistrement impossible ({e}).")
+                return
+        self.ajouter_journal(f"Correspondance reinitialisee : {len(retirer)} entree(s) retiree(s) "
+                             f"(profils absents de Kaggle), {len(corr)} conservee(s).")
+        self._rafraichir_resume_correspondance()
+        self._recalculer_noms()
 
     def _sur_clic_vider(self):
         vider_correspondance(self._reglages_courants())
@@ -32252,13 +32866,47 @@ class ProfilsKaggleScreen(QWidget):
         self._reconstruire_arbre()
         self.ajouter_journal(f"{self._sautoniax.get(id_executant, id_executant)} : {len(profils or [])} profil(s).")
 
+    def oublier_profils(self, ids, raison: str = ""):
+        """FIX profils fantomes : jette la liste en cache de ces sAutoniax (affichee 'profils non charges' jusqu'a la
+        prochaine reponse) ainsi que les cases cochees / 'Garder le nom' memorisees pour leurs profils. Une liste dont
+        on ne peut plus garantir qu'elle est a jour (sAutoniax redemarre, pas de reponse) ne reste jamais affichee."""
+        change = False
+        for i in list(ids or []):
+            if self._profils_par_sautoniax.pop(i, None) is not None:
+                change = True
+                self.ajouter_journal(f"{self._sautoniax.get(i, i)} : liste des profils jetee ({raison or 'perimee'}).")
+            for cle in [k for k in self._etat_cases if k[0] == i]:
+                del self._etat_cases[cle]
+        if change:
+            self._reconstruire_arbre()
+
+    def reconcilier_profils(self, id_executant: str, noms) -> bool:
+        """FIX profils fantomes : compare la liste en cache aux noms REELS (liste de l'onglet Instances, meme dossier
+        sautoniax_profils). Retire tout de suite les profils disparus ; retourne True si la liste differe (le
+        controleur redemande alors la liste complete, ce qui corrige aussi un retrait fait sur une liste plus ancienne)."""
+        profils = self._profils_par_sautoniax.get(id_executant)
+        if profils is None or id_executant not in self._sautoniax:
+            return False
+        reels = {str(n) for n in noms}
+        presents = {str(p.get("nom", "")) for p in profils}
+        disparus = presents - reels
+        apparus = reels - presents
+        if disparus:
+            self._profils_par_sautoniax[id_executant] = [p for p in profils if str(p.get("nom", "")) not in disparus]
+            for nom in disparus:
+                self._etat_cases.pop((id_executant, nom), None)
+            self.ajouter_journal(f"{self._sautoniax.get(id_executant, id_executant)} : profil(s) disparu(s) retire(s) de la liste : "
+                                 + ", ".join(sorted(disparus)))
+            self._reconstruire_arbre()
+        return bool(disparus or apparus)
+
     def _purger_correspondance(self, noms: set):
         """Retire (et enregistre) l'email / les sites de profils deja envoyes puis supprimes du sAutoniax :
-        un profil neuf du meme nom (ex. iaX1) repart de zero, il n'herite jamais de l'email d'un autre compte."""
+        un profil neuf du meme nom (ex. iaX1) repart de zero (cle = 'sAutoniax-N/nom' : les autres machines ne sont pas touchees), il n'herite jamais de l'email d'un autre compte."""
         r = self._reglages_courants()
         sites = getattr(r, "kaggle_correspondance_sites", None)
         retires = []
-        for n in noms:
+        for n in noms:  # n = cle 'sAutoniax-N/nom' (voir cle_correspondance)
             a_retire = r.kaggle_correspondance_noms.pop(n, None) is not None
             if isinstance(sites, dict):
                 a_retire = (sites.pop(n, None) is not None) or a_retire
@@ -32315,6 +32963,11 @@ class ProfilsKaggleScreen(QWidget):
             for (i, nom), it in self._items.items():
                 self._etat_cases[(i, nom)] = (it.checkState(self.COL_PROFIL) == Qt.Checked,
                                               it.checkState(self.COL_GARDER) == Qt.Checked)
+            # FIX : un profil disparu (envoye puis supprime, renomme...) ne laisse plus ses cases memorisees, sinon un
+            # profil NEUF du meme nom (ex. iaX1) heritait de l'ancien 'Garder le nom' / de l'ancienne selection.
+            reels = {(i, str(p.get("nom", ""))) for i, ps in self._profils_par_sautoniax.items() for p in ps}
+            self._etat_cases = {k: v for k, v in self._etat_cases.items()
+                                if k in reels or self._profils_par_sautoniax.get(k[0]) is None}
             self.arbre_envoi.clear()
             self._items.clear()
             self._items_sautoniax.clear()
@@ -32353,6 +33006,7 @@ class ProfilsKaggleScreen(QWidget):
         lignes = []
         for (i, nom), it in self._items.items():
             lignes.append({"id_executant": i, "nom_executant": self._sautoniax.get(i, i), "nom_local": nom,
+                           "cle_corr": cle_correspondance(self._sautoniax.get(i, i), nom),
                            "garder_nom": it.checkState(self.COL_GARDER) == Qt.Checked,
                            "coche": it.checkState(self.COL_PROFIL) == Qt.Checked,
                            "modifie_ts": it.data(self.COL_PROFIL, Qt.UserRole) or 0})
@@ -32379,18 +33033,23 @@ class ProfilsKaggleScreen(QWidget):
             elif it.checkState(self.COL_GARDER) == Qt.Checked:
                 slugs_pris.add(slug_depuis_nom(_n))
         slugs_pris.discard("")
-        origines = {nom: (self._items[(i, nom)].data(self.COL_GARDER, Qt.UserRole) if (i, nom) in self._items else "")
-                    for i, nom in {(l["id_executant"], l["nom_local"]) for l in lignes}}
+        origines = {l["cle_corr"]: (self._items[(l["id_executant"], l["nom_local"])].data(self.COL_GARDER, Qt.UserRole)
+                                    if (l["id_executant"], l["nom_local"]) in self._items else "") for l in lignes}
         perimes = set()
+        a_retirer = set()  # entrees (cle composite OU ancien format) a ignorer
         for l in lignes:
-            nom = l["nom_local"]
-            if l["garder_nom"] or origines.get(nom) or nom not in corr:
+            cle, nom = l["cle_corr"], l["nom_local"]
+            if l["garder_nom"] or origines.get(cle):
                 continue
-            if slug_depuis_nom(str(corr[nom] or "").strip()) in slugs_pris:
-                perimes.add(nom)
-        if perimes:
-            corr = {k: v for k, v in corr.items() if k not in perimes}
-            sites = {k: v for k, v in sites.items() if k not in perimes}
+            ref = cle if cle in corr else (nom if nom in corr else None)  # repli : ancien format (nom seul)
+            if ref is None:
+                continue
+            if slug_depuis_nom(str(corr[ref] or "").strip()) in slugs_pris:
+                perimes.add(cle)
+                a_retirer.add(ref)
+        if a_retirer:
+            corr = {k: v for k, v in corr.items() if k not in a_retirer}
+            sites = {k: v for k, v in sites.items() if k not in a_retirer}
         return corr, sites, perimes
 
     def _recalculer_noms(self):
@@ -32415,7 +33074,7 @@ class ProfilsKaggleScreen(QWidget):
                     couleur = Mocha.overlay1
                 elif plan["erreur"]:
                     etat, archive, infobulle = "erreur de nommage", plan["nom_archive"], plan["erreur"]
-                    if ligne["nom_local"] in self._noms_perimes:
+                    if ligne["cle_corr"] in self._noms_perimes:
                         etat, infobulle = "correspondance a refaire", (
                             "L'email enregistre pour ce nom est deja utilise par une archive existante (autre compte) : "
                             "il est ignore. Utilise « Copier pour IA » puis « Importer la correspondance ».")
@@ -32436,7 +33095,7 @@ class ProfilsKaggleScreen(QWidget):
                 it.setText(self.COL_ETAT, etat)
                 it.setText(self.COL_PROG, "")
                 # tags : ceux du JSON de l'IA s'ils existent (ce sont eux qui partiront), sinon ceux du profil
-                tags = sites_corr.get(ligne["nom_local"])
+                tags = chercher_correspondance(sites_corr, ligne["nom_executant"], ligne["nom_local"])
                 if tags is None:
                     tags = it.data(self.COL_SITES, Qt.UserRole) or []
                 it.setText(self.COL_SITES, ", ".join(tags))
@@ -32489,9 +33148,11 @@ class ProfilsKaggleScreen(QWidget):
                 continue
             entree = {"id_executant": ligne["id_executant"], "nom_executant": ligne["nom_executant"],
                       "nom_local": ligne["nom_local"], "nom_archive": p["nom_archive"], "slug": p["slug"],
-                      "email": corr.get(ligne["nom_local"], ""), "modifie_ts": ligne["modifie_ts"]}
-            if ligne["nom_local"] in sites_corr:  # absent = ancien format : les tags du profil ne sont pas touches
-                entree["sites"] = list(sites_corr[ligne["nom_local"]])
+                      "email": chercher_correspondance(corr, ligne["nom_executant"], ligne["nom_local"], ""),
+                      "modifie_ts": ligne["modifie_ts"]}
+            tags_corr = chercher_correspondance(sites_corr, ligne["nom_executant"], ligne["nom_local"])
+            if tags_corr is not None:  # absent = ancien format : les tags du profil ne sont pas touches
+                entree["sites"] = list(tags_corr)
             profils.append(entree)
         self._operation_id = uuid.uuid4().hex[:12]
         self._supprimer_operation = bool(supprimer)
@@ -32529,7 +33190,7 @@ class ProfilsKaggleScreen(QWidget):
             self._maj_en_cours = True
             it.setText(self.COL_ETAT, "envoye" if ok else "ERREUR")
             if ok and self._supprimer_operation:
-                self._purger_correspondance({nom_local})
+                self._purger_correspondance({cle_correspondance(self._sautoniax.get(id_executant, id_executant), nom_local)})
             if ok:
                 it.setText(self.COL_PROG, "100 %")
             for col in range(8):
@@ -32542,24 +33203,43 @@ class ProfilsKaggleScreen(QWidget):
     # Bloc B : datasets
     # ------------------------------------------------------------------
     def _rafraichir_libelle_tri(self):
-        self.label_tri.setText("Tri : " + ("creation" if self._tri_datasets == "cree" else "mise a jour")
-                               + ", du plus recent au plus ancien (clic sur un en-tete Cree le / Mis a jour le).")
+        if self._tri_recent_d_abord:
+            self.bouton_tri_date.setText(" Date : du plus récent au plus ancien")
+            self.bouton_tri_date.setIcon(qta.icon("mdi6.sort-calendar-descending", color=Mocha.text))
+        else:
+            self.bouton_tri_date.setText(" Date : du plus ancien au plus récent")
+            self.bouton_tri_date.setIcon(qta.icon("mdi6.sort-calendar-ascending", color=Mocha.text))
+        self.label_tri.setText("Tri : date de mise à jour (ou de création si jamais mis à jour), "
+                               + ("du plus récent au plus ancien." if self._tri_recent_d_abord
+                                  else "du plus ancien au plus récent.")
+                               + " Clic sur l'en-tête « Date » ou sur le bouton sous les tags pour inverser.")
+
+    def _sur_clic_tri_date(self):
+        self._tri_recent_d_abord = not self._tri_recent_d_abord
+        self._rafraichir_libelle_tri()
+        self._reconstruire_table_datasets()
 
     def _sur_clic_entete_datasets(self, section: int):
-        if section in (2, 3):
-            self._tri_datasets = "cree" if section == 2 else "maj"
-            self._rafraichir_libelle_tri()
-            self._reconstruire_table_datasets()
+        if section == 2:
+            self._sur_clic_tri_date()
 
     def _reconstruire_table_datasets(self):
         coches = {self.table_datasets.topLevelItem(r).data(0, Qt.UserRole): self.table_datasets.topLevelItem(r).checkState(0)
                   for r in range(self.table_datasets.topLevelItemCount())}
         self.table_datasets.blockSignals(True)
         self.table_datasets.clear()
-        for d in trier_datasets(self._datasets, self._tri_datasets):
+        for d in trier_datasets_par_date(self._datasets, self._tri_recent_d_abord):
+            horodatage = formater_horodatage(date_dataset(d))  # 'AAAA-MM-JJ HH:MM'
+            jour, _, heure = horodatage.partition(" ")
             it = QTreeWidgetItem([d.get("nom_archive", ""), formater_taille_octets(d.get("taille_octets")),
-                                  formater_horodatage(d.get("cree_le")), formater_horodatage(d.get("maj_le")),
-                                  ", ".join(d.get("sites") or [])])
+                                  "", ", ".join(d.get("sites") or [])])
+            it.setData(2, DelegueDateKaggle.ROLE_JOUR, jour)
+            it.setData(2, DelegueDateKaggle.ROLE_HEURE, heure)
+            try:
+                it.setData(2, DelegueDateKaggle.ROLE_PARITE, _kg_datetime.strptime(jour, "%Y-%m-%d").toordinal())
+            except ValueError:
+                it.setData(2, DelegueDateKaggle.ROLE_PARITE, 0)
+            it.setToolTip(2, horodatage)
             it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
             it.setCheckState(0, coches.get(d["slug"], Qt.Unchecked))
             it.setData(0, Qt.UserRole, d["slug"])
@@ -32631,6 +33311,22 @@ class ProfilsKaggleScreen(QWidget):
         self.ajouter_journal(f"Selection automatique : {coches} profil(s) coche(s) (demande : {n}).")
         self._rafraichir_boutons()
 
+    def _sur_clic_deselection_auto(self):
+        """Decoche les N premiers profils COCHES du resultat filtre (ordre d'affichage). Les autres ne changent pas."""
+        n = int(self.spin_nb_deselection.value())
+        self.table_datasets.blockSignals(True)
+        restant = n
+        decoches = 0
+        for r in range(self.table_datasets.topLevelItemCount()):
+            it = self.table_datasets.topLevelItem(r)
+            if restant > 0 and not it.isHidden() and it.checkState(0) == Qt.Checked:
+                it.setCheckState(0, Qt.Unchecked)
+                restant -= 1
+                decoches += 1
+        self.table_datasets.blockSignals(False)
+        self.ajouter_journal(f"Deselection automatique : {decoches} profil(s) decoche(s) (demande : {n}).")
+        self._rafraichir_boutons()
+
     def _afficher_menu_datasets(self, position):
         item = self.table_datasets.itemAt(position)
         if item is None:
@@ -32661,6 +33357,51 @@ class ProfilsKaggleScreen(QWidget):
         self._rafraichir_boutons()
         self.ajouter_journal(f"Suppression de {nom} sur Kaggle (operation {self._operation_id}).")
         self.demande_kaggle_supprimer.emit({"id_operation": self._operation_id, "slug": slug, "nom_archive": nom})
+
+    def _sur_clic_supprimer_coches(self):
+        if self._operation_id is not None:
+            return
+        coches = self._datasets_coches()
+        if not coches:
+            QMessageBox.information(self, "Supprimer de Kaggle", "Aucun profil coché (visible) à supprimer.")
+            return
+        taille = sum(int(d.get("taille_octets") or 0) for d in coches)
+        noms = [str(d.get("nom_archive") or d.get("slug")) for d in coches]
+        apercu = "\n".join(f"  • {n}" for n in noms[:15])
+        if len(noms) > 15:
+            apercu += f"\n  … (+{len(noms) - 15} autres)"
+        detail = (f"Supprimer définitivement {len(coches)} profil(s) de Kaggle ?\n\n{apercu}\n\n"
+                  f"Taille totale : {formater_taille_octets(taille)}\n\n"
+                  "Action IRRÉVERSIBLE : les datasets disparaissent de Kaggle.\n"
+                  "Les profils déjà présents sur les sAutoniax ne sont pas touchés.")
+        if QMessageBox.question(self, "Supprimer de Kaggle", detail,
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        self._operation_id = uuid.uuid4().hex[:12]
+        self._rafraichir_boutons()
+        self.ajouter_journal(f"Suppression de {len(coches)} profil(s) sur Kaggle (operation {self._operation_id}).")
+        self.demande_kaggle_supprimer.emit({
+            "id_operation": self._operation_id,
+            "lot": [{"slug": d["slug"], "nom_archive": d.get("nom_archive") or d["slug"]} for d in coches]})
+
+    def sur_resultat_suppression_lot(self, id_operation: str, resultats: list):
+        """resultats = [(slug, ok, message)] d'un lot de suppressions."""
+        if id_operation != self._operation_id:
+            return
+        echecs = []
+        for slug, ok, message in resultats:
+            if ok:
+                self.ajouter_journal(f"Suppression de {slug} : OK.")
+                self._datasets = [d for d in self._datasets if d.get("slug") != slug]
+            else:
+                self.ajouter_journal(f"Suppression de {slug} : ERREUR ({message})")
+                echecs.append(f"{slug} : {message}")
+        self._reconstruire_table_datasets()
+        nb_ok = len(resultats) - len(echecs)
+        self.ajouter_journal(f"Suppression terminee : {nb_ok} supprime(s), {len(echecs)} en erreur.")
+        if echecs:
+            QMessageBox.warning(self, "Supprimer de Kaggle",
+                                f"{len(echecs)} suppression(s) ont échoué :\n\n" + "\n".join(echecs[:15]))
 
     def sur_resultat_suppression(self, id_operation: str, slug: str, ok: bool, message: str):
         if id_operation != self._operation_id:
@@ -32756,6 +33497,8 @@ class ProfilsKaggleScreen(QWidget):
         self.bouton_envoyer.setEnabled(libre and any(p["partira"] for p in plan))
         self.bouton_telecharger.setEnabled(libre and bool(self._datasets_coches()) and bool(self._cibles_cochees()))
         self.bouton_selection_auto.setEnabled(libre and self.table_datasets.topLevelItemCount() > 0)
+        self.bouton_deselection_auto.setEnabled(libre and self.table_datasets.topLevelItemCount() > 0)
+        self.bouton_supprimer_coches.setEnabled(libre and bool(self._datasets_coches()))
 
     def _journaliser_resultat(self, id_executant: str, nom_local: str, ok: bool, message: str):
         """Resultat d'un transfert : 1re ligne = verdict, lignes suivantes = detail (fichiers, tailles, durees, avertissements)."""
@@ -32788,7 +33531,14 @@ class ProfilsKaggleScreen(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
-        self.demarrer_au_lancement()
+        if not self._deja_affiche:
+            self.demarrer_au_lancement()
+            return
+        # FIX profils fantomes : a chaque retour sur l'onglet, on redemande les profils (scan de dossier, leger),
+        # au plus une fois toutes les 3 s, jamais pendant une operation.
+        if self._operation_id is None and self._sautoniax and time.monotonic() - self._derniere_demande_profils > 3.0:
+            self._derniere_demande_profils = time.monotonic()
+            self.demande_kaggle_actualiser_profils.emit(sorted(self._sautoniax))
 
 
 class ControleurKaggle(QObject):
@@ -32801,6 +33551,7 @@ class ControleurKaggle(QObject):
     _connexion_prete = Signal(bool, str, object)
     _datasets_prets = Signal(object)
     _suppression_prete = Signal(str, str, bool, str)
+    _suppression_lot_prete = Signal(str, object)
 
     def __init__(self, client_serveur_t, ecran, fabrique_gestionnaire=None, parent=None):
         super().__init__(parent)
@@ -32812,9 +33563,12 @@ class ControleurKaggle(QObject):
         self._type_operation = "envoi"
         self._supprimer_local = False
         self._thread_liste: Optional[threading.Thread] = None
+        self._attente_profils: dict = {}   # id_executant -> monotonic de la demande de liste restee sans reponse
+        self._connecte_le: dict = {}       # id_executant -> horodatage de connexion (change = sAutoniax redemarre)
         self._connexion_prete.connect(self._sur_connexion_prete)
         self._datasets_prets.connect(self._sur_datasets_prets)
         self._suppression_prete.connect(self._sur_suppression_prete)
+        self._suppression_lot_prete.connect(self._sur_suppression_lot_prete)
         self._minuteur = QTimer(self)
         self._minuteur.setInterval(1000)
         self._minuteur.timeout.connect(self._sur_minuteur)
@@ -32833,6 +33587,20 @@ class ControleurKaggle(QObject):
         client_serveur_t.kaggle_ack_recu.connect(self._sur_ack)
         client_serveur_t.kill_profil_resultat.connect(self._sur_ack_arret)
         client_serveur_t.kill_profil_resultat_reel_recu.connect(self._sur_kill_reel)
+        # FIX profils fantomes : tout changement de profils d'un sAutoniax redemande sa liste (avant, la liste
+        # n'etait rafraichie qu'au clic sur "Actualiser" ou en fin d'operation Kaggle).
+        for nom_signal in ("creer_profil_sautoniax_resultat_recu", "supprimer_profil_sautoniax_resultat_recu",
+                           "dupliquer_profil_sautoniax_resultat_recu", "telecharger_profil_vers_sautoniax_resultat_recu"):
+            sig = getattr(client_serveur_t, nom_signal, None)
+            if sig is not None:
+                sig.connect(self._sur_changement_profils)
+        sig = getattr(client_serveur_t, "renommer_profil_sautoniax_resultat_recu", None)
+        if sig is not None:
+            sig.connect(lambda ok, id_executant, *_: self._sur_changement_profils(id_executant))
+        # liste REELLE des profils (onglet Instances) : sert a retirer sur-le-champ les profils disparus.
+        sig = getattr(client_serveur_t, "profils_sautoniax_recu", None)
+        if sig is not None:
+            sig.connect(self._sur_liste_instances)
 
     # -- connexion Kaggle, quota, datasets (thread) ------------------------
     def verifier_connexion(self):
@@ -32857,6 +33625,20 @@ class ControleurKaggle(QObject):
 
     def supprimer_dataset(self, charge: dict):
         id_operation = charge.get("id_operation", "")
+        if charge.get("lot"):
+            slugs = [str(x.get("slug", "")) for x in charge["lot"]]
+
+            def travail_lot():
+                resultats = []
+                for sl in slugs:
+                    try:
+                        self._fabrique().supprimer_dataset(sl)
+                        resultats.append((sl, True, ""))
+                    except Exception as e:
+                        resultats.append((sl, False, str(e)))
+                self._suppression_lot_prete.emit(id_operation, resultats)
+            threading.Thread(target=travail_lot, name="kaggle-suppression-lot", daemon=True).start()
+            return
         slug = str(charge.get("slug", ""))
 
         def travail():
@@ -32866,6 +33648,10 @@ class ControleurKaggle(QObject):
             except Exception as e:
                 self._suppression_prete.emit(id_operation, slug, False, str(e))
         threading.Thread(target=travail, name="kaggle-suppression", daemon=True).start()
+
+    def _sur_suppression_lot_prete(self, id_operation, resultats):
+        self._ecran.sur_resultat_suppression_lot(id_operation, list(resultats or []))
+        self._ecran.terminer_operation(id_operation)
 
     def _sur_suppression_prete(self, id_operation, slug, ok, message):
         self._ecran.sur_resultat_suppression(id_operation, slug, bool(ok), message or "")
@@ -32880,9 +33666,41 @@ class ControleurKaggle(QObject):
     # -- liste des profils d'un sAutoniax ----------------------------------
     def actualiser_profils(self, ids_executants):
         for id_executant in ids_executants:
+            self._attente_profils.setdefault(id_executant, time.monotonic())
             self._client.envoyer_ordre_kaggle("kaggle_lister_profils", id_executant, uuid.uuid4().hex[:12])
 
+    def _sur_changement_profils(self, id_executant, *_):
+        """Un profil a ete cree / supprime / duplique / renomme / telecharge sur ce sAutoniax : liste a refaire."""
+        if id_executant:
+            self.actualiser_profils([id_executant])
+
+    def _sur_liste_instances(self, id_executant, profils):
+        if self._ecran.operation_en_cours():
+            return
+        noms = {str(p.get("nom")) for p in (profils or []) if isinstance(p, dict) and p.get("nom")}
+        if self._ecran.reconcilier_profils(id_executant, noms):
+            self.actualiser_profils([id_executant])
+
+    def sur_detail_executants(self, executants):
+        """FIX profils fantomes : un sAutoniax qui redemarre garde le meme id mais change d'horodatage de connexion
+        ('connecte_le'). Sa liste en cache date alors de l'ancienne session : on la jette et on la redemande."""
+        presents = set()
+        for e in executants or []:
+            i = e.get("id", "") if isinstance(e, dict) else ""
+            if not i:
+                continue
+            presents.add(i)
+            cle = e.get("connecte_le")
+            if i in self._connecte_le and self._connecte_le[i] != cle:
+                self._ecran.oublier_profils([i], "sAutoniax reconnecte")
+                self.actualiser_profils([i])
+            self._connecte_le[i] = cle
+        for i in [k for k in self._connecte_le if k not in presents]:
+            del self._connecte_le[i]
+            self._attente_profils.pop(i, None)
+
     def _sur_profils_recus(self, id_executant, profils):
+        self._attente_profils.pop(id_executant, None)
         self._ecran.definir_profils_sautoniax(id_executant, profils)
         if self._flux is not None:
             self._flux.sur_liste(id_executant, profils)
@@ -32985,6 +33803,13 @@ class ControleurKaggle(QObject):
     def _sur_minuteur(self):
         if self._flux is not None:
             self._flux.verifier_delais()
+        # FIX profils fantomes : un sAutoniax qui ne repond pas a la demande de liste ne laisse plus son ancienne
+        # liste affichee comme si elle etait a jour.
+        if self._attente_profils:
+            maintenant = time.monotonic()
+            for i in [k for k, t in self._attente_profils.items() if maintenant - t > 20.0]:
+                del self._attente_profils[i]
+                self._ecran.oublier_profils([i], "pas de reponse du sAutoniax")
 
 
 class ProfilsScreen(QWidget):
@@ -66978,6 +67803,9 @@ class PanneauExecutionClone(QWidget):
         # Qt.UserRole (colonne 0, cf. _reconstruire_table_completement)
         # -- nécessaire car item.text(0) n'affiche que le nom NU.
         self._items: dict[str, "QTreeWidgetItem"] = {}
+        # PATCH verrouillage (demande utilisateur : clic droit sur un profil = le verrouiller/déverrouiller).
+        # Clés composites des profils VERROUILLÉS : ligne grisée, non cochable, non cliquable, boutons inactifs.
+        self._profils_verrouilles: set = set()
         # CLÉ COMPOSITE (cf. self._profils ci-dessus) -> statut au moment
         # où son widget d'actions (colonne 3 -- badge + boutons, cf.
         # _construire_widget_actions_profil) a été construit pour la
@@ -67521,9 +68349,9 @@ class PanneauExecutionClone(QWidget):
         # PATCH : force la sortie de logs des clones cochés qui tournent, sans les arrêter ni les relancer.
         self.bouton_forcer_sortie_clones = _creer_bouton_icone(
             "mdi6.text-box-check-outline",
-            "Forcer l'affichage de la sortie -- réactive la sortie de logs des clones COCHÉS actuellement en "
-            "exécution, sans les arrêter. Ce qui avait été retenu pendant la coupure est renvoyé à la ligne "
-            "suivante écrite par le clone.",
+            "Forcer l'affichage des logs -- réactive les logs du notebook de démarrage des clones COCHÉS "
+            "actuellement en exécution, sans les arrêter. La sortie des cellules n'est pas concernée "
+            "(elle est toujours envoyée).",
             couleur=Mocha.sapphire,
         )
         self.bouton_forcer_sortie_clones.setEnabled(False)  # actif si au moins un clone coché tourne
@@ -68093,6 +68921,7 @@ class PanneauExecutionClone(QWidget):
                         item, 3, self._construire_widget_statut_profil(cle_profil, etat_profil)
                     )
                     self._dernier_cache_widget_statut[cle_profil] = cle_cache_statut
+                self._appliquer_verrou_ligne(cle_profil, item)   # PATCH verrouillage
             except RuntimeError:
                 # AUTO-RÉPARATION -- cf. docstring ci-dessus.
                 self._reconstruire_table_completement()
@@ -68244,6 +69073,7 @@ class PanneauExecutionClone(QWidget):
             self._dernier_cache_widget_statut[cle_profil] = (
                 etat_profil.statut, etat_profil.result_color, est_actif,
             )
+            self._appliquer_verrou_ligne(cle_profil, item)   # PATCH verrouillage
         # BUGFIX -- connexion itemChanged posée une seule fois dans
         # __init__ (jamais ici) : la reposer à chaque reconstruction
         # empilerait les connexions sur le même widget persistant
@@ -68518,6 +69348,10 @@ class PanneauExecutionClone(QWidget):
         cle_profil = item.data(0, Qt.UserRole)
         etat_profil = self._profils.get(cle_profil)
         if etat_profil is None:
+            return
+        if cle_profil in self._profils_verrouilles and item.checkState(0) == Qt.Checked:
+            # PATCH verrouillage : « Tout sélectionner », sélection aléatoire, etc. passent par setCheckState : on annule.
+            item.setCheckState(0, Qt.Unchecked)   # relance ce handler avec Unchecked
             return
         etat_profil.coche = item.checkState(0) == Qt.Checked
         nb_coches = sum(1 for p in self._profils.values() if p.coche)
@@ -68815,6 +69649,8 @@ class PanneauExecutionClone(QWidget):
         cle_profil = item.data(0, Qt.UserRole)
         if not cle_profil:
             return
+        if cle_profil in self._profils_verrouilles:
+            return   # PATCH verrouillage : itemClicked est émis même sur un item désactivé
         # Bascule : recliquer la ligne déjà active désélectionne (section
         # 1 point 11) -- pas besoin d'item "Aucun" séparé.
         if cle_profil == self._profil_actif:
@@ -68836,13 +69672,75 @@ class PanneauExecutionClone(QWidget):
         par Qt via customContextMenuRequested -- même façon de résoudre
         l'item que les menus contextuels existants du fichier (cf.
         _afficher_menu_executants, self.table_executants.itemAt(position))."""
+        # PATCH (demande utilisateur : « clic droit = verrouiller/déverrouiller le profil, il devient gris, on ne
+        # peut ni le sélectionner ni le cocher »). Le clic droit n'émet PLUS demande_premier_plan_clone_profil, mais
+        # le signal, sa connexion et le handler côté TaskConfigScreen sont CONSERVÉS (API intacte, appelable ailleurs).
         item = self.table_profils.itemAt(position)
         if item is None:
             return
         cle_profil = item.data(0, Qt.UserRole)
         if not cle_profil:
             return
-        self.demande_premier_plan_clone_profil.emit(cle_profil)
+        self.basculer_verrou_profil(cle_profil)
+
+    def profil_verrouille(self, cle_profil: str) -> bool:
+        return cle_profil in self._profils_verrouilles
+
+    def basculer_verrou_profil(self, cle_profil: str) -> bool:
+        """Verrouille (ou déverrouille) un profil. Retourne True s'il est verrouillé après l'appel.
+        Verrouiller décoche aussi le profil : il ne sera pas pris dans « Lancer »."""
+        if cle_profil in self._profils_verrouilles:
+            self._profils_verrouilles.discard(cle_profil)
+            verrouille = False
+        else:
+            self._profils_verrouilles.add(cle_profil)
+            verrouille = True
+            if cle_profil == self._profil_actif:
+                self.demande_definir_profil_actif.emit("")   # le bouton Run de l'en-tête ne doit plus cibler ce profil
+            etat_profil = self._profils.get(cle_profil)
+            item = self._items.get(cle_profil)
+            if etat_profil is not None:
+                etat_profil.coche = False
+            if item is not None:
+                try:
+                    item.setCheckState(0, Qt.Unchecked)
+                except RuntimeError:
+                    pass
+        item = self._items.get(cle_profil)
+        if item is not None:
+            try:
+                self._appliquer_verrou_ligne(cle_profil, item)
+            except RuntimeError:
+                self._reconstruire_table_completement()
+        return verrouille
+
+    def _appliquer_verrou_ligne(self, cle_profil: str, item: "QTreeWidgetItem") -> None:
+        """Applique l'état verrouillé / normal à une ligne : flags (non cochable, non cliquable), texte gris,
+        widgets Actions et Statut grisés et inactifs. Idempotent, appelée après chaque (re)construction de ligne."""
+        verrouille = cle_profil in self._profils_verrouilles
+        masque = Qt.ItemIsUserCheckable | Qt.ItemIsEnabled
+        flags = item.flags()
+        nouveaux = (flags & ~masque) if verrouille else (flags | masque)
+        if nouveaux != flags:
+            item.setFlags(nouveaux)
+        gris = QBrush(QColor(Mocha.overlay0)) if verrouille else QBrush()
+        for colonne in (0, 1, 4):
+            item.setForeground(colonne, gris)
+        nom_profil = _nom_depuis_cle_profil_clone(cle_profil)
+        item.setToolTip(0, f"{nom_profil} -- VERROUILLÉ (clic droit pour déverrouiller)" if verrouille else nom_profil)
+        for colonne in (2, 3):
+            widget = self.table_profils.itemWidget(item, colonne)
+            if widget is None:
+                continue
+            if widget.isEnabled() == verrouille:
+                widget.setEnabled(not verrouille)
+            a_effet = widget.graphicsEffect() is not None
+            if verrouille and not a_effet:
+                effet = QGraphicsOpacityEffect(widget)
+                effet.setOpacity(0.4)
+                widget.setGraphicsEffect(effet)
+            elif not verrouille and a_effet:
+                widget.setGraphicsEffect(None)
 
     def _construire_widget_statut_profil(self, cle_profil: str, etat_profil: "CloneProfilEtat") -> QWidget:
         """CORRECTIF (retour utilisateur, capture d'écran à l'appui :
@@ -69029,7 +69927,8 @@ class PanneauExecutionClone(QWidget):
         # COMPOSITE (cf. _cle_profil_clone) : cette liste transporte
         # donc déjà des clés composites, pas des noms nus, cohérent avec
         # la docstring de demande_lancer_clones.
-        cles_cochees = [cle for cle, etat_profil in self._profils.items() if etat_profil.coche]
+        cles_cochees = [cle for cle, etat_profil in self._profils.items()
+                        if etat_profil.coche and cle not in self._profils_verrouilles]
         if not cles_cochees:
             return
         self.demande_lancer_clones.emit(cles_cochees)
@@ -74976,6 +75875,12 @@ class TaskConfigScreen(QWidget):
         rendu possible malgré task.services_api_importes/self._moteur_
         courant_par_task qui, eux, sont partagés par Task, pas par
         profil)."""
+        _verrouilles = [c for c in cles_profils if self._profil_clone_verrouille(c)]
+        if _verrouilles:
+            cles_profils = [c for c in cles_profils if c not in _verrouilles]
+            self._notify_status(f"{len(_verrouilles)} profil(s) verrouillé(s) ignoré(s).", error=True)
+            if not cles_profils:
+                return
         task = self._task_courant_obj()
         if task is None or not cles_profils:
             return
@@ -76404,6 +77309,10 @@ class TaskConfigScreen(QWidget):
         local -- le navigateur est déjà visible localement, exactement le
         choix déjà fait par _sur_demande_lancer_clones_local qui n'appelle
         jamais _sur_clic_voir_rendu_reseau)."""
+        if self._profil_clone_verrouille(cle_profil):
+            # PATCH verrouillage : point de passage du bouton Run de l'en-tête, du raccourci et du bouton de ligne.
+            self._notify_status("Profil verrouillé -- lancement refusé (clic droit sur sa ligne pour le déverrouiller).", error=True)
+            return
         task = self._task_courant_obj()
         if task is None or not cle_profil:
             return
@@ -76805,6 +77714,13 @@ class TaskConfigScreen(QWidget):
 
     # --- 3.1 Point d'entrée unique pour changer le profil actif ---
 
+    def _profil_clone_verrouille(self, cle_profil) -> bool:
+        """PATCH verrouillage : True si ce profil est verrouillé dans le panneau clone (clic droit sur sa ligne)."""
+        try:
+            return bool(cle_profil) and bool(self.panneau_clone.profil_verrouille(cle_profil))
+        except Exception:
+            return False
+
     def _definir_profil_actif(self, task: "Task", nom_profil: Optional[str]):
         """Cf. section 3.1 de la spec. SEUL point d'entrée pour changer
         le profil actif -- lie automatiquement TOUS les ServiceAPI déjà
@@ -76812,6 +77728,10 @@ class TaskConfigScreen(QWidget):
         nom_profil est None). Remplace l'ancien duo _demande_import_
         service_api / _demande_liaison_instance (sélection instance par
         instance) par une seule action globale par Task."""
+        if nom_profil and self._profil_clone_verrouille(nom_profil):
+            # PATCH verrouillage : SEUL point d'entrée du profil actif.
+            self._notify_status("Profil verrouillé -- clic droit sur sa ligne pour le déverrouiller.", error=True)
+            return
         etat = self._executions_clone.setdefault(task.id, ExecutionCloneEtat())
         ancien_profil = etat.profil_actif
         log_cellule.debug(
@@ -81275,6 +82195,9 @@ class TaskConfigScreen(QWidget):
     def _auto_selectionner_clone_unique(self, task):
         """PATCH (demande utilisateur) : s'il n'y a qu'UN SEUL clone dans le panneau de clones et qu'aucun n'est
         sélectionné, le bouton d'exécution le sélectionne et l'exécute."""
+        _etat_unique = self._executions_clone.get(task.id) if task is not None else None
+        if _etat_unique is not None and len(_etat_unique.profils) == 1 and self._profil_clone_verrouille(next(iter(_etat_unique.profils))):
+            return   # PATCH verrouillage : l'unique clone est verrouillé
         if task is None:
             return
         etat = self._executions_clone.get(task.id)
@@ -114483,6 +115406,8 @@ class MainWindow(QMainWindow):
         self.client_serveur_t.executants_detail_change.connect(
             lambda executants: self.controleur_kaggle.sur_executants_connectes(
                 {e.get("id", ""): e.get("nom") or e.get("id", "") for e in executants if e.get("id")}))
+        # FIX profils fantomes : detecte un sAutoniax redemarre (meme id, nouveau 'connecte_le') -> liste jetee puis redemandee.
+        self.client_serveur_t.executants_detail_change.connect(self.controleur_kaggle.sur_detail_executants)
         # PATCH (sélecteur groupé Local/Réseau de TestComposantScreen,
         # cf. ApplicationsScreen.definir_client_serveur_t/definir_
         # executants_reseau_connus) -- même source unique executants_
@@ -142571,7 +143496,7 @@ def _sautoniax_lancer_executeur_isole(instance_id: str, _executeurs_isoles: Opti
                     break
                 if ligne.strip() == "EXECUTEUR_PRET":
                     ev.set()
-                log.info(f"[sAutoniax][executeur:{iid}] {ligne.rstrip()}")
+                log.info(f"[sAutoniax][executeur:{iid}] {ligne.rstrip()}", extra={"instance_id_logs": iid})
         except (ValueError, OSError):
             pass
     threading.Thread(target=_lire_stdout, name=f"sautoniax-lecture-stdout-executeur-{instance_id}", daemon=True).start()
@@ -144438,8 +145363,7 @@ async def _sautoniax_executer_notebook_distant(
         indifféremment depuis des threads ou la boucle ailleurs dans ce
         fichier -- cf. _sur_logs_executant_demande par ex.)."""
         def write(self_flux, texte):
-            if _sortie_logs_coupee():   # sortie coupée (défaut) : aucune ligne envoyée au serveurT
-                return len(texte)
+            # PATCH : la sortie des cellules est TOUJOURS envoyée (le drapeau ne gouverne plus que la console du notebook de démarrage).
             for ligne in texte.splitlines():
                 if ligne:
                     client_t.envoyer_notebook_distant_log(session_id, id_pilote, ligne)
@@ -146309,6 +147233,38 @@ async def _main_async_sautoniax(
 
     client_t.kill_projet_demande.connect(_sur_kill_projet_demande, Qt.DirectConnection)
 
+    def _liberer_residus_profil(nom_profil: str) -> int:
+        # CORRECTIF (envoi Kaggle : "Arret non confirme, profil non archive" / "Profil en cours
+        # d'execution : arret non confirme, archive refusee") : _kaggle_noms_actifs() compte aussi
+        # (a) les taches de cellule de notebook distant encore vivantes (_diag_profil_nom) et
+        # (b) _instances_legacy_par_profil, deux registres que le kill ne vidait PAS : le navigateur
+        # etait ferme mais la cellule continuait a tourner, donc le profil restait "actif" pour
+        # toujours (1er essai : archive refusee) et le kill suivant repondait "Aucun projet en
+        # cours" (2e essai). On annule ici ces residus. Retourne le nombre de residus liberes.
+        liberes = 0
+        if not nom_profil:
+            return 0
+        for _tk in list(_taches_projets_en_cours):
+            if getattr(_tk, "_diag_profil_nom", None) == nom_profil and not _tk.done():
+                try:
+                    loop.call_soon_threadsafe(_tk.cancel)
+                    liberes += 1
+                except Exception as _e:
+                    log.warning(f"[sAutoniax] annulation de la tache du profil '{nom_profil}' impossible : {_e!r}")
+        if liberes:
+            _ctl = namespace_notebook_distant.get("controle_arret")
+            if _ctl is not None:
+                try:
+                    _ctl.arreter()
+                except Exception as _e:
+                    log.debug(f"[sAutoniax] controle_arret.arreter() ignore : {_e!r}")
+        # Entree legacy : purgee seulement si aucun batch ne tourne (sinon elle est vivante).
+        if _moteur_batch_courant.get("moteur") is None and _instances_legacy_par_profil.pop(nom_profil, None):
+            liberes += 1
+        if liberes:
+            log.info(f"[sAutoniax] kill_profil '{nom_profil}' : {liberes} residu(s) d'execution libere(s).")
+        return liberes
+
     def _sur_kill_profil_demande(nom_profil: str, redemarrer: bool):
         # PATCH (arrêt/redémarrage PAR PROFIL -- granularité réelle, cf.
         # docstring de _OrchestrateurMappingProfils.arreter_profil).
@@ -146339,6 +147295,7 @@ async def _main_async_sautoniax(
         #     sous-projets tournent en parallèle" sans notion de profil
         #     dédié par fil) : retourne "non disponible" plutôt que
         #     d'agir sur autre chose que le profil demandé par erreur.
+        _residus_liberes = 0 if redemarrer else _liberer_residus_profil(nom_profil)
         if nom_profil and nom_profil == namespace_notebook_distant.get("profil_charge"):
             if redemarrer:
                 # Même raisonnement EXACT que le cas _instances_isolees
@@ -146425,6 +147382,11 @@ async def _main_async_sautoniax(
 
         moteur = _moteur_batch_courant.get("moteur")
         if moteur is None:
+            if not redemarrer and (_residus_liberes or nom_profil not in _kaggle_noms_actifs()):
+                # Residus liberes ci-dessus, ou profil deja arrete : l'etat voulu (profil inactif) est atteint.
+                log.info(f"[sAutoniax] kill_profil reçu (profil='{nom_profil}') -- aucun batch actif, residus liberes={_residus_liberes}.")
+                client_t.envoyer_kill_profil_resultat(nom_profil, redemarrer, True, "")
+                return
             log.info(f"[sAutoniax] kill_profil reçu (profil='{nom_profil}') -- aucun batch actif, ignoré.")
             client_t.envoyer_kill_profil_resultat(nom_profil, redemarrer, False, "Aucun projet en cours d'exécution sur cet exécutant.")
             return
@@ -148210,6 +149172,7 @@ def main_sautoniax():
     QEventLoop, cf. PySide6 -- une QApplication n'est nécessaire que
     pour les widgets et l'intégration de la boucle d'événements Qt native,
     aucun des deux n'est utilisé ici."""
+    _couper_logs_console_notebook_demarrage()   # PATCH : le drapeau de sortie de logs coupe la console du notebook de démarrage
     parser = argparse.ArgumentParser(description="Exécutant sAutoniax (headless, ex. Kaggle)")
     parser.add_argument("--sautoniax", action="store_true", help="Active le mode sAutoniax (cf. dispatch fin de fichier)")
     # PATCH (demande explicite utilisateur : sAutoniax ne doit plus jamais
@@ -148711,9 +149674,9 @@ def main_executeur_sautoniax():
 
                 def write(self_flux, texte):
                     _journal_instance_ajouter(instance_id, texte)  # PATCH journal par profil (même si coupé)
-                    # Mode silencieux (AUTONIAX_SILENCIEUX=1), sortie coupée pour ce profil, ou session inconnue :
-                    # le texte reste dans le tampon, RIEN n'est envoyé au notebook du pilote.
-                    if _sortie_logs_coupee(instance_id) or not session_id or not id_pilote:
+                    # PATCH : le drapeau de sortie de logs ne coupe plus la sortie des cellules (il ne concerne que la
+                    # console du notebook de démarrage). Seule une session inconnue garde le texte dans le tampon.
+                    if not session_id or not id_pilote:
                         return super().write(texte)
                     # PATCH forcer l'affichage : sortie réactivée en cours de cellule -> on rattrape d'abord
                     # ce qui a été gardé en tampon pendant la coupure, puis la nouvelle ligne.
@@ -148734,9 +149697,10 @@ def main_executeur_sautoniax():
 
             log.info(
                 f"[executeur:{instance_id}] cellule démarrée (requete_id={requete_id!r}, session={session_id!r}, "
-                f"id_pilote={id_pilote!r}) -- mode silencieux={'OUI (AUTONIAX_SILENCIEUX=1 : la sortie ne sera envoyee qu a la fin)' if _sortie_logs_coupee(instance_id) else 'non'}."
+                f"id_pilote={id_pilote!r}) -- sortie des cellules envoyée au pilote : {'oui' if (session_id and id_pilote) else 'non (session inconnue)'}."
             )
             flux = _FluxEnDirectExecuteur()
+            _FLUX_DEFAUT_EXECUTEUR["flux"] = flux   # PATCH : les threads lancés par la cellule écrivent aussi vers le pilote (jamais retiré : ils survivent à la cellule)
             ok = True
             erreur = ""
             try:
@@ -148746,8 +149710,6 @@ def main_executeur_sautoniax():
                 ok = False
                 erreur = f"{e.__class__.__name__}: {e}\n{traceback.format_exc()}"
             sortie = flux.getvalue()
-            if _sortie_logs_coupee(instance_id):
-                sortie = ""  # PATCH : sortie coupée pour ce profil -> rien n'est renvoyé non plus à la fin (le journal la garde)
             result_color = None
             if lire_result_color_finale:
                 # AJOUT (alias RESULT_COLOR) : si l'utilisateur a modifié
@@ -148986,6 +149948,25 @@ def _tuer_zombies_autoniax(processus=None, tuer=None) -> list:
     return [p for p, _ in cibles]
 
 
+def _arreter_tous_les_qthreads(racine):
+    """PATCH (crash qFatal « QThread: Destroyed while thread '' is still
+    running » à la fermeture/au redémarrage de l'app) -- plusieurs écrans
+    démarrent un QThread dans leur __init__ sans jamais l'arrêter ; Qt les
+    détruit avec la fenêtre alors qu'ils tournent encore -> qFatal -> abort.
+    Appelée sur QApplication.aboutToQuit (cf. main()) : quit() puis wait()
+    sur TOUS les QThread enfants de la fenêtre ; terminate() en dernier
+    recours si un thread ne s'arrête pas en 3 s (l'app quitte de toute façon)."""
+    try:
+        for t in racine.findChildren(QThread):
+            if t.isRunning():
+                t.quit()
+                if not t.wait(3000):
+                    t.terminate()
+                    t.wait(1000)
+    except Exception:
+        pass
+
+
 def main():
     # ── Identité Windows de l'app (barre des tâches / Alt+Tab) ─────
     # C'est LA raison pour laquelle setWindowIcon()/app.setWindowIcon()
@@ -149003,6 +149984,26 @@ def main():
             )
         except Exception:
             pass
+
+    # PATCH crash.txt : un qFatal() Qt tue le process SANS exception Python -> on note le message dans crash.txt
+    # avant l'abort. Les autres messages Qt restent écrits sur stderr, comme le gestionnaire par défaut.
+    try:
+        from PySide6.QtCore import qInstallMessageHandler as _qimh, QtMsgType as _QtMsgType
+
+        def _gestionnaire_msg_qt(type_msg, contexte, message):
+            try:
+                if type_msg == _QtMsgType.QtFatalMsg:
+                    _crash_ecrire("MESSAGE FATAL Qt (qFatal)",
+                                  "%s\n(fichier=%s ligne=%s fonction=%s)" % (
+                                      message, getattr(contexte, "file", None),
+                                      getattr(contexte, "line", None), getattr(contexte, "function", None)))
+                if sys.stderr is not None:
+                    sys.stderr.write(str(message) + "\n")
+            except Exception:
+                pass
+        _qimh(_gestionnaire_msg_qt)
+    except Exception:
+        pass
 
     app = QApplication(sys.argv)
     _installer_gui_diag(app)
@@ -149085,6 +150086,7 @@ def main():
     # chargement disque nécessaire. Classe SplashScreen inchangée (cf.
     # ligne ~4729).
     window = MainWindow()
+    app.aboutToQuit.connect(lambda: _arreter_tous_les_qthreads(window))
     if window.reglages.splash_actif:
         splash = SplashScreen()
         splash.show()
