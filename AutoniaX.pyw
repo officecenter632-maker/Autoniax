@@ -22579,6 +22579,7 @@ class PanneauProprietesSautoniax(QWidget):
         # ferait planter/serait sans effet si on tentait de le
         # démarrer/copier ensuite.
         self._profils_coches &= set(self._profils.keys())
+        self._synchroniser_coches_vers_orchestrateur()
         nb_actifs = sum(1 for p in self._profils.values() if p.get("actif"))
         self.label_sous_titre.setText(
             f"{len(self._profils)} profil(s) -- {nb_actifs} actif(s)."
@@ -22637,7 +22638,17 @@ class PanneauProprietesSautoniax(QWidget):
             self._profils_coches.add(nom_profil)
         else:
             self._profils_coches.discard(nom_profil)
+        self._synchroniser_coches_vers_orchestrateur()
         self._rafraichir_etat_boutons_masse()
+
+    def _synchroniser_coches_vers_orchestrateur(self):
+        """PATCH (bug : apres « tout selectionner » puis decochage manuel de certains profils, « Tout arreter » et
+        « Supprimer » agissaient quand meme sur les profils decoches) -- l'orchestrateur global garde SA PROPRE copie des
+        coches par sAutoniax ; les decochages manuels faits ici ne lui etaient jamais transmis. On lui repousse donc
+        l'etat reel du panneau a chaque changement."""
+        if self._orchestrateur_actions_globales is not None and self._id_executant_courant is not None:
+            self._orchestrateur_actions_globales.definir_profils_coches(
+                self._id_executant_courant, set(self._profils_coches))
 
     def _sur_clic_tout_selectionner_profils(self):
         """AJOUT (spec A.1) -- coche la case de TOUTES les lignes
@@ -23375,6 +23386,7 @@ class PanneauProprietesSautoniax(QWidget):
             if ancien_nom in self._profils_coches:
                 self._profils_coches.discard(ancien_nom)
                 self._profils_coches.add(nouveau_nom)
+                self._synchroniser_coches_vers_orchestrateur()
         else:
             self._afficher_statut_temporaire(f"Échec du renommage de '{ancien_nom}' : {message}")
         self._reconstruire_table()
@@ -23810,6 +23822,31 @@ class OrchestrateurActionsGlobalesInstances(QObject):
         qu'il affiche actuellement -- cf. PanneauProprietesSautoniax.
         appliquer_coches_externes pour le détail de cette synchronisation."""
         self._panneau_proprietes = panneau_proprietes
+
+    def definir_profils_coches(self, id_executant: str, noms_coches: set):
+        """PATCH -- le panneau visible pousse ici ses coches reelles (cases cochees/decochees a la main), pour que
+        « Tout demarrer / Tout arreter / Supprimer » n'agissent que sur ce qui est reellement coche a l'ecran."""
+        self._profils_coches[id_executant] = set(noms_coches)
+
+    def cibles_arret(self, ids_executants: list) -> dict:
+        """{id_executant: [noms]} des profils COCHES et ACTIFS (= ce que « Tout arreter » va couper)."""
+        cibles = {}
+        for id_executant in ids_executants:
+            connus = self._profils_connus.get(id_executant, {})
+            noms = sorted((n for n in self._profils_coches.get(id_executant, set())
+                           if n in connus and connus[n].get("actif")), key=_cle_tri_numerique_profil)
+            if noms:
+                cibles[id_executant] = noms
+        return cibles
+
+    def cibles_suppression(self, ids_executants: list) -> dict:
+        """{id_executant: [noms]} des profils COCHES (= ce que « Supprimer » va tenter de supprimer)."""
+        cibles = {}
+        for id_executant in ids_executants:
+            noms = sorted(self._profils_coches.get(id_executant, set()), key=_cle_tri_numerique_profil)
+            if noms:
+                cibles[id_executant] = noms
+        return cibles
 
     def profils_coches_pour(self, id_executant: str) -> set:
         """CORRECTIF (retour utilisateur : "sa ne met pas a jour les
@@ -24834,6 +24871,44 @@ class InstancesConnecteesScreen(QWidget):
             return
         self._sautoniax_coches[id_executant] = item.checkState(0) == Qt.Checked
 
+    def _confirmer_action_globale(self, titre: str, verbe: str, cibles: dict, avertissement: str = "") -> bool:
+        """PATCH -- fenetre de confirmation listant ce qui va etre touche (defaut : Non)."""
+        total = sum(len(v) for v in cibles.values())
+        texte = f"{verbe} {total} profil(s) sur {len(cibles)} sAutoniax ?"
+        if avertissement:
+            texte += "\n\n" + avertissement
+        boite = QMessageBox(self)
+        boite.setIcon(QMessageBox.Warning)
+        boite.setWindowTitle(titre)
+        boite.setText(texte)
+        boite.setDetailedText("\n".join(f"{ex} : {', '.join(noms)}" for ex, noms in cibles.items()))
+        oui = boite.addButton("Confirmer", QMessageBox.AcceptRole)
+        non = boite.addButton("Annuler", QMessageBox.RejectRole)
+        boite.setDefaultButton(non)
+        boite.setEscapeButton(non)
+        boite.exec()
+        return boite.clickedButton() is oui
+
+    def _sur_clic_tout_arreter_confirme(self):
+        ids = self._ids_executants_coches()
+        cibles = self.orchestrateur_actions_globales.cibles_arret(ids)
+        if not cibles:
+            self.orchestrateur_actions_globales.lancer_tout_arreter(ids)  # affiche le message « rien a arreter »
+            return
+        if self._confirmer_action_globale("Tout arrêter", "Arrêter (kill)", cibles):
+            self.orchestrateur_actions_globales.lancer_tout_arreter(ids)
+
+    def _sur_clic_supprimer_confirme(self):
+        ids = self._ids_executants_coches()
+        cibles = self.orchestrateur_actions_globales.cibles_suppression(ids)
+        if not cibles:
+            self.orchestrateur_actions_globales.lancer_suppression(ids)  # affiche le message « rien a supprimer »
+            return
+        if self._confirmer_action_globale(
+                "Supprimer", "Supprimer DÉFINITIVEMENT", cibles,
+                "Action irréversible. Les profils actifs seront ignorés (arrêtez-les d'abord)."):
+            self.orchestrateur_actions_globales.lancer_suppression(ids)
+
     def _ids_executants_coches(self) -> list:
         """AJOUT (SPEC_lot_corrections_2026-09.md section 13) -- liste des
         id_executant actuellement COCHÉS et PRÊTS (cf. self._sautoniax_
@@ -24994,7 +25069,7 @@ class InstancesConnecteesScreen(QWidget):
             "cocher des profils)."
         )
         self.bouton_tout_arreter_global.clicked.connect(
-            lambda: self.orchestrateur_actions_globales.lancer_tout_arreter(self._ids_executants_coches())
+            self._sur_clic_tout_arreter_confirme
         )
         layout_barre.addWidget(self.bouton_tout_arreter_global)
         layout_barre.addWidget(_separateur())
@@ -25100,7 +25175,7 @@ class InstancesConnecteesScreen(QWidget):
             "un profil actif est ignoré, arrêtez-le d'abord."
         )
         self.bouton_supprimer_profils_global.clicked.connect(
-            lambda: self.orchestrateur_actions_globales.lancer_suppression(self._ids_executants_coches())
+            self._sur_clic_supprimer_confirme
         )
         layout_barre.addWidget(self.bouton_supprimer_profils_global)
         layout_barre.addStretch(1)
