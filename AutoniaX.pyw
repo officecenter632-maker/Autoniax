@@ -32862,6 +32862,7 @@ class ProfilsKaggleScreen(QWidget):
         self._datasets: list = []
         self._tri_datasets = "maj"
         self._tri_recent_d_abord = True  # sens du tri par date (bouton sous les tags)
+        self._maj_plage_en_cours = False  # PATCH : garde anti-recursion du Maj+clic « toute la plage »
         self._operation_id: Optional[str] = None
         self._deja_affiche = False
         self._maj_en_cours = False
@@ -33101,7 +33102,7 @@ class ProfilsKaggleScreen(QWidget):
         self.table_datasets.header().setStretchLastSection(True)
         self.table_datasets.header().setSectionsClickable(True)
         self.table_datasets.header().sectionClicked.connect(self._sur_clic_entete_datasets)
-        self.table_datasets.itemChanged.connect(lambda *_: self._rafraichir_boutons())
+        self.table_datasets.itemChanged.connect(self._sur_item_change_datasets)
         self.table_datasets.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table_datasets.customContextMenuRequested.connect(self._afficher_menu_datasets)
         layout_d.addWidget(self.table_datasets, stretch=1)
@@ -33807,6 +33808,27 @@ class ProfilsKaggleScreen(QWidget):
         if section == 2:
             self._sur_clic_tri_date()
 
+    def _sur_item_change_datasets(self, item, colonne=0):
+        """PATCH : Maj + clic sur la case d'un profil = coche/decoche TOUTE sa plage de dates (comptes dont les dates
+        de mise a jour se suivent a moins de l'ecart max). Seules les lignes visibles (filtre par tags) sont touchees."""
+        if (colonne == 0 and item is not None and not self._maj_plage_en_cours
+                and (QApplication.keyboardModifiers() & Qt.ShiftModifier)):
+            plage = item.data(0, Qt.UserRole + 2)
+            if plage is not None:
+                etat = item.checkState(0)
+                self._maj_plage_en_cours = True
+                self.table_datasets.blockSignals(True)
+                try:
+                    for r in range(self.table_datasets.topLevelItemCount()):
+                        autre = self.table_datasets.topLevelItem(r)
+                        if autre is not item and not autre.isHidden() and autre.data(0, Qt.UserRole + 2) == plage:
+                            autre.setCheckState(0, etat)
+                finally:
+                    self.table_datasets.blockSignals(False)
+                    self._maj_plage_en_cours = False
+                self.table_datasets.viewport().update()
+        self._rafraichir_boutons()
+
     def _cocher_toutes_cibles(self, cocher: bool):
         """PATCH : coche / decoche tous les sAutoniax cibles d'un coup (un seul rafraichissement des boutons)."""
         etat = Qt.Checked if cocher else Qt.Unchecked
@@ -33856,6 +33878,7 @@ class ProfilsKaggleScreen(QWidget):
             it.setCheckState(0, coches.get(d["slug"], Qt.Unchecked))
             it.setData(0, Qt.UserRole, d["slug"])
             it.setData(0, Qt.UserRole + 1, list(d.get("sites") or []))
+            it.setData(0, Qt.UserRole + 2, num_plage)  # PATCH : numero de plage (Maj+clic sur la case)
             self.table_datasets.addTopLevelItem(it)
         self.table_datasets.blockSignals(False)
         self._reconstruire_liste_tags()
