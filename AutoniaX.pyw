@@ -136301,6 +136301,39 @@ async def _copie_secours_camoufox(page, etat_navigateur: dict, x: int, y: int, r
     return {"copie": texte}
 
 
+async def _copie_secours_cdp(page, etat_navigateur: dict, x: int, y: int, resultat_initial: dict) -> dict:
+    """PATCH Ctrl+C (Chrome/Vivaldi, nodriver) -- miroir CDP de _copie_secours_camoufox.
+    Un keyDown/keyUp "Control+c" envoyé via Input.dispatchKeyEvent N'EXÉCUTE PAS la
+    commande de copie du navigateur (il faudrait `commands=["copy"]`) : l'événement DOM
+    "copy" n'est jamais émis, le presse-papier virtuel n'est donc jamais réécrit et le
+    pilote recevait toujours {"copie": None} ("Rien à copier"). On relit donc la sélection
+    (champ de saisie inclus), puis, si le drapeau COPIE_ELEMENT_SOUS_CURSEUR_SI_AUCUNE_
+    SELECTION est actif, le texte de l'élément sous (x, y). Ne lève jamais."""
+    try:
+        expression = "(" + _JS_CAMOUFOX_TEXTE_A_COPIER + ")([%d, %d, %s])" % (
+            int(x), int(y), "true" if COPIE_ELEMENT_SOUS_CURSEUR_SI_AUCUNE_SELECTION else "false")
+        r, exception_details = await page.send(cdp.runtime.evaluate(expression, return_by_value=True))
+        if exception_details is not None:
+            log.warning(f"[cdp][copie-secours] lecture impossible : {exception_details}")
+            return resultat_initial
+        valeur = getattr(r, "value", None) if r is not None else None
+        if isinstance(valeur, list):  # sérialisation nodriver éventuelle en paires clé/valeur
+            try:
+                valeur = {k: (v.get("value") if isinstance(v, dict) else v) for k, v in valeur}
+            except Exception:  # noqa: BLE001
+                valeur = None
+        texte = str((valeur or {}).get("texte") or "") if isinstance(valeur, dict) else ""
+    except Exception as exc:  # noqa: BLE001
+        log.warning(f"[cdp][copie-secours] lecture impossible : {exc!r}")
+        return resultat_initial
+    if not texte:
+        log.info("[cdp][copie-secours] ni sélection ni élément textuel sous le curseur.")
+        return resultat_initial
+    _memoriser_copie_presse_papier(etat_navigateur, texte)
+    log.info(f"[cdp][copie-secours] copie de secours : {len(texte)} caractère(s).")
+    return {"copie": texte}
+
+
 async def _executer_commande_camoufox(
     context, gestion: GestionOngletsCamoufox, etat_navigateur: dict, data: dict,
     arret_demande: "asyncio.Event | None" = None,
@@ -139003,7 +139036,11 @@ async def _executer_commande(browser, etat_navigateur: dict, data: dict, arret_d
             _ts_avant = etat_navigateur.get("presse_papier_virtuel_ts")
             await action_press_key(page, int(data["x"]), int(data["y"]), str(data.get("touche", "")))
             if str(data.get("touche", "")) == "Control+c":
-                resultat = await _attendre_copie_fraiche(etat_navigateur, _ts_avant)
+                resultat = await _attendre_copie_fraiche(etat_navigateur, _ts_avant, delai_max_s=0.3)
+                if not resultat.get("copie"):
+                    resultat = await _copie_secours_cdp(
+                        page, etat_navigateur, int(data["x"]), int(data["y"]), resultat,
+                    )
         elif action == "copy":
             # Stocke dans le presse-papier VIRTUEL de cette instance
             # (etat_navigateur, jamais le presse-papier Windows, cf.
