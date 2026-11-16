@@ -32152,6 +32152,48 @@ def trier_datasets_par_date(datasets: list, recent_d_abord: bool = True) -> list
     return connus + inconnus
 
 
+# PATCH (Profils Kaggle, PLAGES DE DATES) -- les comptes dont les dates de mise a jour sont proches forment une
+# « plage » ; les plages successives sont coloriees en alternant deux couleurs.
+PLAGE_ECART_MAX_MIN_DEFAUT = 2.0   # ecart max (minutes) entre deux comptes VOISINS (dans la liste triee) d'une meme plage
+PLAGE_ECART_MAX_MIN_MAX = 240.0
+PLAGE_COULEUR_A = "#94e2d5"        # teal   (Mocha.teal)   -- plages paires
+PLAGE_COULEUR_B = "#f9e2af"        # yellow (Mocha.yellow) -- plages impaires
+PLAGE_ALPHA_FOND = 38              # opacite du fond (0-255)
+
+
+def _datetime_plage(valeur):
+    """Date Kaggle (str/epoch/datetime) -> datetime naif comparable, ou None si inconnue."""
+    cle = cle_tri_date(valeur)[:19]
+    if not cle:
+        return None
+    try:
+        return _kg_datetime.strptime(cle, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        try:
+            return _kg_datetime.strptime(cle[:16], "%Y-%m-%d %H:%M")
+        except ValueError:
+            return None
+
+
+def calculer_plages_dates(datasets_tries: list, ecart_max_min: float) -> list:
+    """datasets_tries : liste DEJA triee par date (dans le sens affiche). Retourne, dans le meme ordre, une liste
+    d'entiers : numero de plage (0, 1, 2...) de chaque dataset, ou None si sa date est inconnue.
+    Regle : un dataset rejoint la plage du precedent si l'ecart avec lui est <= ecart_max_min (chainage : une plage peut
+    donc depasser ecart_max_min au total tant que chaque voisin reste proche du suivant)."""
+    limite_s = max(0.0, float(ecart_max_min)) * 60.0
+    plages, num, precedent = [], -1, None
+    for d in datasets_tries:
+        dt = _datetime_plage(date_dataset(d))
+        if dt is None:
+            plages.append(None)
+            continue
+        if precedent is None or abs((dt - precedent).total_seconds()) > limite_s:
+            num += 1
+        plages.append(num)
+        precedent = dt
+    return plages
+
+
 class DelegueDateKaggle(QStyledItemDelegate):
     """Colonne Date : jour et heure:minute en couleurs differentes, police agrandie. Le jour alterne de couleur d'un
     jour calendaire a l'autre pour distinguer d'un coup d'oeil les groupes de profils."""
@@ -33041,6 +33083,24 @@ class ProfilsKaggleScreen(QWidget):
                                                 "(seuls ceux visibles après le filtre par tags). Une confirmation est demandée.")
         self.bouton_supprimer_coches.clicked.connect(self._sur_clic_supprimer_coches)
         ligne_tri_suppr.addWidget(self.bouton_supprimer_coches)
+
+        # PATCH : ecart max (minutes) entre deux comptes voisins pour former une « plage » coloriee.
+        label_plage = QLabel("Plage (écart max)", colonne_droite)
+        label_plage.setObjectName("PlaceholderSubtitle")
+        ligne_tri_suppr.addSpacing(12)
+        ligne_tri_suppr.addWidget(label_plage)
+        self.spin_ecart_plage = QDoubleSpinBox(colonne_droite)
+        self.spin_ecart_plage.setRange(0.0, PLAGE_ECART_MAX_MIN_MAX)
+        self.spin_ecart_plage.setDecimals(1)
+        self.spin_ecart_plage.setSingleStep(0.5)
+        self.spin_ecart_plage.setValue(PLAGE_ECART_MAX_MIN_DEFAUT)
+        self.spin_ecart_plage.setSuffix(" min")
+        self.spin_ecart_plage.setToolTip(
+            "Les comptes dont les dates de mise à jour se suivent à moins de cet écart (entre deux voisins de la liste)\n"
+            "forment une PLAGE. Les plages sont coloriées en alternant deux couleurs.\n"
+            "0 = seuls les comptes à la même minute exacte sont groupés.")
+        self.spin_ecart_plage.valueChanged.connect(lambda *_: self._reconstruire_table_datasets())
+        ligne_tri_suppr.addWidget(self.spin_ecart_plage)
         ligne_tri_suppr.addStretch(1)
         layout_d.addLayout(ligne_tri_suppr)
         self._rafraichir_libelle_tri()
@@ -33657,7 +33717,15 @@ class ProfilsKaggleScreen(QWidget):
                   for r in range(self.table_datasets.topLevelItemCount())}
         self.table_datasets.blockSignals(True)
         self.table_datasets.clear()
-        for d in trier_datasets_par_date(self._datasets, self._tri_recent_d_abord):
+        datasets_tries = trier_datasets_par_date(self._datasets, self._tri_recent_d_abord)
+        _spin_plage = getattr(self, "spin_ecart_plage", None)
+        plages = calculer_plages_dates(
+            datasets_tries, _spin_plage.value() if _spin_plage is not None else PLAGE_ECART_MAX_MIN_DEFAUT)
+        taille_plage: dict = {}
+        for n in plages:
+            if n is not None:
+                taille_plage[n] = taille_plage.get(n, 0) + 1
+        for d, num_plage in zip(datasets_tries, plages):
             horodatage = formater_horodatage(date_dataset(d))  # 'AAAA-MM-JJ HH:MM'
             jour, _, heure = horodatage.partition(" ")
             it = QTreeWidgetItem([d.get("nom_archive", "") + (" [incomplet]" if d.get("incomplet") else ""),
@@ -33669,7 +33737,14 @@ class ProfilsKaggleScreen(QWidget):
                 it.setData(2, DelegueDateKaggle.ROLE_PARITE, _kg_datetime.strptime(jour, "%Y-%m-%d").toordinal())
             except ValueError:
                 it.setData(2, DelegueDateKaggle.ROLE_PARITE, 0)
-            it.setToolTip(2, horodatage)
+            if num_plage is not None:
+                it.setToolTip(2, f"{horodatage}\nPlage n°{num_plage + 1} : {taille_plage[num_plage]} compte(s)")
+                fond = QColor(PLAGE_COULEUR_A if num_plage % 2 == 0 else PLAGE_COULEUR_B)
+                fond.setAlpha(PLAGE_ALPHA_FOND)
+                for col in range(self.table_datasets.columnCount()):
+                    it.setBackground(col, QBrush(fond))
+            else:
+                it.setToolTip(2, horodatage)
             it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
             it.setCheckState(0, coches.get(d["slug"], Qt.Unchecked))
             it.setData(0, Qt.UserRole, d["slug"])
