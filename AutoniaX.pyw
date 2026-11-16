@@ -24785,7 +24785,8 @@ class InstancesConnecteesScreen(QWidget):
             id_executant, infos = kv
             cle_nom = _cle_tri_numerique_generique(infos.get("nom") or id_executant)
             if colonne == 1:
-                principale = (str(id_executant).lower(),)
+                # PATCH : instance_id trié NUMÉRIQUEMENT (sAutoniax-9 avant sAutoniax-10), pas en texte pur.
+                principale = (_cle_tri_numerique_generique(str(id_executant).lower()),)
             elif colonne == 2:
                 en_chargement = infos.get("role") == "executant" and id_executant not in self._sautoniax_prets
                 texte = (
@@ -26792,7 +26793,7 @@ class NotebookDistantScreen(QWidget):
 
         self.combo_executant.blockSignals(True)
         self.combo_executant.clear()
-        for id_executant, nom in sorted(self._noms_executants.items(), key=lambda kv: kv[1]):
+        for id_executant, nom in sorted(self._noms_executants.items(), key=lambda kv: _cle_tri_numerique_generique(str(kv[1]))):
             self.combo_executant.addItem(nom, id_executant)
         index_a_restaurer = self.combo_executant.findData(id_selectionne_avant)
         if index_a_restaurer >= 0:
@@ -28698,7 +28699,7 @@ class ProfilsCloudScreen(QWidget):
         choisi est toujours connecté."""
         id_choisi_avant = self.combo_sautoniax_cible.currentData()
         self.combo_sautoniax_cible.clear()
-        for id_executant, nom in sorted(executants.items(), key=lambda kv: kv[1]):
+        for id_executant, nom in sorted(executants.items(), key=lambda kv: _cle_tri_numerique_generique(str(kv[1]))):
             self.combo_sautoniax_cible.addItem(nom, id_executant)
         index_a_restaurer = self.combo_sautoniax_cible.findData(id_choisi_avant)
         if index_a_restaurer >= 0:
@@ -30330,10 +30331,16 @@ KAGGLE_API_TOKEN = "KGAT_af3ac4a714d020b6a4a8034cf1bf8792"  # en dur (decision e
 KAGGLE_PAQUET_PIP = "kaggle==2.2.5"  # minimum 1.8.0 ; meme epinglage dans le notebook sAutoniax
 PREFIXE_DATASET = "ax-"
 _DIAG_KAGGLE: dict = {"total_datasets_vus": None}  # diagnostic du dernier listing (tous les datasets du compte)
+# PATCH : {slug: nom_archive} des archives PLANIFIEES. Kaggle ne liste pas (dataset_list) un dataset cree mais dont le
+# traitement n'est pas termine / a plante : on le sonde directement (dataset_status) pour qu'il apparaisse dans la liste.
+_SLUGS_A_SONDER: dict = {}
 MAX_TRANSFERTS_SIMULTANES = 10  # global, tous sAutoniax confondus (plafond du reglage de l'ecran)
-NB_ENVOIS_SIMULTANES_DEFAUT = 3  # valeur par defaut du widget "Envois simultanes" (ecran Profils Kaggle)
-DELAI_ENTRE_GROUPES_DEFAUT_S = 30  # valeur par defaut du widget "Delai entre groupes" (secondes)
+NB_ENVOIS_SIMULTANES_DEFAUT = 3  # valeur par defaut du widget "Envois simultanes" (ecran Profils Kaggle) : 3 comptes a la fois (10 -> 429 sur la creation)
+DELAI_ENTRE_DEPARTS_DEFAUT_S = 3  # PATCH : attente minimale (s) entre le depart de deux envois / telechargements (depart echelonne)
+DELAI_ENTRE_DEPARTS_MAX_S = 600
+DELAI_ENTRE_GROUPES_DEFAUT_S = 0  # 0 = fenetre glissante (un envoi termine libere sa place tout de suite) ; >0 = groupes
 DELAI_ENTRE_GROUPES_MAX_S = 3600
+VERSION_CODE_ENVOI = "envoi-2026-11-14e"  # affichee au demarrage d'un envoi (pilote ET sAutoniax) pour savoir quel code tourne
 NB_TENTATIVES = 3
 DELAIS_TENTATIVES_S = (5, 15, 45)
 # CORRECTIF 429 (log du 14/11/2026 : 7 envois en parallele -> "429 Too Many Requests" sur GetDatasetStatus pendant
@@ -30341,6 +30348,10 @@ DELAIS_TENTATIVES_S = (5, 15, 45)
 # peu d'aleatoire pour desynchroniser les envois paralleles) puis reprise automatique, sans compter comme echec.
 ATTENTES_429_S = (10, 20, 40, 60, 60, 60, 60, 60)
 DELAI_PRET_KAGGLE_S = 600
+# PATCH : ce sont les APPELS API qui declenchent les 429 (pas les envois de fichiers). Espacement minimal entre deux
+# appels API Kaggle de ce processus (tous profils confondus) + sondages du statut moins frequents.
+DELAI_MIN_ENTRE_APPELS_API_S = 3.0
+INTERVALLE_SONDAGE_STATUT_S = 15
 QUOTA_PRIVE_GO = 100  # affichage seulement
 KAGGLE_SLUG_MIN = 6
 KAGGLE_SLUG_MAX = 50  # a confirmer au premier test reel
@@ -30376,6 +30387,14 @@ _log_kaggle = logging.getLogger("autoniax.kaggle")
 
 class ErreurKaggle(Exception):
     """Erreur metier Kaggle (message destine a etre affiche tel quel)."""
+
+
+class ErreurAnnulationKaggle(ErreurKaggle):
+    """PATCH : operation annulee par l'utilisateur (bouton « Tuer la commande en cours »)."""
+
+
+_ANNULATION_KAGGLE = threading.Event()   # pose par un ordre d'annulation recu du pilote
+_OPERATION_ANNULEE: dict = {"id": ""}     # operation visee (un nouvel envoi d'une autre operation leve le drapeau)
 
 
 class ErreurCorrespondance(ErreurKaggle):
@@ -30585,21 +30604,34 @@ PROMPT_CORRESPONDANCE_IA = (
     "FORMAT EXIGÉ : un objet JSON { \"sAutoniax-N/nom_profil_local\": { \"sautoniax\": \"sAutoniax-N\", "
     "\"profil\": \"nom_profil_local\", \"email\": \"email@domaine.com\", \"sites\": [\"google\", \"tiktok\"], "
     "\"coche\": true } }.\n"
+    "RÈGLE N°1 (prioritaire) : la LISTE BRUTE que je te donne dans CE message est la SEULE source de vérité pour "
+    "\"email\" et \"coche\". Chaque ligne de la liste brute contient : e-mail, nom du profil, sAuto-N (= sAutoniax-N), "
+    "puis éventuellement les sites. Les e-mails et les \"coche\" déjà présents dans le JSON actuel ne sont PAS une "
+    "source : ils reflètent un état ancien, ne les conserve JAMAIS par défaut. Une entrée n'a un e-mail et "
+    "\"coche\": true que si une ligne de la liste brute de ce message lui correspond ; sinon tu l'effaces "
+    "(\"email\": \"\", \"coche\": false), même si le JSON actuel y avait un e-mail et \"coche\": true. "
+    "Exemple : si la liste brute ne contient qu'UNE seule ligne, une seule entrée du JSON a un e-mail et "
+    "\"coche\": true ; TOUTES les autres sont remises à \"email\": \"\" et \"coche\": false.\n"
+    "- Correspondance ligne brute -> entrée : une ligne correspond à l'entrée dont \"sautoniax\" porte le même "
+    "numéro exact (sAuto-1 = sAutoniax-1, mais sAuto-1 n'est PAS sAutoniax-11) ET dont \"profil\" est identique au "
+    "nom de profil de la ligne. Une ligne qui ne correspond à aucune entrée du JSON actuel est ignorée : "
+    "n'ajoute aucune entrée. Ne rattache jamais l'e-mail d'une ligne à un autre sAutoniax ou à un autre profil "
+    "que le sien.\n"
     "- Chaque entrée = UN profil sur UNE machine (un sAutoniax = une machine distincte). Un même nom de profil "
     "présent sur plusieurs sAutoniax donne plusieurs entrées DIFFÉRENTES (comptes différents) : ne les fusionne jamais.\n"
     "- Chaque clé (ex. \"sAutoniax-1/iaX1\") et les champs \"sautoniax\" et \"profil\" : recopie-les EXACTEMENT "
-    "tels quels (même casse, mêmes caractères). Ne renomme, n'ajoute et ne supprime aucune entrée.\n"
-    "- \"email\" : l'adresse e-mail complète du compte (avec @), prise telle quelle dans la liste brute (e-mail + "
-    "sAutoniax) que je te donne. Les valeurs vides \"\" sont à compléter ; corrige aussi celles qui sont fausses. "
-    "Ne rattache jamais l'e-mail d'une ligne à un autre sAutoniax que le sien ; une ligne de la liste brute dont le "
-    "sAutoniax n'est pas dans le JSON actuel est ignorée.\n"
-    "- \"coche\" : true si le sAutoniax de l'entrée a une ligne (donc un e-mail) dans la liste brute ; false s'il n'en a "
-    "aucune. Dans ce cas l'entrée reste dans le JSON (ne la supprime pas), avec \"email\": \"\" et \"coche\": false : "
+    "tels quels (même casse, mêmes caractères). Ne renomme, n'ajoute et ne supprime aucune entrée : toutes les "
+    "entrées du JSON actuel doivent se retrouver dans ta réponse, cochées ou non.\n"
+    "- \"email\" : l'adresse e-mail complète (avec @) de la ligne brute correspondante, recopiée telle quelle, "
+    "caractère pour caractère. Entrée sans ligne brute correspondante : \"email\": \"\".\n"
+    "- \"coche\" : true si une ligne de la liste brute correspond à l'entrée (donc un e-mail) ; false sinon. "
+    "Une entrée décochée reste dans le JSON (ne la supprime pas), avec \"email\": \"\" et \"coche\": false : "
     "le profil est simplement décoché dans l'application.\n"
     "- Deux entrées ne doivent jamais avoir le même email (les e-mails vides des entrées décochées sont exemptés).\n"
     "- \"sites\" : la liste des sites/services sur lesquels le compte est déjà connecté, en minuscules, "
-    "un mot par site (ex. google, youtube, tiktok, facebook). Complète-la d'après les informations que je te "
-    "donne ; garde les sites déjà présents ; mets [] si tu n'en sais rien.\n"
+    "un mot par site (ex. google, youtube, tiktok, facebook). Garde les sites déjà présents dans le JSON actuel "
+    "(même pour une entrée décochée) et ajoute ceux de la ligne brute correspondante (colonne des sites, séparés "
+    "par des virgules), sans doublon ; mets [] si tu n'en sais rien.\n"
     "- Réponds UNIQUEMENT avec le JSON valide : aucun texte avant ou après, aucune explication, "
     "pas de bloc de code markdown.\n"
     "JSON actuel :\n"
@@ -30968,11 +31000,28 @@ class GestionnaireKaggle:
     def __init__(self, api=None, fabrique_api=None, pause=None):
         self._api = api
         self._fabrique_api = fabrique_api
-        self._pause = pause or time.sleep
+        self._pause = pause or self._pause_annulable
         self.journal_detail: list = []  # lignes detaillees du transfert en cours (remontees a l'ecran du pilote)
 
+    @staticmethod
+    def _verifier_annulation() -> None:
+        if _ANNULATION_KAGGLE.is_set():
+            raise ErreurAnnulationKaggle("Operation annulee par l'utilisateur.")
+
+    @classmethod
+    def _pause_annulable(cls, secondes: float) -> None:
+        """time.sleep decoupe en tranches d'1 s : une annulation coupe l'attente en moins d'une seconde."""
+        fin = time.monotonic() + max(0.0, float(secondes))
+        while True:
+            cls._verifier_annulation()
+            reste = fin - time.monotonic()
+            if reste <= 0:
+                return
+            time.sleep(min(1.0, reste))
+
     def _j(self, texte: str) -> None:
-        self.journal_detail.append(texte)
+        # l'heure de l'evenement reel (les lignes remontent toutes d'un coup a la fin de l'envoi)
+        self.journal_detail.append(f"[{time.strftime('%H:%M:%S')}] {texte}")
         _log_kaggle.info("%s", texte)
 
     # -- connexion ---------------------------------------------------------
@@ -31018,14 +31067,35 @@ class GestionnaireKaggle:
         txt = str(e)
         return code == 429 or "429 Client Error" in txt or "Too Many Requests" in txt or "RESOURCE_EXHAUSTED" in txt
 
+    _verrou_cadence_api = threading.Lock()
+    _dernier_appel_api = 0.0
+    _ctx_cadence = threading.local()
+
+    def _espacer_appel_api(self) -> None:
+        """PATCH : cadence globale des appels API (partagee par tous les envois en cours dans ce processus)."""
+        self._verifier_annulation()
+        if getattr(GestionnaireKaggle._ctx_cadence, "dans_appel", False):
+            return  # deja espace par _avec_429 (appel englobant)
+        with GestionnaireKaggle._verrou_cadence_api:
+            maintenant = time.monotonic()
+            attente = max(0.0, GestionnaireKaggle._dernier_appel_api + DELAI_MIN_ENTRE_APPELS_API_S - maintenant)
+            GestionnaireKaggle._dernier_appel_api = maintenant + attente
+        if attente > 0:
+            self._pause(attente)
+
     def _avec_429(self, libelle: str, fonction):
         """Appelle `fonction` ; sur une 429 (trop de requetes Kaggle) fait une pause puis reessaie
         (ATTENTES_429_S), au lieu d'echouer. Toute autre erreur est relancee telle quelle."""
         essai = 0
         while True:
             try:
-                return fonction()
-            except ErreurCorrespondance:
+                self._espacer_appel_api()
+                GestionnaireKaggle._ctx_cadence.dans_appel = True
+                try:
+                    return fonction()
+                finally:
+                    GestionnaireKaggle._ctx_cadence.dans_appel = False
+            except (ErreurCorrespondance, ErreurAnnulationKaggle):
                 raise
             except Exception as e:
                 if not self._est_429(e) or essai >= len(ATTENTES_429_S):
@@ -31040,7 +31110,7 @@ class GestionnaireKaggle:
         for n in range(1, NB_TENTATIVES + 1):
             try:
                 return self._avec_429(libelle, fonction)
-            except ErreurCorrespondance:
+            except (ErreurCorrespondance, ErreurAnnulationKaggle):
                 raise
             except Exception as e:
                 derniere = e
@@ -31052,6 +31122,7 @@ class GestionnaireKaggle:
     # -- lecture -----------------------------------------------------------
     def dataset_existe(self, ref: str) -> bool:
         api = self.authentifier()
+        self._espacer_appel_api()
         try:
             api.dataset_status(ref)
             return True
@@ -31062,12 +31133,18 @@ class GestionnaireKaggle:
             if code == 403 or "403" in str(e) or "forbidden" in str(e).lower():
                 # Kaggle repond 403 (et non 404) pour un dataset qui n'existe pas encore dans ton espace :
                 # on tranche avec la liste de tes propres datasets plutot que de bloquer la creation.
-                return any(d["ref"] == ref for d in self.lister_datasets())
+                try:  # lecture ciblee : si la liste des fichiers repond, le dataset existe (pas de liste complete du compte)
+                    self._fichiers_dataset(ref)
+                    return True
+                except Exception:
+                    pass
+                return any(d["ref"] == ref for d in self.lister_datasets(sonder=False))
             raise
 
-    def lister_datasets(self) -> list:
+    def lister_datasets(self, sonder: bool = True) -> list:
         """Datasets ax- du compte : [{ref, slug, nom_archive, titre, taille_octets,
-        cree_le (ISO|None), maj_le (str|None), prive}]."""
+        cree_le (ISO|None), maj_le (str|None), prive}].
+        PATCH sonder=True : ajoute aussi les archives planifiees que Kaggle ne liste pas (creation interrompue)."""
         api = self.authentifier()
         sortie: list = []
         vus: set = set()
@@ -31108,7 +31185,35 @@ class GestionnaireKaggle:
                 break
             page += 1
         _DIAG_KAGGLE["total_datasets_vus"] = self.total_datasets_vus
+        if sonder:
+            try:
+                sortie.extend(self._sonder_datasets_non_listes({d["slug"] for d in sortie}))
+            except Exception as e:
+                _log_kaggle.warning("Sondage des datasets non listes impossible : %r", e)
         return sortie
+
+    def _sonder_datasets_non_listes(self, slugs_listes: set) -> list:
+        """Datasets planifies qui existent sur Kaggle mais absents de dataset_list (traitement interrompu).
+        Appel direct a dataset_status (jamais lister_datasets : pas de recursion). 404/403 = n'existe pas."""
+        api = self.authentifier()
+        trouves: list = []
+        for slug, nom_archive in sorted(dict(_SLUGS_A_SONDER).items()):
+            if not slug or slug in slugs_listes or not slug.startswith(PREFIXE_DATASET):
+                continue
+            ref = self.ref(slug)
+            try:
+                statut = str(self._avec_429(f"Statut de {ref}", lambda r=ref: api.dataset_status(r)) or "")
+            except Exception:
+                continue  # absent (404/403) ou illisible : on ne l'invente pas
+            try:
+                taille = sum(t for _, t in self._fichiers_dataset(ref))
+            except Exception:
+                taille = 0
+            trouves.append({"ref": ref, "slug": slug, "titre": titre_depuis_nom(nom_archive),
+                            "nom_archive": nom_archive, "taille_octets": taille, "cree_le": None, "sites": [],
+                            "maj_le": None, "prive": True,
+                            "incomplet": not statut.lower().endswith("ready"), "statut": statut})
+        return trouves
 
     def supprimer_dataset(self, slug: str):
         """Supprime definitivement UN dataset ax- du compte Kaggle (garde-fou : jamais un autre dataset).
@@ -31143,6 +31248,7 @@ class GestionnaireKaggle:
         jeton = None
         vus: set = set()
         for _ in range(1000):  # la liste est paginee (20 par defaut) : on suit les pages jusqu'a la fin
+            self._espacer_appel_api()
             try:
                 rep = api.dataset_list_files(ref, page_token=jeton, page_size=200)
             except TypeError:
@@ -31188,6 +31294,7 @@ class GestionnaireKaggle:
 
         try:
             nom_zip = f"{nom_archive}{KAGGLE_EXTENSION_ARCHIVE}"
+            self._j(f"Code d'envoi sAutoniax : {VERSION_CODE_ENVOI}")
             self._j(f"Envoi de '{nom_profil}' vers {ref} (archive '{nom_zip}')")
             prog("Archivage", 5)
             t0 = time.monotonic()
@@ -31253,7 +31360,7 @@ class GestionnaireKaggle:
                 metadonnees["subtitle"] = sous_titre_creation(date_envoi, sites_envoi)
             else:
                 # la date de creation vit dans le sous-titre existant : on la conserve, jamais ecrasee
-                existant = next((d for d in self.lister_datasets() if d["ref"] == ref), None)
+                existant = self._lire_dataset_cible(ref)
                 if existant and existant.get("cree_le"):
                     metadonnees["subtitle"] = sous_titre_creation(existant["cree_le"], sites_envoi)
                 if existant:
@@ -31266,22 +31373,22 @@ class GestionnaireKaggle:
             api = self.authentifier()
             prog("Envoi vers Kaggle", 30)
             t0 = time.monotonic()
+            def _creer():
+                rep = api.dataset_create_new(temp, public=False, quiet=True, convert_to_csv=False, dir_mode="skip")
+                erreur = getattr(rep, "error", "") or ""
+                if erreur:
+                    raise ErreurKaggle(erreur)
+                return rep
             if not existe:
                 self._j(f"Creation du dataset : debut ({formater_taille_octets(taille)} a envoyer)")
-
-                def _creer():
-                    rep = api.dataset_create_new(temp, public=False, quiet=True, convert_to_csv=False, dir_mode="skip")
-                    erreur = getattr(rep, "error", "") or ""
-                    if erreur:
-                        raise ErreurKaggle(erreur)
-                    return rep
                 self._avec_tentatives(f"Creation de {ref}", _creer)
                 self._j(f"Creation du dataset : terminee en {_kg_duree(t0)}")
             else:
                 self._j(f"Mise a jour du dataset : debut ({formater_taille_octets(taille)} a envoyer)")
                 # FIX : le statut 'ready' est celui de l'ANCIENNE version ; on memorise ses fichiers pour detecter la nouvelle
                 try:
-                    liste_avant = sorted(self._fichiers_dataset(ref))
+                    liste_avant = (sorted(existant["fichiers"]) if existant and existant.get("fichiers") is not None
+                                   else sorted(self._fichiers_dataset(ref)))
                 except Exception as e:
                     _log_kaggle.warning("Liste avant mise a jour illisible pour %s : %r", ref, e)
                     liste_avant = None
@@ -31293,17 +31400,49 @@ class GestionnaireKaggle:
                     if erreur:
                         raise ErreurKaggle(erreur)
                     return rep
-                self._avec_tentatives(f"Mise a jour de {ref}", _maj)
-                self._j(f"Mise a jour du dataset : terminee en {_kg_duree(t0)}")
+                try:
+                    self._avec_tentatives(f"Mise a jour de {ref}", _maj)
+                    self._j(f"Mise a jour du dataset : terminee en {_kg_duree(t0)}")
+                except (ErreurCorrespondance, ErreurAnnulationKaggle):
+                    raise
+                except Exception as e_maj:
+                    # PATCH : mise a jour impossible (dataset incomplet, interrompu...) -> on SUPPRIME puis on RECREE
+                    # avec le meme nom. Le zip est pret, le dossier local n'est touche qu'apres verification.
+                    self._j(f"Mise a jour impossible ({e_maj}) : verification de {ref}")
+                    try:
+                        encore_la = self.dataset_existe(ref)
+                    except Exception:
+                        encore_la = True  # doute : on supprime (404 = deja supprime, sans risque)
+                    if encore_la:
+                        self._j(f"{ref} existe : suppression puis recreation")
+                        prog("Suppression de l'ancienne archive", 40)
+                        self.supprimer_dataset(slug)
+                        for _ in range(24):  # Kaggle libere le nom avec un petit delai
+                            try:
+                                if not self.dataset_existe(ref):
+                                    break
+                            except Exception:
+                                break
+                            self._pause(5)
+                    else:
+                        self._j(f"{ref} n'existe pas : creation directe")
+                    existe = False
+                    existait = False
+                    liste_avant = None
+                    metadonnees["subtitle"] = sous_titre_creation(date_envoi, sites_envoi)
+                    with open(os.path.join(temp, "dataset-metadata.json"), "w", encoding="utf-8") as f:
+                        json.dump(metadonnees, f, ensure_ascii=False)
+                    t0 = time.monotonic()
+                    self._j(f"Creation du dataset : debut ({formater_taille_octets(taille)} a envoyer)")
+                    self._avec_tentatives(f"Creation de {ref}", _creer)
+                    self._j(f"Creation du dataset : terminee en {_kg_duree(t0)}")
             prog("Attente Kaggle", 70)
             t0 = time.monotonic()
-            self._attendre_pret(ref)
-            if existait:
-                self._attendre_nouvelle_version(ref, liste_avant)
+            fichiers_publies = self._attendre_fichier_publie(ref, nom_zip, taille, liste_avant)
             self._j(f"Kaggle a termine le traitement apres {_kg_duree(t0)}")
             prog("Verification", 90)
             verif = self._verifier_envoi(ref, nom_zip, taille, nb_zip, nb_zip_non_vides, taille_contenu_zip,
-                                         liste_avant=liste_avant)
+                                         liste_avant=liste_avant, fichiers_initiaux=fichiers_publies)
             avertissements.extend(verif["avertissements"])
             _kg_hist_maj(dossier_profils, nom_profil, nom_archive=nom_archive, nb_fichiers=nb_dossier,
                          taille=taille_dossier, dernier_envoi=date_envoi, kaggle_mode=verif["mode"],
@@ -31407,7 +31546,7 @@ class GestionnaireKaggle:
         except Exception:
             pass
         try:
-            if any(d["ref"] == ref for d in self.lister_datasets()):
+            if any(d["ref"] == ref for d in self.lister_datasets(sonder=False)):
                 return "ready"
         except Exception:
             pass
@@ -31425,7 +31564,42 @@ class GestionnaireKaggle:
                 raise ErreurKaggle(f"Kaggle a refuse le traitement de {ref} (statut '{statut}').")
             if time.monotonic() - debut > DELAI_PRET_KAGGLE_S:
                 raise ErreurKaggle(f"Kaggle n'a pas termine le traitement de {ref} en {DELAI_PRET_KAGGLE_S}s (statut '{statut}').")
-            self._pause(min(5, max(0.01, DELAI_PRET_KAGGLE_S / 100)))
+            self._pause(min(INTERVALLE_SONDAGE_STATUT_S, max(0.01, DELAI_PRET_KAGGLE_S / 100)))
+
+    def _metadonnees_dataset(self, ref: str) -> dict:
+        """dataset-metadata.json du dataset existant (title, subtitle, description...) ; {} si illisible."""
+        dossier = tempfile.mkdtemp(prefix="kg_meta_")
+        try:
+            api = self.authentifier()
+            chemin = self._avec_429(f"Metadonnees de {ref}", lambda: api.dataset_metadata(ref, dossier))
+            if not chemin or not os.path.isfile(str(chemin)):
+                chemin = os.path.join(dossier, "dataset-metadata.json")
+            with open(chemin, "r", encoding="utf-8") as f:
+                donnees = json.load(f)
+            return donnees if isinstance(donnees, dict) else {}
+        except Exception as e:
+            _log_kaggle.warning("Metadonnees illisibles pour %s : %r", ref, e)
+            return {}
+        finally:
+            shutil.rmtree(dossier, ignore_errors=True)
+
+    def _lire_dataset_cible(self, ref: str) -> dict:
+        """Lecture ciblee du SEUL dataset concerne (au lieu de lister tous les datasets du compte) :
+        {cree_le, taille_octets, fichiers}. Repli sur la liste complete uniquement si la lecture ciblee echoue."""
+        try:
+            fichiers = self._fichiers_dataset(ref)
+            meta = self._metadonnees_dataset(ref)
+            if not meta:
+                raise ErreurKaggle("metadonnees illisibles")  # sous-titre (date de creation) introuvable -> repli liste complete
+            return {"cree_le": date_creation_depuis_sous_titre(meta.get("subtitle")),
+                    "taille_octets": sum(t for _, t in fichiers), "fichiers": fichiers, "meta_lue": bool(meta)}
+        except Exception as e:
+            _log_kaggle.warning("Lecture ciblee de %s impossible (%r) : repli sur la liste complete", ref, e)
+        existant = next((d for d in self.lister_datasets(sonder=False) if d["ref"] == ref), None)
+        if existant:
+            existant = dict(existant)
+            existant["fichiers"] = None
+        return existant or {}
 
     def _email_description_existante(self, ref: str) -> str:
         """Email lu dans la description JSON du dataset existant ('' si illisible : jamais bloquant)."""
@@ -31446,11 +31620,47 @@ class GestionnaireKaggle:
         finally:
             shutil.rmtree(dossier, ignore_errors=True)
 
-    def _attendre_nouvelle_version(self, ref: str, liste_avant) -> None:
+    def _attendre_fichier_publie(self, ref: str, nom_zip: str, taille_zip: int, liste_avant=None) -> list:
+        """Remplace « statut ready » + « liste a changé » : l'upload est déjà réussi, inutile d'interroger le statut.
+        On lit la liste des fichiers du SEUL dataset (toutes les ~8 s) jusqu'à voir l'archive envoyée (même taille).
+        Une lecture qui échoue (404/403 : pas encore publié) = pas encore prêt, pas une erreur."""
+        def _correspond(fs) -> bool:
+            hm = [(n, t) for n, t in fs if n != "meta.json"]
+            return any(n == nom_zip and t == taille_zip for n, t in hm) or (len(hm) == 1 and hm[0][1] == taille_zip)
+
+        debut = time.monotonic()
+        self._pause(5)
+        while True:
+            try:
+                fichiers = self._avec_429(f"Liste des fichiers de {ref}", lambda: self._fichiers_dataset(ref))
+                if fichiers and _correspond(fichiers):
+                    return fichiers
+            except (ErreurCorrespondance, ErreurAnnulationKaggle):
+                raise
+            except Exception as e:
+                _log_kaggle.info("Liste de %s pas encore lisible : %r", ref, e)
+            if time.monotonic() - debut > DELAI_PRET_KAGGLE_S:
+                raise ErreurKaggle(f"Kaggle n'a pas publie {nom_zip} dans {ref} en {DELAI_PRET_KAGGLE_S} s. "
+                                   "Dossier local CONSERVE : reessayez dans un moment.")
+            self._pause(8 + random.uniform(0, 3))
+
+    @staticmethod
+    def _archive_deja_identique(liste_avant, nom_zip: str, taille_zip: int) -> bool:
+        """True si la liste d'AVANT contient deja l'archive envoyee (meme nom, ou nom nettoye par Kaggle avec un
+        seul fichier hors meta.json) avec EXACTEMENT la meme taille : la liste ne changera jamais, inutile d'attendre."""
+        if not liste_avant:
+            return False
+        hm = [(n, t) for n, t in liste_avant if n != "meta.json"]
+        return any(n == nom_zip and t == taille_zip for n, t in hm) or (len(hm) == 1 and hm[0][1] == taille_zip)
+
+    def _attendre_nouvelle_version(self, ref: str, liste_avant, nom_zip: str = "", taille_zip: int = 0) -> None:
         """Apres dataset_create_version, le statut reste 'ready' (ancienne version) : on attend que la liste des
         fichiers change reellement (nouvelle version publiee) avant de verifier. Delai depasse -> on continue
         quand meme (renvoi identique possible) et la verification tranche."""
         if liste_avant is None:
+            return
+        if nom_zip and self._archive_deja_identique(liste_avant, nom_zip, taille_zip):
+            self._j("Archive identique a l'ancienne (meme nom, meme taille) : pas d'attente d'un changement de liste.")
             return
         debut = time.monotonic()
         delai = min(DELAI_PRET_KAGGLE_S, 300)
@@ -31464,10 +31674,10 @@ class GestionnaireKaggle:
             if time.monotonic() - debut > delai:
                 self._j(f"Attention : la liste des fichiers n'a pas change apres {int(delai)} s (renvoi identique ou Kaggle en retard).")
                 return
-            self._pause(min(3, max(0.01, delai / 100)))
+            self._pause(min(5, max(0.01, delai / 100)))
 
     def _verifier_envoi(self, ref: str, nom_zip: str, taille_zip: int, nb_attendu: int,
-                        nb_attendu_non_vides: int, taille_attendue: int, liste_avant=None) -> dict:
+                        nb_attendu_non_vides: int, taille_attendue: int, liste_avant=None, fichiers_initiaux=None) -> dict:
         """Relit ce que Kaggle contient APRES l'envoi et le compare a ce qui est parti.
         - archive gardee : le zip est la, avec la bonne taille ;
         - archive decompressee par Kaggle : meme nombre de fichiers et meme taille totale que le contenu du zip.
@@ -31476,7 +31686,8 @@ class GestionnaireKaggle:
             hm = [(n, t) for n, t in fs if n != "meta.json"]
             return any(n == nom_zip for n, _ in hm) or (len(hm) == 1 and hm[0][1] == taille_zip)
 
-        fichiers = self._avec_tentatives(f"Liste des fichiers de {ref}", lambda: self._fichiers_dataset(ref))
+        fichiers = (fichiers_initiaux if fichiers_initiaux
+                    else self._avec_tentatives(f"Liste des fichiers de {ref}", lambda: self._fichiers_dataset(ref)))
         # FIX journaux : Kaggle peut encore afficher l'ANCIENNE version juste apres l'envoi. Tant que la liste n'est pas
         # celle attendue, on relit (jusqu'a ~60 s) avant de tirer la moindre conclusion.
         for _essai in range(12):
@@ -32120,7 +32331,8 @@ DELAI_INACTIVITE_ENVOI_S = DELAI_PRET_KAGGLE_S + 900
 
 class FluxEnvoiKaggle:
     def __init__(self, profils: list, lister, arreter, envoyer, notifier, terminer, horloge=None,
-                 max_simultanes: int = MAX_TRANSFERTS_SIMULTANES, delai_groupes_s=None, journaliser=None):
+                 max_simultanes: int = MAX_TRANSFERTS_SIMULTANES, delai_groupes_s=None, journaliser=None,
+                 delai_departs_s: float = DELAI_ENTRE_DEPARTS_DEFAUT_S):
         """profils : [{id_executant, nom_local, nom_archive, email, ...}] ; callbacks :
         lister(id_executant), arreter(id_executant, nom_local), envoyer(id_executant, profil),
         notifier(id_executant, nom_local, ok, message), terminer()."""
@@ -32135,6 +32347,11 @@ class FluxEnvoiKaggle:
         self._journaliser = journaliser
         self._groupe_ouvert = False
         self._prochain_groupe = 0.0
+        # PATCH depart echelonne : au moins `delai_departs_s` secondes entre le depart de deux envois (le minuteur du
+        # controleur rappelle _pomper chaque seconde). Evite que N creations arrivent en meme temps chez Kaggle (429).
+        self._delai_departs = max(0.0, float(delai_departs_s or 0.0))
+        self._prochain_depart = 0.0
+        self._places_groupe = 0  # mode groupes : places du groupe en cours qui restent a lancer (departs echelonnes)
         self._entrees = [{"profil": p, "id": p["id_executant"], "nom": p["nom_local"],
                           "etat": "liste", "echeance": 0.0, "timeout": False} for p in profils]
         self._attente_liste: set = set()
@@ -32250,6 +32467,18 @@ class FluxEnvoiKaggle:
             self._attente_liste.clear()
         self._pomper()
 
+    def annuler(self, motif: str = "Annule par l'utilisateur.") -> None:
+        """PATCH : plus rien n'est lance ; toute ligne non terminee est marquee « Annule » ; l'ecran est libere."""
+        if self._termine:
+            return
+        for e in self._entrees:
+            if e["etat"] != "fini":
+                e["etat"] = "fini"
+                e["timeout"] = False
+                self._notifier(e["id"], e["nom"], False, motif)
+        self._termine = True
+        self._terminer()
+
     # -- ordonnancement ----------------------------------------------------
     def _signaler(self, texte: str) -> None:
         if self._journaliser is not None:
@@ -32266,12 +32495,14 @@ class FluxEnvoiKaggle:
         if self._delai_groupes is None:
             libres = self._max - len(en_cours)
         else:
-            if self._groupe_ouvert and not en_cours:
+            if self._groupe_ouvert and not en_cours and self._places_groupe <= 0:
                 self._groupe_ouvert = False
                 self._prochain_groupe = self._horloge() + self._delai_groupes
                 if self._delai_groupes > 0 and any(e["etat"] != "fini" for e in self._entrees):
                     self._signaler(f"Groupe termine : pause de {int(self._delai_groupes)} s avant le prochain groupe.")
-            if en_cours or self._horloge() < self._prochain_groupe:
+            if self._groupe_ouvert and self._places_groupe > 0:
+                libres = self._places_groupe  # fin des departs echelonnes du groupe deja ouvert
+            elif en_cours or self._horloge() < self._prochain_groupe:
                 libres = 0  # groupe en cours, ou pause entre deux groupes
             else:
                 # Les profils deviennent "prets" au fil des reponses des sAutoniax (liste, arret du profil) : on
@@ -32279,19 +32510,29 @@ class FluxEnvoiKaggle:
                 prets = {e["id"] for e in self._entrees if e["etat"] == "pret"}
                 en_preparation = any(e["etat"] in ("liste", "arret") for e in self._entrees)
                 libres = self._max if (len(prets) >= self._max or not en_preparation) else 0
+                self._places_groupe = libres
         lance = False
+        bloque_par_depart = False
         for e in self._entrees:
             if libres <= 0:
                 break
             if e["etat"] == "pret" and e["id"] not in occupes:
+                if self._horloge() < self._prochain_depart:
+                    bloque_par_depart = True  # depart echelonne : le prochain part au prochain passage du minuteur
+                    break
                 e["etat"] = "envoi"
                 e["echeance"] = self._horloge() + DELAI_INACTIVITE_ENVOI_S
                 occupes.add(e["id"])
                 libres -= 1
+                if self._delai_groupes is not None:
+                    self._places_groupe = max(0, self._places_groupe - 1)
                 lance = True
+                self._prochain_depart = self._horloge() + self._delai_departs
                 self._envoyer(e["id"], e["profil"])
         if lance and self._delai_groupes is not None:
             self._groupe_ouvert = True
+        if self._delai_groupes is not None and not bloque_par_depart:
+            self._places_groupe = 0  # plus rien a lancer pour ce groupe (le groupe ne se ferme que quand tout est fini)
         if all(e["etat"] == "fini" for e in self._entrees):
             self._termine = True
             self._terminer()
@@ -32333,10 +32574,14 @@ class FluxTelechargementKaggle:
     MAX_TRANSFERTS_SIMULTANES au total. Un echec n'arrete pas les autres ; pas de
     reaffectation automatique apres deconnexion (ligne en erreur)."""
     def __init__(self, repartition: list, envoyer, notifier, terminer, horloge=None,
-                 max_simultanes: int = MAX_TRANSFERTS_SIMULTANES):
+                 max_simultanes: int = MAX_TRANSFERTS_SIMULTANES,
+                 delai_departs_s: float = DELAI_ENTRE_DEPARTS_DEFAUT_S):
         self._envoyer, self._notifier, self._terminer = envoyer, notifier, terminer
         self._horloge = horloge or time.monotonic
         self._max = max_simultanes
+        # PATCH depart echelonne (meme logique que FluxEnvoiKaggle) : `delai_departs_s` entre deux departs.
+        self._delai_departs = max(0.0, float(delai_departs_s or 0.0))
+        self._prochain_depart = 0.0
         self._entrees = [{"id": r["id_executant"], "profil": p, "nom": p.get("nom_local") or p["nom_archive"],
                           "etat": "pret", "echeance": 0.0, "timeout": False}
                          for r in repartition for p in r.get("profils", [])]
@@ -32392,6 +32637,18 @@ class FluxTelechargementKaggle:
                 self._echouer(e, "Aucune nouvelle du sAutoniax (le resultat peut arriver plus tard).", timeout=True)
         self._pomper()
 
+    def annuler(self, motif: str = "Annule par l'utilisateur.") -> None:
+        """PATCH : plus rien n'est lance ; toute ligne non terminee est marquee « Annule » ; l'ecran est libere."""
+        if self._termine:
+            return
+        for e in self._entrees:
+            if e["etat"] != "fini":
+                e["etat"] = "fini"
+                e["timeout"] = False
+                self._notifier(e["id"], e["nom"], False, motif)
+        self._termine = True
+        self._terminer()
+
     def _pomper(self):
         if self._termine or not self._demarre:
             return
@@ -32401,10 +32658,13 @@ class FluxTelechargementKaggle:
             if libres <= 0:
                 break
             if e["etat"] == "pret" and e["id"] not in occupes:
+                if self._horloge() < self._prochain_depart:
+                    break  # depart echelonne : le prochain part au prochain passage du minuteur
                 e["etat"] = "envoi"
                 e["echeance"] = self._horloge() + DELAI_INACTIVITE_ENVOI_S
                 occupes.add(e["id"])
                 libres -= 1
+                self._prochain_depart = self._horloge() + self._delai_departs
                 self._envoyer(e["id"], e["profil"])
         if all(e["etat"] == "fini" for e in self._entrees):
             self._termine = True
@@ -32414,6 +32674,36 @@ class FluxTelechargementKaggle:
 # ===========================================================================
 # PROFILS KAGGLE (phase 1) -- FIN DU BLOC ISOLE
 # ===========================================================================
+
+
+class ListeCiblesQuatreColonnes(QListWidget):
+    """PATCH : liste des sAutoniax cibles rangee sur 4 colonnes (de gauche a droite, ligne par ligne) au lieu d'une
+    seule ; la largeur d'une colonne suit la largeur de la liste."""
+    NB_COLONNES = 4
+    HAUTEUR_LIGNE = 24
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setViewMode(QListView.ListMode)
+        self.setFlow(QListView.LeftToRight)
+        self.setWrapping(True)
+        self.setResizeMode(QListView.Adjust)
+        self.setUniformItemSizes(True)
+        self.setMovement(QListView.Static)
+        self.setSpacing(0)
+        self._ajuster_colonnes()
+
+    def _ajuster_colonnes(self):
+        largeur = max(50, (self.viewport().width() - 24) // self.NB_COLONNES)  # marge : Qt retourne a la ligne trop tot sinon
+        self.setGridSize(QSize(largeur, self.HAUTEUR_LIGNE))
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._ajuster_colonnes()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self._ajuster_colonnes()
 
 
 class ProfilsKaggleScreen(QWidget):
@@ -32439,6 +32729,7 @@ class ProfilsKaggleScreen(QWidget):
     demande_kaggle_envoyer = Signal(dict)
     demande_kaggle_telecharger = Signal(dict)
     demande_kaggle_supprimer = Signal(dict)  # {id_operation, slug, nom_archive}
+    demande_kaggle_annuler = Signal()  # PATCH : bouton « Tuer la commande en cours »
 
     LIGNES_JOURNAL_MAX = 500
     COL_PROFIL, COL_SITES, COL_TAILLE, COL_MODIF, COL_GARDER, COL_ARCHIVE, COL_ETAT, COL_PROG = range(8)
@@ -32613,7 +32904,8 @@ class ProfilsKaggleScreen(QWidget):
         self.spin_envois_simultanes.setValue(NB_ENVOIS_SIMULTANES_DEFAUT)
         self.spin_envois_simultanes.setToolTip(
             "Nombre de profils envoyes vers Kaggle en meme temps (taille d'un groupe).\n"
-            "Trop eleve : Kaggle repond 429 (trop de requetes). Au plus 1 envoi a la fois par sAutoniax.")
+            "Trop eleve : Kaggle repond 429 (trop de requetes). Au plus 1 envoi a la fois par sAutoniax.\n"
+            "Defaut : 3.")
         colonne_boutons_journal.addWidget(self.spin_envois_simultanes)
         label_delai_groupes = QLabel("Delai entre groupes", colonne_gauche)
         label_delai_groupes.setObjectName("PlaceholderSubtitle")
@@ -32624,10 +32916,34 @@ class ProfilsKaggleScreen(QWidget):
         self.spin_delai_groupes.setValue(DELAI_ENTRE_GROUPES_DEFAUT_S)
         self.spin_delai_groupes.setSuffix(" s")
         self.spin_delai_groupes.setToolTip(
-            "Pause (en secondes) entre la fin d'un groupe d'envois et le depart du groupe suivant.\n"
-            "Le groupe suivant ne part que lorsque TOUS les envois du groupe precedent sont termines.\n"
-            "0 = enchainer directement.")
+            "0 = FENETRE GLISSANTE (recommande) : des qu'un envoi se termine, le suivant part tout de suite,\n"
+            "sans attendre les autres.\n"
+            "Plus de 0 = mode GROUPES : pause (en secondes) entre la fin d'un groupe et le depart du suivant ;\n"
+            "le groupe suivant ne part que lorsque TOUS les envois du groupe precedent sont termines.")
         colonne_boutons_journal.addWidget(self.spin_delai_groupes)
+        label_delai_departs = QLabel("Delai entre departs", colonne_gauche)
+        label_delai_departs.setObjectName("PlaceholderSubtitle")
+        label_delai_departs.setWordWrap(True)
+        colonne_boutons_journal.addWidget(label_delai_departs)
+        self.spin_delai_departs = QSpinBox(colonne_gauche)
+        self.spin_delai_departs.setRange(0, DELAI_ENTRE_DEPARTS_MAX_S)
+        self.spin_delai_departs.setValue(DELAI_ENTRE_DEPARTS_DEFAUT_S)
+        self.spin_delai_departs.setSuffix(" s")
+        self.spin_delai_departs.setToolTip(
+            "Attente minimale entre le depart de deux envois (et de deux telechargements) : ils ne partent jamais\n"
+            "tous en meme temps, ce qui evite les erreurs 429 de Kaggle a la creation / mise a jour des datasets.\n"
+            "0 = aucun delai. Defaut : 3 s.")
+        colonne_boutons_journal.addWidget(self.spin_delai_departs)
+        # PATCH : tue la commande Kaggle en cours (envoi / telechargement / suppression).
+        self.bouton_annuler = QPushButton(" Tuer la commande en cours", colonne_gauche)
+        self.bouton_annuler.setIcon(qta.icon("mdi6.stop-circle-outline", color=Mocha.red))
+        self.bouton_annuler.setCursor(Qt.PointingHandCursor)
+        self.bouton_annuler.setEnabled(False)
+        self.bouton_annuler.setToolTip(
+            "Stoppe l'operation Kaggle en cours : plus aucun profil n'est lance, les transferts en cours sont coupes\n"
+            "des que possible sur les sAutoniax. Le dossier local n'est jamais supprime sans envoi verifie.")
+        self.bouton_annuler.clicked.connect(self._sur_clic_annuler)
+        colonne_boutons_journal.addWidget(self.bouton_annuler)
         colonne_boutons_journal.addStretch(1)
         ligne_journal.addLayout(colonne_boutons_journal)
         layout_g.addLayout(ligne_journal, stretch=1)
@@ -32762,7 +33078,7 @@ class ProfilsKaggleScreen(QWidget):
         label_cibles = QLabel("sAutoniax cibles", colonne_droite)
         label_cibles.setObjectName("ReglagesLabel")
         layout_d.addWidget(label_cibles)
-        self.liste_cibles = QListWidget(colonne_droite)
+        self.liste_cibles = ListeCiblesQuatreColonnes(colonne_droite)
         self.liste_cibles.setObjectName("ProfilsKaggleCibles")
         self.liste_cibles.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)  # pas de barre horizontale (defilement : molette / Maj+molette)
         self.liste_cibles.setMaximumHeight(110)
@@ -32936,7 +33252,7 @@ class ProfilsKaggleScreen(QWidget):
                 del self._profils_par_sautoniax[i]
         self.liste_cibles.blockSignals(True)
         self.liste_cibles.clear()
-        for id_executant, nom in sorted(self._sautoniax.items(), key=lambda kv: (kv[1], kv[0])):
+        for id_executant, nom in sorted(self._sautoniax.items(), key=lambda kv: (_cle_tri_numerique_generique(str(kv[1])), kv[0])):
             it = QListWidgetItem(nom)
             it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
             it.setData(Qt.UserRole, id_executant)
@@ -33061,7 +33377,7 @@ class ProfilsKaggleScreen(QWidget):
             self.arbre_envoi.clear()
             self._items.clear()
             self._items_sautoniax.clear()
-            for id_executant, nom_sautoniax in sorted(self._sautoniax.items(), key=lambda kv: (kv[1], kv[0])):
+            for id_executant, nom_sautoniax in sorted(self._sautoniax.items(), key=lambda kv: (_cle_tri_numerique_generique(str(kv[1])), kv[0])):
                 parent = QTreeWidgetItem([nom_sautoniax])
                 parent.setFlags(parent.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsAutoTristate)
                 parent.setCheckState(self.COL_PROFIL, Qt.Checked)
@@ -33115,6 +33431,7 @@ class ProfilsKaggleScreen(QWidget):
         de profil : l'entree enregistree est ignoree (a refaire), jamais appliquee a tort."""
         corr = self._correspondance()
         sites = dict(getattr(self._reglages_courants(), "kaggle_correspondance_sites", None) or {})
+        return corr, sites, set()  # PATCH : le nom/email donne dans le JSON est TOUJOURS respecte (plus de garde-fou)
         slugs_pris = {d.get("slug") for d in self._datasets}
         for (_i, _n), it in self._items.items():
             origine = it.data(self.COL_GARDER, Qt.UserRole)
@@ -33152,6 +33469,14 @@ class ProfilsKaggleScreen(QWidget):
         self._corr_effective, self._sites_effectifs, self._noms_perimes = corr_eff, sites_corr, perimes
         self._plan_courant = planifier_envoi(lignes, corr_eff)
         self._lignes_courantes_cache = lignes
+        _attendus = {p["slug"]: p["nom_archive"] for p in self._plan_courant if p.get("slug")}
+        _SLUGS_A_SONDER.clear()
+        _SLUGS_A_SONDER.update(_attendus)
+        _cle_sonde = frozenset(_attendus)
+        if _attendus and self._datasets is not None and _cle_sonde != getattr(self, "_cle_derniere_sonde", None) \
+                and any(sl not in {d["slug"] for d in self._datasets} for sl in _attendus):
+            self._cle_derniere_sonde = _cle_sonde  # une seule relance par ensemble : pas de boucle
+            self.demande_kaggle_actualiser_datasets.emit()
         self._maj_en_cours = True
         try:
             for ligne, plan in zip(lignes, self._plan_courant):
@@ -33224,6 +33549,9 @@ class ProfilsKaggleScreen(QWidget):
                      else f"Archives : {r['crees']} creee(s), {r['maj']} mise(s) a jour.\n")
                   + "Les profils en cours seront FERMES (navigateur arrete) avant l'archivage.\n"
                   + f"Suppression du dossier sur le sAutoniax apres envoi verifie : {'OUI' if supprimer else 'non'}.\n")
+        if r["maj"]:
+            detail += (f"\n{r['maj']} archive(s) existante(s) sur Kaggle seront mises a jour (nouvelle version, "
+                       "ou supprimees puis recreees si la mise a jour echoue).")
         if r["bloques"]:
             detail += f"\n{r['bloques']} ligne(s) bloquee(s) (erreur de nommage) : non envoyees."
         if r["ignores"]:
@@ -33251,10 +33579,17 @@ class ProfilsKaggleScreen(QWidget):
         self.ajouter_journal(f"Envoi : {len(profils)} profil(s) (operation {self._operation_id}).")
         max_simultanes = int(self.spin_envois_simultanes.value())
         delai_groupes_s = int(self.spin_delai_groupes.value())
-        self.ajouter_journal(f"Envois par groupes de {max_simultanes}, pause de {delai_groupes_s} s entre deux groupes.")
+        delai_departs_s = int(self.spin_delai_departs.value())
+        self.ajouter_journal(f"Code d'envoi pilote : {VERSION_CODE_ENVOI}.")
+        self.ajouter_journal(f"Departs echelonnes : {delai_departs_s} s minimum entre deux envois.")
+        if delai_groupes_s <= 0:
+            self.ajouter_journal(f"Envois en fenetre glissante : {max_simultanes} en parallele, un envoi termine libere sa place tout de suite.")
+        else:
+            self.ajouter_journal(f"Envois par groupes de {max_simultanes}, pause de {delai_groupes_s} s entre deux groupes.")
         self.demande_kaggle_envoyer.emit({"id_operation": self._operation_id, "supprimer_local": supprimer,
                                           "profils": profils, "max_simultanes": max_simultanes,
-                                          "delai_groupes_s": delai_groupes_s})
+                                          "delai_groupes_s": (delai_groupes_s if delai_groupes_s > 0 else None),
+                                          "delai_departs_s": delai_departs_s})
 
     def _marquer_lignes_en_attente(self, cles: set):
         self._maj_en_cours = True
@@ -33325,7 +33660,8 @@ class ProfilsKaggleScreen(QWidget):
         for d in trier_datasets_par_date(self._datasets, self._tri_recent_d_abord):
             horodatage = formater_horodatage(date_dataset(d))  # 'AAAA-MM-JJ HH:MM'
             jour, _, heure = horodatage.partition(" ")
-            it = QTreeWidgetItem([d.get("nom_archive", ""), formater_taille_octets(d.get("taille_octets")),
+            it = QTreeWidgetItem([d.get("nom_archive", "") + (" [incomplet]" if d.get("incomplet") else ""),
+                                  formater_taille_octets(d.get("taille_octets")),
                                   "", ", ".join(d.get("sites") or [])])
             it.setData(2, DelegueDateKaggle.ROLE_JOUR, jour)
             it.setData(2, DelegueDateKaggle.ROLE_HEURE, heure)
@@ -33545,8 +33881,11 @@ class ProfilsKaggleScreen(QWidget):
         charge = {"id_operation": self._operation_id, "repartition": [
             {"id_executant": i, "nom_executant": self._sautoniax.get(i, i),
              "profils": [{"slug": d["slug"], "nom_archive": d["nom_archive"], "nom_local": d["nom_archive"]} for d in v]}
-            for i, v in sorted(repartition.items()) if v]}
+            for i, v in sorted(repartition.items()) if v],
+            "max_simultanes": int(self.spin_envois_simultanes.value()),
+            "delai_departs_s": int(self.spin_delai_departs.value())}
         self.ajouter_journal(f"Telechargement : {len(choisis)} profil(s) sur {len(charge['repartition'])} sAutoniax (operation {self._operation_id}).")
+        self.ajouter_journal(f"{charge['max_simultanes']} en parallele, departs echelonnes de {charge['delai_departs_s']} s minimum.")
         self.demande_kaggle_telecharger.emit(charge)
 
     def sur_progression_telechargement(self, id_operation: str, id_executant: str, nom_local: str, etape: str, pourcentage: int):
@@ -33581,9 +33920,21 @@ class ProfilsKaggleScreen(QWidget):
     def operation_en_cours(self) -> bool:
         return self._operation_id is not None
 
+    def _sur_clic_annuler(self):
+        if self._operation_id is None:
+            return
+        if QMessageBox.question(self, "Tuer la commande en cours",
+                                "Arreter l'operation Kaggle en cours ?\nLes profils non termines seront marques « Annule ».",
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        self.ajouter_journal("Annulation de l'operation en cours...")
+        self.demande_kaggle_annuler.emit()
+
     def _rafraichir_boutons(self):
         libre = self._operation_id is None
         plan = self._plan_courant
+        if getattr(self, "bouton_annuler", None) is not None:
+            self.bouton_annuler.setEnabled(not libre)
         self.bouton_importer.setEnabled(libre)
         self.bouton_vider.setEnabled(libre)
         self.bouton_actualiser_profils.setEnabled(libre)
@@ -33674,6 +34025,7 @@ class ControleurKaggle(QObject):
         ecran.demande_kaggle_envoyer.connect(self.demarrer_envoi)
         ecran.demande_kaggle_telecharger.connect(self.demarrer_telechargement)
         ecran.demande_kaggle_supprimer.connect(self.supprimer_dataset)
+        ecran.demande_kaggle_annuler.connect(self.annuler_operation)
         # reseau -> controleur
         client_serveur_t.kaggle_profils_recus.connect(self._sur_profils_recus)
         client_serveur_t.kaggle_progression_recue.connect(self._sur_progression)
@@ -33820,6 +34172,10 @@ class ControleurKaggle(QObject):
             delai_groupes_s = None if brut is None else max(0.0, float(brut))
         except (TypeError, ValueError):
             delai_groupes_s = None
+        try:
+            delai_departs_s = max(0.0, float(charge.get("delai_departs_s", DELAI_ENTRE_DEPARTS_DEFAUT_S)))
+        except (TypeError, ValueError):
+            delai_departs_s = float(DELAI_ENTRE_DEPARTS_DEFAUT_S)
         self._flux = FluxEnvoiKaggle(
             profils,
             lister=lambda i: self._client.envoyer_ordre_kaggle("kaggle_lister_profils", i, id_operation),
@@ -33830,6 +34186,7 @@ class ControleurKaggle(QObject):
             max_simultanes=max_simultanes,
             delai_groupes_s=delai_groupes_s,
             journaliser=self._ecran.ajouter_journal,
+            delai_departs_s=delai_departs_s,
         )
         self._flux.demarrer()
 
@@ -33841,6 +34198,15 @@ class ControleurKaggle(QObject):
             return
         self._operation = id_operation
         self._type_operation = "telechargement"
+        try:
+            brut = charge.get("max_simultanes")
+            max_simultanes = NB_ENVOIS_SIMULTANES_DEFAUT if brut is None else max(1, min(int(brut), MAX_TRANSFERTS_SIMULTANES))
+        except (TypeError, ValueError):
+            max_simultanes = NB_ENVOIS_SIMULTANES_DEFAUT
+        try:
+            delai_departs_s = max(0.0, float(charge.get("delai_departs_s", DELAI_ENTRE_DEPARTS_DEFAUT_S)))
+        except (TypeError, ValueError):
+            delai_departs_s = float(DELAI_ENTRE_DEPARTS_DEFAUT_S)
         self._flux = FluxTelechargementKaggle(
             list(charge.get("repartition") or []),
             envoyer=lambda i, p: self._client.envoyer_ordre_kaggle(
@@ -33849,8 +34215,28 @@ class ControleurKaggle(QObject):
                           "nom_local": p.get("nom_local") or p["nom_archive"]}]),
             notifier=lambda i, n, ok, m: self._ecran.sur_resultat_telechargement(id_operation, i, n, ok, m),
             terminer=lambda: self._ecran.terminer_operation(id_operation),
+            max_simultanes=max_simultanes,
+            delai_departs_s=delai_departs_s,
         )
         self._flux.demarrer()
+
+    def annuler_operation(self):
+        """PATCH : bouton « Tuer la commande en cours ». Stoppe le flux cote pilote, envoie l'ordre d'annulation a
+        chaque sAutoniax concerne (coupe le transfert en cours), puis libere l'ecran."""
+        flux = self._flux_actif()
+        id_operation = self._operation or ""
+        if flux is None:
+            # rien de pilote a arreter (suppression de datasets, operation figee...) : on libere simplement l'ecran
+            self._ecran.ajouter_journal("Aucun envoi/telechargement en cours : ecran libere de force.")
+            if self._ecran.operation_en_cours():
+                self._ecran.terminer_operation(self._ecran._operation_id)
+            return
+        ids = sorted({e["id"] for e in getattr(flux, "_entrees", [])})
+        for i in ids:
+            # type d'ordre deja relaye par le serveur ; le drapeau 'annuler' est lu par le sAutoniax
+            self._client.envoyer_ordre_kaggle("kaggle_lister_profils", i, id_operation, annuler=True)
+        self._ecran.ajouter_journal(f"Annulation demandee a {len(ids)} sAutoniax.")
+        flux.annuler()
 
     def _arreter_profil(self, id_executant, nom_local):
         # kill_profil ferme le navigateur et vide les registres ; "Arreter" (arreter_execution_profil) n'arrete que le
@@ -35151,6 +35537,71 @@ class SAutoniaxAvecServeurManagerScreen(NotebookManagerScreen):
             texte_tooltip_drag="Glisser pour copier sAutoniaxAvecServeur.ipynb hors d'AutoniaX",
             parent=parent,
         )
+
+        # PATCH (demande explicite utilisateur : "il faut patcher cette
+        # interface de tels sorte qu'elle montre aussi les paquets a
+        # decocher, par defaut tout sont cochés") -- même bloc de cases à
+        # cocher que SAutoniaxManagerScreen (BINAIRES_SAUTONIAX), mais qui
+        # réécrit les lignes INSTALLER_* du notebook COMBINÉ
+        # (get_notebook_combine_path) et non celui de sAutoniax. Tout est
+        # coché par défaut ; décocher un binaire inutilisé évite son
+        # téléchargement sur Kaggle/Colab.
+        label_binaires = QLabel("Binaires à télécharger au démarrage", self)
+        label_binaires.setObjectName("PlaceholderSubtitle")
+        label_binaires.setAlignment(Qt.AlignCenter)
+        self.layout().addWidget(label_binaires)
+
+        conteneur_binaires = QWidget(self)
+        ligne_binaires = QHBoxLayout(conteneur_binaires)
+        ligne_binaires.setContentsMargins(0, 0, 0, 0)
+        ligne_binaires.setSpacing(14)
+        self._cases_binaires = {}
+        for variable, libelle in BINAIRES_SAUTONIAX:
+            case = QCheckBox(libelle, conteneur_binaires)
+            case.setChecked(True)  # tout coché par défaut
+            case.setCursor(Qt.PointingHandCursor)
+            self._cases_binaires[variable] = case
+            ligne_binaires.addWidget(case)
+        self.layout().addWidget(conteneur_binaires, 0, Qt.AlignCenter)
+
+        self.label_statut_binaires = QLabel("", self)
+        self.label_statut_binaires.setObjectName("PlaceholderSubtitle")
+        self.label_statut_binaires.setAlignment(Qt.AlignCenter)
+        self.label_statut_binaires.setWordWrap(True)
+        self.layout().addWidget(self.label_statut_binaires)
+
+        # Connecté APRÈS les setChecked(True) ci-dessus : sinon chaque
+        # setChecked déclencherait une réécriture inutile du notebook.
+        for case in self._cases_binaires.values():
+            case.toggled.connect(self._sur_changement_binaires)
+
+        # Synchronise un notebook déjà déposé avec l'état affiché (tout
+        # coché) : sans ça, les cases afficheraient "tout coché" alors que
+        # le fichier sur disque garderait d'anciennes valeurs INSTALLER_*
+        # jusqu'au prochain clic ou dépôt. Rien n'est créé si le notebook
+        # n'a jamais été déposé.
+        if get_notebook_combine_path().is_file():
+            self._appliquer_binaires()
+
+    def _options_binaires(self) -> dict:
+        return {variable: case.isChecked() for variable, case in self._cases_binaires.items()}
+
+    def _sur_changement_binaires(self, _etat=None) -> None:
+        self._appliquer_binaires()
+
+    def _appliquer_binaires(self) -> None:
+        options = self._options_binaires()
+        try:
+            configurer_binaires_notebook(options, get_notebook_combine_path())
+        except (FileNotFoundError, ValueError, OSError, json.JSONDecodeError) as e:
+            self.label_statut_binaires.setText(f"Échec : {e}")
+            return
+        coches = [libelle for variable, libelle in BINAIRES_SAUTONIAX if options[variable]]
+        self.label_statut_binaires.setText("Binaires du notebook : " + (", ".join(coches) if coches else "aucun") + ".")
+
+    def _apres_depot_notebook(self) -> None:
+        """Un notebook vient d'être déposé : on lui applique les cases cochées actuelles."""
+        self._appliquer_binaires()
 
 
 class ReseauScreen(QWidget):
@@ -37429,7 +37880,7 @@ class ParametresScreen(QWidget):
         self.liste_sources_logs.addItem(item_serveur)
 
         for id_executant, nom_affiche in sorted(
-            getattr(self, "_executants_logs_connus", {}).items(), key=lambda paire: paire[1]
+            getattr(self, "_executants_logs_connus", {}).items(), key=lambda paire: _cle_tri_numerique_generique(str(paire[1]))
         ):
             item = QListWidgetItem(f"sAutoniax : {nom_affiche}")
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
@@ -44611,7 +45062,7 @@ class TestComposantScreen(InstanceApercuScreen):
         # combo -- cohérent avec le "Aucun sAutoniax connecté" juste en bas,
         # qui a la même intention (rendre visible l'état vide, pas le taire).
         au_moins_un_profil = False
-        for id_executant, nom_executant in sorted(self._noms_executants_reseau.items(), key=lambda kv: kv[1]):
+        for id_executant, nom_executant in sorted(self._noms_executants_reseau.items(), key=lambda kv: _cle_tri_numerique_generique(str(kv[1]))):
             profils = self._instances_par_profil_reseau.get(id_executant, {})
             if not profils:
                 index_vide = self.instance_combo.count()
@@ -68081,7 +68532,7 @@ class PanneauExecutionClone(QWidget):
         # imaginé ; reste Interactive, donc ajustable à la main si un nom
         # de profil plus long apparaît un jour (tooltip déjà posé en
         # filet de sécurité, cf. item.setToolTip(0, ...) plus bas).
-        self.table_profils.setColumnWidth(0, 62)
+        self.table_profils.setColumnWidth(0, 56)  # Profil : ajuste au contenu (case + "iaX20"), sans vide
         # CORRECTIF (retour utilisateur : "et tu as élargi pour le temps ?")
         # -- QTreeWidget active stretchLastSection=True par défaut, qui
         # étire la DERNIÈRE colonne du header pour combler tout l'espace
@@ -68197,7 +68648,7 @@ class PanneauExecutionClone(QWidget):
         # reste Fixed/42 : pas concerné par cette demande, ses libellés
         # ("Succès", "Échec"...) restent de longueur fixe et connue.
         self.table_profils.header().setSectionResizeMode(1, QHeaderView.Interactive)
-        self.table_profils.setColumnWidth(1, 48)
+        self.table_profils.setColumnWidth(1, 70)  # sAutoniax : ajuste au contenu, sans vide
         # CORRECTIF (retour utilisateur : "je veux que le message de
         # statut soit completement affiché, succes est coupé") -- 42px
         # (hérité de la section 10, pensé à l'époque pour un panneau à
@@ -69222,12 +69673,27 @@ class PanneauExecutionClone(QWidget):
         # main par-dessus cet ajustement automatique, et le tooltip posé
         # plus haut (item.setToolTip(0, ...)) reste un filet de sécurité
         # si jamais un nom dépasse même la largeur du panneau.
-        largeur_contenu = self.table_profils.sizeHintForColumn(0)
-        self.table_profils.setColumnWidth(0, max(largeur_contenu, 62))
+        self._ajuster_largeurs_profil_sautoniax()
         # AJOUT (spec B.2, colonne "Temps") -- (re)démarre le QTimer
         # d'affichage live si au moins un profil est "en_cours" après
         # cette reconstruction, l'arrête sinon (cf. sa docstring).
         self._synchroniser_timer_temps()
+
+    def _ajuster_largeurs_profil_sautoniax(self) -> None:
+        """Colonnes Profil et sAutoniax AJUSTEES AU CONTENU, sans espace vide a droite du texte :
+        largeur = texte le plus long (ou titre de la colonne s'il est plus large) + une petite marge."""
+        fm = self.table_profils.fontMetrics()
+        fm_entete = self.table_profils.header().fontMetrics()
+        entete = self.table_profils.headerItem()
+        plus_long_profil = fm_entete.horizontalAdvance(entete.text(0))
+        plus_long_exec = fm_entete.horizontalAdvance(entete.text(1))
+        for i in range(self.table_profils.topLevelItemCount()):
+            it = self.table_profils.topLevelItem(i)
+            plus_long_profil = max(plus_long_profil, fm.horizontalAdvance(it.text(0)) + 24)   # +24 : case a cocher
+            plus_long_exec = max(plus_long_exec, fm.horizontalAdvance(it.text(1)))
+        # marge fixe de ~12 px (gauche + droite) ; plafond Profil 90 px (le tooltip donne le nom complet au-dela)
+        self.table_profils.setColumnWidth(0, min(plus_long_profil + 14, 90))
+        self.table_profils.setColumnWidth(1, plus_long_exec + 16)
 
     @staticmethod
     def _libelle_statut(statut: str) -> str:
@@ -85200,7 +85666,7 @@ class TaskConfigScreen(QWidget):
             return None
         menu = QMenu(self)
         menu.setTitle(titre)
-        for id_executant, nom in sorted(self._noms_executants_reseau.items(), key=lambda kv: kv[1]):
+        for id_executant, nom in sorted(self._noms_executants_reseau.items(), key=lambda kv: _cle_tri_numerique_generique(str(kv[1]))):
             action = menu.addAction(nom)
             action.setData(id_executant)
         chosen = menu.exec(QCursor.pos())
@@ -91439,6 +91905,7 @@ class ClientServeurT(QObject):
     PAS_TACHE_GARANTIE = 5.0
     DELAI_ALERTE_SILENCE_SESSION = 30.0
     DELAI_ECHEC_SILENCE_SESSION = 300.0
+    RELANCES_SESSION_PERDUE_MAX = 2   # PATCH : nb de relances automatiques d'une exécution que le sAutoniax ne connaît plus
 
     def _garantie_enregistrer(self, uid: str, type_msg: str, session_id: str, id_pilote: str, texte: str, mode: str):
         """Mémorise un message à livrer (appelé par la boucle réseau, JUSTE AVANT le premier envoi)."""
@@ -91545,6 +92012,20 @@ class ClientServeurT(QObject):
                 motif = (f"Aucun signe de vie du clone depuis {silence:.0f} s (connexion coupée ou clone arrêté) -- "
                          "exécution considérée comme perdue.")
             elif s["absences"] >= 3 and maintenant - s["t_envoi"] > 40.0:
+                if s.get("ordre") and s.get("relances", 0) < self.RELANCES_SESSION_PERDUE_MAX:
+                    # PATCH : le sAutoniax répond mais ne connaît plus la session (redémarré, ordre perdu) : au lieu
+                    # de passer en erreur, on RENVOIE l'ordre de départ (la session absente n'est pas en cours : sûr).
+                    s["relances"] = s.get("relances", 0) + 1
+                    s["t_envoi"] = s["t_vie"] = maintenant
+                    s["absences"], s["alerte"] = 0, False
+                    log_reseau_t.warning(f"[VIE-SESSION] session={sid} : inconnue du sAutoniax -> relance automatique "
+                                         f"{s['relances']}/{self.RELANCES_SESSION_PERDUE_MAX}")
+                    self.notebook_distant_log_recu.emit(
+                        sid, s["id_executant"],
+                        f"⚠ Le sAutoniax ne connaît plus cette exécution (redémarré ?) -- relance automatique "
+                        f"{s['relances']}/{self.RELANCES_SESSION_PERDUE_MAX}.")
+                    asyncio.ensure_future(self._renvoyer_ordre_session(sid, s["ordre"]))
+                    continue
                 motif = "Le clone est joignable mais ne connaît plus cette exécution (redémarré, ou demande perdue)."
             if motif:
                 self._sessions_attendues.pop(sid, None)
@@ -91557,6 +92038,18 @@ class ClientServeurT(QObject):
                     sid, s["id_executant"],
                     f"⚠ Aucun signe de vie du clone depuis {silence:.0f} s -- attente de sa reconnexion "
                     f"(abandon automatique après {self.DELAI_ECHEC_SILENCE_SESSION:.0f} s).")
+
+    async def _renvoyer_ordre_session(self, session_id: str, ordre: dict):
+        """PATCH relance : renvoie l'ordre de départ d'une session perdue côté sAutoniax."""
+        try:
+            await self._ws.send(json.dumps(ordre))
+            log_reseau_t.info(f"-> executer_notebook_distant RENVOYÉ (relance, session={session_id}, "
+                              f"id_executant={ordre.get('id_executant')!r}, profil={ordre.get('profil_nom')!r})")
+        except Exception as e:
+            log_reseau_t.warning(f"Relance de la session {session_id} impossible : {e!r}")
+            self._sessions_attendues.pop(session_id, None)
+            self.notebook_distant_resultat_recu.emit(session_id, ordre.get("id_executant", ""), False,
+                                                     f"Relance automatique impossible : {e}", None, None, None, None)
 
     def _noter_vie_session(self, data: dict) -> bool:
         """Côté PILOTE : tout message d'un clone prouve qu'il est vivant. Retourne True si le message est
@@ -93761,6 +94254,13 @@ class ClientServeurT(QObject):
             _t_now = time.time()
             self._sessions_attendues[session_id] = {
                 "id_executant": id_executant, "t_envoi": _t_now, "t_vie": _t_now, "absences": 0, "alerte": False,
+                # PATCH relance : l'ordre est gardé pour être renvoyé si le sAutoniax a redémarré / perdu la session
+                "relances": 0,
+                "ordre": {"type": "executer_notebook_distant", "id_executant": id_executant,
+                          "session_id": session_id, "profil_nom": profil_nom, "code": code,
+                          "services_api_lies": services_api_lies or {},
+                          "reinitialiser_result_color": reinitialiser_result_color,
+                          "lire_result_color_finale": lire_result_color_finale},
             }
             log_reseau_t.info(
                 f"-> executer_notebook_distant envoyé au serveurT "
@@ -100115,7 +100615,7 @@ class DialogueEnvoiSautoniax(DialogueAutoniaXBase):
 
         self.combo_cible = QComboBox(self.zone_contenu)
         self.combo_cible.setObjectName("ReglagesCombo")
-        for id_executant, nom in sorted(executants.items(), key=lambda kv: kv[1]):
+        for id_executant, nom in sorted(executants.items(), key=lambda kv: _cle_tri_numerique_generique(str(kv[1]))):
             self.combo_cible.addItem(nom, id_executant)
         self.ajouter_widget(self.combo_cible)
 
@@ -114127,7 +114627,7 @@ class MainWindow(QMainWindow):
         if mautoniax_coche:
             sections_attendues.append(("__mautoniax__", "mAutoniax (cette instance)"))
         noms_par_id = getattr(parametres_screen, "_executants_logs_connus", {}) if parametres_screen else {}
-        for id_executant in sorted(ids_sautoniax_coches, key=lambda i: noms_par_id.get(i, i)):
+        for id_executant in sorted(ids_sautoniax_coches, key=lambda i: _cle_tri_numerique_generique(str(noms_par_id.get(i, i)))):
             sections_attendues.append((id_executant, f"sAutoniax : {noms_par_id.get(id_executant, id_executant)}"))
 
         self._copie_logs_en_cours = {
@@ -114224,7 +114724,7 @@ class MainWindow(QMainWindow):
         # sAutoniax). ids_executant_sautoniax est déjà dédupliqué par
         # l'appelant (cf. TaskConfigScreen._sur_demande_copier_logs_
         # execution_clone) -- aucun filtrage supplémentaire nécessaire ici.
-        for id_executant in sorted(ids_executant_sautoniax, key=lambda i: noms_par_id.get(i, {}).get("nom", i)):
+        for id_executant in sorted(ids_executant_sautoniax, key=lambda i: _cle_tri_numerique_generique(str(noms_par_id.get(i, {}).get("nom", i)))):
             nom_affiche = noms_par_id.get(id_executant, {}).get("nom", id_executant)
             sections_attendues.append((id_executant, f"sAutoniax : {nom_affiche}"))
 
@@ -147844,6 +148344,16 @@ async def _main_async_sautoniax(
         id_pilote = msg.get("id_pilote", "")
         id_operation = msg.get("id_operation", "")
         dossier_profils = str(_chemin_donnees("sautoniax_profils"))
+        if msg.get("annuler"):
+            # PATCH : ordre d'annulation du pilote -> les transferts de CETTE operation s'arretent au prochain point
+            # de controle (appel API, pause) ; les profils suivants de l'operation sont sautes.
+            _OPERATION_ANNULEE["id"] = id_operation
+            _ANNULATION_KAGGLE.set()
+            log.info(f"[sAutoniax] kaggle : annulation demandee (operation {id_operation!r}).")
+            return
+        if type_ordre in ("kaggle_envoyer_profils", "kaggle_telecharger_profils") \
+                and _ANNULATION_KAGGLE.is_set() and id_operation != _OPERATION_ANNULEE["id"]:
+            _ANNULATION_KAGGLE.clear()  # nouvelle operation : le drapeau de l'ancienne ne la concerne pas
         try:
             if type_ordre == "kaggle_lister_profils":
                 profils_k = scanner_profils_kaggle(dossier_profils, _kaggle_noms_actifs())
@@ -147877,6 +148387,10 @@ async def _main_async_sautoniax(
                         client_t.envoyer_kaggle_vers_pilote("kaggle_progression", id_pilote, id_operation=id_operation,
                                                             nom_local=_n, etape=etape, pourcentage=int(pct))
 
+                    if _ANNULATION_KAGGLE.is_set() and id_operation == _OPERATION_ANNULEE["id"]:
+                        client_t.envoyer_kaggle_vers_pilote("kaggle_resultat", id_pilote, id_operation=id_operation,
+                                                            nom_local=nom_local_k, ok=False, message="Annule.")
+                        continue
                     # l'arret confirme par le pilote peut mettre quelques secondes a vider les registres
                     for _ in range(15):
                         if nom_local_k not in _kaggle_noms_actifs():
