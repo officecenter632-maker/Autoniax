@@ -33225,7 +33225,27 @@ class ProfilsKaggleScreen(QWidget):
         self.bouton_telecharger.setCursor(Qt.PointingHandCursor)
         self.bouton_telecharger.setEnabled(False)
         self.bouton_telecharger.clicked.connect(self._sur_clic_telecharger)
-        layout_d.addWidget(self.bouton_telecharger)
+
+        # PATCH : boutons icones « tout selectionner / tout deselectionner » des sAutoniax cibles, sur la meme ligne
+        # que « Repartir et telecharger ».
+        ligne_telecharger = QHBoxLayout()
+        ligne_telecharger.setSpacing(6)
+        self.bouton_cibles_tout = QToolButton(colonne_droite)
+        self.bouton_cibles_tout.setIcon(qta.icon("mdi6.checkbox-multiple-marked-outline", color=Mocha.text))
+        self.bouton_cibles_tout.setToolTip("Tout sélectionner (sAutoniax cibles)")
+        self.bouton_cibles_tout.setCursor(Qt.PointingHandCursor)
+        self.bouton_cibles_tout.clicked.connect(lambda: self._cocher_toutes_cibles(True))
+        self.bouton_cibles_aucun = QToolButton(colonne_droite)
+        self.bouton_cibles_aucun.setIcon(qta.icon("mdi6.checkbox-multiple-blank-outline", color=Mocha.text))
+        self.bouton_cibles_aucun.setToolTip("Tout désélectionner (sAutoniax cibles)")
+        self.bouton_cibles_aucun.setCursor(Qt.PointingHandCursor)
+        self.bouton_cibles_aucun.clicked.connect(lambda: self._cocher_toutes_cibles(False))
+        for b in (self.bouton_cibles_tout, self.bouton_cibles_aucun):
+            b.setFixedHeight(self.bouton_telecharger.sizeHint().height())
+            b.setFixedWidth(max(34, self.bouton_telecharger.sizeHint().height()))
+            ligne_telecharger.addWidget(b)
+        ligne_telecharger.addWidget(self.bouton_telecharger, stretch=1)
+        layout_d.addLayout(ligne_telecharger)
 
         separation.addWidget(colonne_gauche)
         separation.addWidget(colonne_droite)
@@ -33786,6 +33806,18 @@ class ProfilsKaggleScreen(QWidget):
     def _sur_clic_entete_datasets(self, section: int):
         if section == 2:
             self._sur_clic_tri_date()
+
+    def _cocher_toutes_cibles(self, cocher: bool):
+        """PATCH : coche / decoche tous les sAutoniax cibles d'un coup (un seul rafraichissement des boutons)."""
+        etat = Qt.Checked if cocher else Qt.Unchecked
+        self.liste_cibles.blockSignals(True)
+        for r in range(self.liste_cibles.count()):
+            it = self.liste_cibles.item(r)
+            if it.flags() & Qt.ItemIsUserCheckable and it.flags() & Qt.ItemIsEnabled:
+                it.setCheckState(etat)
+        self.liste_cibles.blockSignals(False)
+        self.liste_cibles.viewport().update()
+        self._rafraichir_boutons()
 
     def _reconstruire_table_datasets(self):
         coches = {self.table_datasets.topLevelItem(r).data(0, Qt.UserRole): self.table_datasets.topLevelItem(r).checkState(0)
