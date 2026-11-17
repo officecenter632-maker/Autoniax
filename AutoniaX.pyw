@@ -32811,7 +32811,16 @@ class ListeCiblesQuatreColonnes(QListWidget):
         self._ajuster_colonnes()
 
     def _ajuster_colonnes(self):
-        largeur = max(50, (self.viewport().width() - 24) // self.NB_COLONNES)  # marge : Qt retourne a la ligne trop tot sinon
+        # PATCH : la largeur d'une colonne est au minimum celle du nom le plus long (+ case a cocher),
+        # donc le nom s'affiche toujours en entier ; le nombre de colonnes s'adapte (4 max).
+        fm = self.fontMetrics()
+        plus_long = 0
+        for r in range(self.count()):
+            plus_long = max(plus_long, fm.horizontalAdvance(self.item(r).text()))
+        largeur_min = plus_long + 48  # case a cocher + marges
+        dispo = self.viewport().width() - 24  # marge : Qt retourne a la ligne trop tot sinon
+        nb = max(1, min(self.NB_COLONNES, dispo // max(1, largeur_min)))
+        largeur = max(largeur_min, dispo // nb)
         self.setGridSize(QSize(largeur, self.HAUTEUR_LIGNE))
 
     def resizeEvent(self, e):
@@ -33412,8 +33421,10 @@ class ProfilsKaggleScreen(QWidget):
             it = QListWidgetItem(nom)
             it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
             it.setData(Qt.UserRole, id_executant)
+            it.setToolTip(nom)  # PATCH : nom complet en infobulle
             it.setCheckState(coches.get(id_executant, Qt.Unchecked))
             self.liste_cibles.addItem(it)
+        self.liste_cibles._ajuster_colonnes()  # PATCH : recalculer les largeurs avec les nouveaux noms
         self.liste_cibles.blockSignals(False)
         self._reconstruire_arbre()
         self._rafraichir_boutons()
