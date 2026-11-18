@@ -23,6 +23,7 @@ import io
 import json
 import logging
 import posixpath
+import sys
 import tempfile
 import time
 import uuid
@@ -934,6 +935,10 @@ RESOLUTION_PAR_DEFAUT = "full"
 LIMITE_INSTANCES_PAR_EXECUTANT = 30
 
 
+_WEBP_FONCTIONNE = True  # passe à False au premier échec d'encodage WebP
+_NB_RECOMPRESSIONS_LOGUEES = 0
+
+
 def _recompresser_pour_diffusion(image_b64_source: str, preference: dict) -> str:
     """Reçoit la capture TELLE QUE REÇUE de l'exécutant (WebP qualité
     100, pleine résolution -- cf. ClientServeurT._envoyer_capture côté
@@ -971,8 +976,10 @@ def _recompresser_pour_diffusion(image_b64_source: str, preference: dict) -> str
         return image_b64_source
     if not PILLOW_DISPONIBLE:
         return image_b64_source
+    diag_source = "non decode"
     try:
         donnees_source = base64.b64decode(image_b64_source)
+        diag_source = "entete=%r" % (donnees_source[:12],)
         # CORRECTIF ROBUSTESSE (cf. commentaire d'en-tête du fichier --
         # crash -11/SIGSEGV sous forte charge) : garde-fou sur la taille
         # AVANT de passer les octets à Pillow/libwebp (code natif en C).
@@ -997,20 +1004,102 @@ def _recompresser_pour_diffusion(image_b64_source: str, preference: dict) -> str
         with io.BytesIO(donnees_source) as buffer_entree:
             img = PILImage.open(buffer_entree)
             img.load()
-            if img.mode not in ("RGB", "RGBA"):
-                img = img.convert("RGB")
-            # Aucun redimensionnement ici (cf. docstring ci-dessus) --
-            # seule la qualité de compression WebP change la taille du
-            # fichier, jamais les dimensions en pixels de l'image.
+            # CORRECTIF "unsupported image mode" (ValueError levée par
+            # l'encodeur natif libwebp de Pillow) : le mode annoncé par
+            # un fichier WebP rouvert peut être autre chose que
+            # RGB/RGBA (ex. "RGBa" prémultiplié venant du décodeur
+            # d'animation, ou cadre issu d'un WebP animé), et l'ancien
+            # test `img.mode not in ("RGB", "RGBA")` laissait passer
+            # des cas où l'objet restait un ImageFile WebP avec ses
+            # propres métadonnées de séquence. On reconstruit donc une
+            # image Pillow PURE (pixels bruts, mode RGB ou RGBA
+            # explicite, aucune métadonnée de plugin) avant d'encoder.
+            # Aucun redimensionnement : mêmes dimensions que la source.
+            diag_source = "format=%r mode=%r taille=%r" % (img.format, img.mode, img.size)
+            a_alpha = (
+                img.mode in ("RGBA", "LA", "PA", "RGBa", "La")
+                or "transparency" in img.info
+            )
+            mode_cible = "RGBA" if a_alpha else "RGB"
+            if img.mode != mode_cible:
+                img = img.convert(mode_cible)
+            img_pure = PILImage.frombytes(mode_cible, img.size, img.tobytes())
             with io.BytesIO() as buffer_sortie:
-                img.save(buffer_sortie, format="WEBP", quality=qualite)
+                # CORRECTIF : l'encodeur WebP de Pillow plante sur ce
+                # serveur ("unsupported image mode" alors que le mode est
+                # RGB). On tente WebP une fois ; au premier échec on
+                # mémorise (_WEBP_FONCTIONNE=False) et on bascule en JPEG
+                # pour toutes les captures suivantes (JPEG marche toujours).
+                global _WEBP_FONCTIONNE
+                if _WEBP_FONCTIONNE:
+                    try:
+                        img_pure.save(
+                            buffer_sortie, format="WEBP", quality=qualite,
+                            method=4, save_all=False,
+                        )
+                    except (ValueError, OSError) as e_webp:
+                        _WEBP_FONCTIONNE = False
+                        try:
+                            from PIL import features as _pil_features
+                            diag_pil = (
+                                "pillow=%s python=%s plateforme=%s "
+                                "webp_ok=%r libwebp=%r webp_anim=%r "
+                                "webp_mux=%r jpeg_ok=%r libjpeg=%r "
+                                "modules_pillow=%r"
+                            ) % (
+                                getattr(PILImage, "__version__", "?"),
+                                sys.version.split()[0], sys.platform,
+                                _pil_features.check("webp"),
+                                _pil_features.version("webp"),
+                                _pil_features.check("webp_anim"),
+                                _pil_features.check("webp_mux"),
+                                _pil_features.check("jpg"),
+                                _pil_features.version("jpg"),
+                                [m for m in ("webp", "jpg", "zlib", "libtiff")
+                                 if _pil_features.check(m)],
+                            )
+                        except Exception as e_diag:
+                            diag_pil = "diagnostic Pillow impossible : %r" % (e_diag,)
+                        logger.warning(
+                            "WebP indisponible sur ce serveur -- bascule "
+                            "définitive en JPEG. erreur=%r | image: mode=%r "
+                            "taille=%r octets_bruts=%d qualite=%r | source: %s "
+                            "| env: %s",
+                            e_webp, img_pure.mode, img_pure.size,
+                            len(img_pure.tobytes()), qualite, diag_source,
+                            diag_pil,
+                            exc_info=True,
+                        )
+                        buffer_sortie.seek(0)
+                        buffer_sortie.truncate()
+                if not _WEBP_FONCTIONNE:
+                    img_jpeg = img_pure.convert("RGB")
+                    img_jpeg.save(
+                        buffer_sortie, format="JPEG", quality=qualite,
+                        optimize=True,
+                    )
                 donnees_sortie = buffer_sortie.getvalue()
+                global _NB_RECOMPRESSIONS_LOGUEES
+                _NB_RECOMPRESSIONS_LOGUEES += 1
+                if _NB_RECOMPRESSIONS_LOGUEES <= 5 or _NB_RECOMPRESSIONS_LOGUEES % 50 == 0:
+                    logger.info(
+                        "_recompresser_pour_diffusion : ok #%d format_sortie=%s "
+                        "qualite=%r taille_px=%r source=%d octets -> sortie=%d octets "
+                        "(%.0f%%)",
+                        _NB_RECOMPRESSIONS_LOGUEES,
+                        "WEBP" if _WEBP_FONCTIONNE else "JPEG", qualite,
+                        img_pure.size, len(donnees_source), len(donnees_sortie),
+                        100.0 * len(donnees_sortie) / max(1, len(donnees_source)),
+                    )
         return base64.b64encode(donnees_sortie).decode("ascii")
     except Exception as e:
         logger.warning(
-            "_recompresser_pour_diffusion : échec (qualite=%r, source_len=%d) : %r -- "
-            "capture envoyée à ce pilote telle que reçue.",
-            qualite, len(image_b64_source or ""), e,
+            "_recompresser_pour_diffusion : échec (qualite=%r, source_len=%d, "
+            "pillow=%s, %s) : %r -- capture envoyée à ce pilote telle que reçue.",
+            qualite, len(image_b64_source or ""),
+            getattr(PILImage, "__version__", "?") if PILLOW_DISPONIBLE else "absent",
+            diag_source, e,
+            exc_info=True,
         )
         return image_b64_source
 
