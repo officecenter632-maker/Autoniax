@@ -67859,6 +67859,8 @@ class FenetreRenduTaskReseau(QWidget):
     def traiter_resultat_copie_distante(self, data: dict) -> bool:
         """PATCH Ctrl+C -- appelé par l'hôte (3 écrans) pour chaque command_result.
         Retourne True si la réponse concernait un Ctrl+C de cette vue."""
+        if self._traiter_resultat_synchro_presse_papier(data):
+            return True
         if self._traiter_resultat_copie_adresse(data):
             return True
         if self._traiter_resultat_sauvegarde_page(data):
@@ -68051,6 +68053,18 @@ class FenetreRenduTaskReseau(QWidget):
         self._minuteur_survol_panneau = QTimer(self)
         self._minuteur_survol_panneau.setInterval(self._INTERVALLE_SURVEILLANCE_SOURIS_MS)
         self._minuteur_survol_panneau.timeout.connect(self._verifier_survol_panneau_flottant)
+
+        # PATCH (demande utilisateur : "quand je clique sur un bouton de copie dans le navigateur
+        # distant, ça doit venir dans ma machine") -- une copie déclenchée PAR LA PAGE (bouton
+        # "copier", clic sur un e-mail...) est interceptée côté instance et reste dans son presse-papier
+        # virtuel, sans aucun message vers le pilote. On l'interroge donc périodiquement tant que cette
+        # fenêtre est visible (action get_clipboard_info) et on recopie dans le presse-papier LOCAL.
+        self._requete_synchro_presse_papier = None
+        self._ticks_attente_synchro_presse_papier = 0
+        self._ts_presse_papier_distant_vu = "__jamais__"   # 1re réponse = simple référence (rien de périmé copié)
+        self._minuteur_synchro_presse_papier = QTimer(self)
+        self._minuteur_synchro_presse_papier.setInterval(self._INTERVALLE_SYNCHRO_PRESSE_PAPIER_MS)
+        self._minuteur_synchro_presse_papier.timeout.connect(self._interroger_presse_papier_distant)
 
         self._repositionner_panneau_flottant()
 
@@ -68392,6 +68406,8 @@ class FenetreRenduTaskReseau(QWidget):
         # interroger QCursor.pos() toutes les 60ms pour un widget invisible.
         if hasattr(self, "_minuteur_survol_panneau"):
             self._minuteur_survol_panneau.stop()
+        if hasattr(self, "_minuteur_synchro_presse_papier"):
+            self._minuteur_synchro_presse_papier.stop()
         if hasattr(self, "barre_onglets"):
             self.barre_onglets.definir_survol(False)
         super().hideEvent(event)
@@ -68428,9 +68444,51 @@ class FenetreRenduTaskReseau(QWidget):
         if bouton.isEnabled():
             bouton.click()
 
+    _INTERVALLE_SYNCHRO_PRESSE_PAPIER_MS = 700
+
+    def _interroger_presse_papier_distant(self):
+        """Envoie get_clipboard_info (une seule requête en vol ; abandon après ~5 s sans réponse)."""
+        if not self.isVisible():
+            return
+        if self._requete_synchro_presse_papier is not None:
+            self._ticks_attente_synchro_presse_papier += 1
+            if self._ticks_attente_synchro_presse_papier < 8:
+                return
+        requete_id = self._prochain_requete_id()
+        self._requete_synchro_presse_papier = requete_id
+        self._ticks_attente_synchro_presse_papier = 0
+        self.commande_controle_distance.emit({
+            "requete_id": requete_id,
+            "commande": {"action": "get_clipboard_info"},
+        })
+
+    def _traiter_resultat_synchro_presse_papier(self, data: dict) -> bool:
+        if data.get("requete_id") is None or data.get("requete_id") != self._requete_synchro_presse_papier:
+            return False
+        self._requete_synchro_presse_papier = None
+        if not data.get("ok", False):
+            return True   # instance ancienne (sans get_clipboard_info) ou injoignable : silence, on réessaiera
+        resultat = data.get("result")
+        if not isinstance(resultat, dict):
+            return True
+        ts = resultat.get("ts")
+        texte = resultat.get("texte")
+        precedent = self._ts_presse_papier_distant_vu
+        self._ts_presse_papier_distant_vu = ts
+        if precedent == "__jamais__" or ts is None or ts == precedent or not isinstance(texte, str) or not texte:
+            return True
+        QGuiApplication.clipboard().setText(texte)
+        from PySide6.QtWidgets import QToolTip
+        QToolTip.showText(QCursor.pos(), f"Copié depuis le navigateur distant ({len(texte)} caractères)")
+        return True
+
     def showEvent(self, event):
         if hasattr(self, "_minuteur_survol_panneau") and self.isVisible():
             self._minuteur_survol_panneau.start()
+        if hasattr(self, "_minuteur_synchro_presse_papier") and self.isVisible():
+            self._ts_presse_papier_distant_vu = "__jamais__"
+            self._requete_synchro_presse_papier = None
+            self._minuteur_synchro_presse_papier.start()
         super().showEvent(event)
 
 
@@ -137298,6 +137356,9 @@ async def _executer_commande_camoufox(
         elif action == "copy":
             await action_camoufox_copy(page)
             resultat = etat_navigateur.get("presse_papier_virtuel", "")
+        elif action == "get_clipboard_info":
+            # PATCH synchro presse-papier : texte + horodatage de la dernière copie faite PAR LA PAGE.
+            resultat = {"texte": action_camoufox_get_clipboard(etat_navigateur), "ts": etat_navigateur.get("presse_papier_virtuel_ts")}
         elif action == "get_clipboard":
             resultat = action_camoufox_get_clipboard(etat_navigateur)
         elif action == "get_last_assistant_message":
@@ -139330,7 +139391,7 @@ ACTIONS_4_2 = {"moveCursor", "mousemove", "click", "scroll", "paste", "copy", "l
 # séparé de ACTIONS_4_2 pour ne pas fausser la traçabilité avec le cahier
 # des charges -- ACTIONS_SUPPORTEES (l'union des deux) est ce qu'utilisent
 # réellement le filtrage et le dispatch ci-dessous.
-ACTIONS_ETENDUES = {"type_text", "capture_propre", "mouse_drag", "drag", "drag_page", "clear", "get_clipboard", "shutdown", "newTab", "navigate", "resetInterface", "clearBrowsingData", "remplacerRessources", "isInterfaceInitialisee", "getHomeTabId", "set_download_dir", "getScreenInfo", "press_key", "scroll_simple", "goBack", "goForward", "bringToFront", "dom_paste", "dom_clear", "get_last_assistant_message", "get_html", "find_elements", "evaluer_js", "closeTab"}
+ACTIONS_ETENDUES = {"type_text", "capture_propre", "mouse_drag", "drag", "drag_page", "clear", "get_clipboard", "shutdown", "newTab", "navigate", "resetInterface", "clearBrowsingData", "remplacerRessources", "isInterfaceInitialisee", "getHomeTabId", "set_download_dir", "getScreenInfo", "press_key", "scroll_simple", "goBack", "goForward", "bringToFront", "dom_paste", "dom_clear", "get_last_assistant_message", "get_html", "find_elements", "evaluer_js", "closeTab", "get_clipboard_info"}
 # PATCH (demande explicite utilisateur -- généralisation de Composant.id_dom,
 # "composant.id_dom.paste(), et clear()" -> composant.dom_paste()/
 # dom_clear(), cf. action_dom_paste/action_dom_clear juste au-dessus) :
@@ -139586,6 +139647,9 @@ async def _executer_commande(browser, etat_navigateur: dict, data: dict, arret_d
             # click(copier_presse_papier=True) laisserait le global à un
             # horodatage périmé et fausserait le test de fraîcheur.
             _memoriser_copie_presse_papier(etat_navigateur, resultat)
+        elif action == "get_clipboard_info":
+            # PATCH synchro presse-papier : texte + horodatage de la dernière copie faite PAR LA PAGE.
+            resultat = {"texte": action_get_clipboard(etat_navigateur), "ts": etat_navigateur.get("presse_papier_virtuel_ts")}
         elif action == "get_clipboard":
             # Hors 4.2 (cf. ACTIONS_ETENDUES) -- lit le presse-papier
             # VIRTUEL de cette instance SANS déclencher de copie au
@@ -142291,6 +142355,9 @@ srv_ACTIONS_SUPPORTEES = {
     # Lit le presse-papier du navigateur sans déclencher de copie (cf.
     # action_get_clipboard, InstanceExecutable.get_presse_papier).
     "get_clipboard",
+    # PATCH synchro presse-papier distant -> local : {"texte", "ts"} du presse-papier virtuel
+    # (sans quoi le serveur rejette l'action avant l'instance, même piège que get_clipboard).
+    "get_clipboard_info",
     # get_last_assistant_message : MÊME PIÈGE que type_text/capture_propre/
     # drag/drag_page/clear/dom_paste/dom_clear/get_clipboard ci-dessus
     # (septième occurrence) -- ajoutée à ACTIONS_ETENDUES côté
