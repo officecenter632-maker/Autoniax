@@ -66548,7 +66548,8 @@ class FenetreRenduTaskReseau(QWidget):
         # Téléchargements/saver_pages, puis ce FICHIER est copié dans le presse-papier. Le résultat revient
         # par traiter_resultat_copie_distante (point d'entrée déjà branché dans les 3 écrans hôtes).
         self._BOUTON_SAUVER_TAILLE = 48
-        self._requetes_sauvegarde_page: set = set()
+        self._requetes_sauvegarde_page: dict = {}   # {requete_id: nom de fichier choisi, ou None}
+        self.case_choisir_nom_sauvegarde = None     # créée dans _construire_entete_panneau_flottant (panneau de droite)
         self.bouton_sauver_page = QToolButton(self.panneau.colonne_image)
         self.bouton_sauver_page.setObjectName("BoutonSauverPageDistante")
         self.bouton_sauver_page.setIcon(qta.icon("mdi6.content-save-outline", color=Mocha.text))
@@ -66817,8 +66818,25 @@ class FenetreRenduTaskReseau(QWidget):
     def _sur_clic_sauver_page(self):
         if self._requetes_sauvegarde_page:
             return  # une sauvegarde est déjà en cours
+        nom_choisi = None
+        case = self.case_choisir_nom_sauvegarde
+        if case is not None and case.isChecked():
+            # PATCH (demande explicite utilisateur : "on demande d'entrer le nom ... si dans le panneau de
+            # droite on a coché toujours choisir le nom") -- le nom est demandé AVANT de récupérer la page ;
+            # Annuler = aucune sauvegarde.
+            from PySide6.QtWidgets import QInputDialog
+            defaut = f"{time.strftime('%Y%m%d_%H%M%S')}_page"
+            texte, ok = QInputDialog.getText(
+                self, "Sauvegarder la page", "Nom du fichier (sans extension) :", text=defaut,
+            )
+            if not ok:
+                return
+            nom_choisi = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", texte).strip().strip(".")
+            if nom_choisi.lower().endswith((".html", ".htm")):
+                nom_choisi = nom_choisi.rsplit(".", 1)[0].strip()
+            nom_choisi = nom_choisi or defaut
         requete_id = self._prochain_requete_id()
-        self._requetes_sauvegarde_page.add(requete_id)
+        self._requetes_sauvegarde_page[requete_id] = nom_choisi
         self.bouton_sauver_page.setEnabled(False)
         self.bouton_sauver_page.setToolTip("Récupération de la page en cours…")
         self.commande_controle_distance.emit({
@@ -66844,7 +66862,7 @@ class FenetreRenduTaskReseau(QWidget):
     def _expirer_sauvegarde_page(self, requete_id: str):
         if requete_id not in self._requetes_sauvegarde_page:
             return  # déjà traitée
-        self._requetes_sauvegarde_page.discard(requete_id)
+        self._requetes_sauvegarde_page.pop(requete_id, None)
         self._terminer_sauvegarde_page("mdi6.alert-circle-outline", Mocha.red,
                                        "Sauvegarde de la page : aucune réponse (délai dépassé).")
 
@@ -66853,7 +66871,7 @@ class FenetreRenduTaskReseau(QWidget):
         requete_id = data.get("requete_id")
         if requete_id not in self._requetes_sauvegarde_page:
             return False
-        self._requetes_sauvegarde_page.discard(requete_id)
+        nom_choisi = self._requetes_sauvegarde_page.pop(requete_id, None)
         if not data.get("ok", False):
             self._terminer_sauvegarde_page("mdi6.alert-circle-outline", Mocha.red,
                                            f"Sauvegarde impossible : {data.get('error', 'erreur inconnue')}")
@@ -66866,7 +66884,12 @@ class FenetreRenduTaskReseau(QWidget):
         try:
             dossier = Path.home() / "Downloads" / "saver_pages"
             dossier.mkdir(parents=True, exist_ok=True)
-            chemin = dossier / f"{time.strftime('%Y%m%d_%H%M%S')}_page.html"
+            base = nom_choisi or f"{time.strftime('%Y%m%d_%H%M%S')}_page"
+            chemin = dossier / f"{base}.html"
+            n = 1
+            while nom_choisi and chemin.exists():  # nom choisi déjà pris : jamais d'écrasement silencieux
+                chemin = dossier / f"{base}_{n}.html"
+                n += 1
             chemin.write_text(html, encoding="utf-8")
         except OSError as exc:
             QGuiApplication.clipboard().setText(html)  # repli : au moins le texte
@@ -68031,6 +68054,31 @@ class FenetreRenduTaskReseau(QWidget):
         entete_layout.addWidget(self.bouton_fermer)
 
         colonne_reglages.layout().insertWidget(0, entete)
+
+        # PATCH (demande explicite utilisateur : "si dans le panneau de droite on a coché toujours choisir le
+        # nom") -- interrupteur juste sous l'entête, même composant (ToggleSwitch) que les autres. Décoché par
+        # défaut : la sauvegarde garde son nom automatique (AAAAMMJJ_HHMMSS_page.html).
+        bande_nom = QWidget(colonne_reglages)
+        layout_nom = QHBoxLayout(bande_nom)
+        layout_nom.setContentsMargins(0, 0, 0, 0)
+        layout_nom.setSpacing(10)
+        icone_nom = QLabel(bande_nom)
+        icone_nom.setPixmap(qta.icon("mdi6.rename-box-outline", color=Mocha.overlay1).pixmap(15, 15))
+        layout_nom.addWidget(icone_nom)
+        label_nom = QLabel("Toujours choisir le nom de la sauvegarde", bande_nom)
+        label_nom.setObjectName("ReglagesLabel")
+        label_nom.setWordWrap(True)
+        layout_nom.addWidget(label_nom, 1)
+        self.case_choisir_nom_sauvegarde = QCheckBox(bande_nom)
+        self.case_choisir_nom_sauvegarde.setObjectName("ToggleSwitch")
+        self.case_choisir_nom_sauvegarde.setCursor(Qt.PointingHandCursor)
+        self.case_choisir_nom_sauvegarde.setChecked(False)
+        self.case_choisir_nom_sauvegarde.setToolTip(
+            "Coché : le bouton de sauvegarde (en bas à gauche de l'image) demande d'abord le nom du fichier.\n"
+            "Décoché (par défaut) : nom automatique AAAAMMJJ_HHMMSS_page.html."
+        )
+        layout_nom.addWidget(self.case_choisir_nom_sauvegarde)
+        colonne_reglages.layout().insertWidget(1, bande_nom)
 
     def _repositionner_panneau_flottant(self):
         """Replaque colonne_reglages contre le bord droit de colonne_image,
