@@ -68108,8 +68108,8 @@ class FenetreRenduTaskReseau(QWidget):
         colonne_reglages.layout().insertWidget(0, entete)
 
         # PATCH (demande explicite utilisateur : "si dans le panneau de droite on a coché toujours choisir le
-        # nom") -- interrupteur juste sous l'entête, même composant (ToggleSwitch) que les autres. Décoché par
-        # défaut : la sauvegarde garde son nom automatique (AAAAMMJJ_HHMMSS_page.html).
+        # nom") -- interrupteur juste sous l'entête, même composant (ToggleSwitch) que les autres. Coché par
+        # défaut (demande utilisateur) : décoché = nom automatique (AAAAMMJJ_HHMMSS_page.html).
         bande_nom = QWidget(colonne_reglages)
         layout_nom = QHBoxLayout(bande_nom)
         layout_nom.setContentsMargins(0, 0, 0, 0)
@@ -68124,10 +68124,10 @@ class FenetreRenduTaskReseau(QWidget):
         self.case_choisir_nom_sauvegarde = QCheckBox(bande_nom)
         self.case_choisir_nom_sauvegarde.setObjectName("ToggleSwitch")
         self.case_choisir_nom_sauvegarde.setCursor(Qt.PointingHandCursor)
-        self.case_choisir_nom_sauvegarde.setChecked(False)
+        self.case_choisir_nom_sauvegarde.setChecked(True)   # PATCH : actif par défaut
         self.case_choisir_nom_sauvegarde.setToolTip(
-            "Coché : le bouton de sauvegarde (en bas à gauche de l'image) demande d'abord le nom du fichier.\n"
-            "Décoché (par défaut) : nom automatique AAAAMMJJ_HHMMSS_page.html."
+            "Coché (par défaut) : le bouton de sauvegarde (en bas à gauche de l'image) demande d'abord le nom du fichier.\n"
+            "Décoché : nom automatique AAAAMMJJ_HHMMSS_page.html."
         )
         layout_nom.addWidget(self.case_choisir_nom_sauvegarde)
         colonne_reglages.layout().insertWidget(1, bande_nom)
