@@ -67859,6 +67859,8 @@ class FenetreRenduTaskReseau(QWidget):
     def traiter_resultat_copie_distante(self, data: dict) -> bool:
         """PATCH Ctrl+C -- appelé par l'hôte (3 écrans) pour chaque command_result.
         Retourne True si la réponse concernait un Ctrl+C de cette vue."""
+        if self._traiter_resultat_action(data):
+            return True
         if self._traiter_resultat_synchro_presse_papier(data):
             return True
         if self._traiter_resultat_copie_adresse(data):
@@ -68129,6 +68131,199 @@ class FenetreRenduTaskReseau(QWidget):
         )
         layout_nom.addWidget(self.case_choisir_nom_sauvegarde)
         colonne_reglages.layout().insertWidget(1, bande_nom)
+        self._construire_section_actions(colonne_reglages)
+
+    # ------------------------------------------------------------------
+    # ACTIONS (demande utilisateur : "dans le panneau droit une liste d'actions ... je donne le nom de l'action
+    # et le code à exécuter ; directement, ça récupère la page actuelle (sans l'enregistrer) puis ça copie le
+    # résultat dans le presse-papier système"). Une action = {"nom", "code"}. Le code est du PYTHON exécuté
+    # LOCALEMENT, avec `html` (code HTML de l'onglet actif, jamais écrit sur disque), `re` et `json` ; il
+    # place le texte à copier dans `resultat`. Liste persistée dans ~/.autoniax/actions_pilote.json.
+    # ------------------------------------------------------------------
+    _FICHIER_ACTIONS = Path.home() / ".autoniax" / "actions_pilote.json"
+    _CODE_ACTION_EXEMPLE = (
+        "# `html` = code HTML de la page active (rien n'est enregistré sur disque).\n"
+        "# Mets dans `resultat` le texte à copier dans le presse-papier. `re` et `json` sont disponibles.\n"
+        "m = re.search(r'user-dropdown-email[^>]*>\\s*([^<\\s]+@[^<\\s]+)\\s*<', html)\n"
+        "resultat = m.group(1) if m else ''\n"
+    )
+
+    def _charger_actions(self) -> list:
+        exemple = [{"nom": "Adresse e-mail Proton", "code": self._CODE_ACTION_EXEMPLE}]
+        try:
+            donnees = json.loads(self._FICHIER_ACTIONS.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            self._actions = exemple      # premier lancement : une action d'exemple prête à l'emploi
+            self._sauver_actions()
+            return exemple
+        except (OSError, ValueError):
+            return []
+        if not isinstance(donnees, list):
+            return []
+        return [a for a in donnees if isinstance(a, dict) and a.get("nom") and isinstance(a.get("code"), str)]
+
+    def _sauver_actions(self):
+        try:
+            self._FICHIER_ACTIONS.parent.mkdir(parents=True, exist_ok=True)
+            self._FICHIER_ACTIONS.write_text(
+                json.dumps(self._actions, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError as exc:
+            from PySide6.QtWidgets import QToolTip
+            QToolTip.showText(QCursor.pos(), f"Actions : écriture impossible ({exc})")
+
+    def _construire_section_actions(self, colonne_reglages: QWidget):
+        self._requetes_actions = {}
+        self._actions = []
+        self._actions = self._charger_actions()
+        section = QWidget(colonne_reglages)
+        disposition = QVBoxLayout(section)
+        disposition.setContentsMargins(0, 0, 0, 0)
+        disposition.setSpacing(4)
+        entete = QHBoxLayout()
+        entete.setSpacing(4)
+        titre = QLabel("Actions", section)
+        titre.setObjectName("ReglagesLabel")
+        entete.addWidget(titre, 1)
+        for icone, infobulle, rappel in (
+            ("mdi6.play", "Exécuter l'action sélectionnée (double-clic sur l'action : idem)", self._executer_action_selectionnee),
+            ("mdi6.plus", "Nouvelle action", self._nouvelle_action),
+            ("mdi6.pencil-outline", "Modifier l'action sélectionnée", self._modifier_action_selectionnee),
+            ("mdi6.trash-can-outline", "Supprimer l'action sélectionnée", self._supprimer_action_selectionnee),
+        ):
+            bouton = QToolButton(section)
+            bouton.setIcon(qta.icon(icone, color=Mocha.text))
+            bouton.setToolTip(infobulle)
+            bouton.setCursor(Qt.PointingHandCursor)
+            bouton.clicked.connect(rappel)
+            entete.addWidget(bouton)
+        disposition.addLayout(entete)
+        self.liste_actions = QListWidget(section)
+        self.liste_actions.setMaximumHeight(130)
+        self.liste_actions.itemDoubleClicked.connect(lambda _item: self._executer_action_selectionnee())
+        disposition.addWidget(self.liste_actions)
+        colonne_reglages.layout().insertWidget(2, section)
+        self._rafraichir_liste_actions()
+
+    def _rafraichir_liste_actions(self, selection: int = 0):
+        self.liste_actions.clear()
+        for action in self._actions:
+            self.liste_actions.addItem(str(action["nom"]))
+        if self._actions:
+            self.liste_actions.setCurrentRow(max(0, min(selection, len(self._actions) - 1)))
+
+    def _editer_action(self, action: Optional[dict]) -> Optional[dict]:
+        dialogue = QDialog(self)
+        dialogue.setWindowTitle("Action" if action is None else f"Modifier l'action « {action['nom']} »")
+        dialogue.resize(660, 460)
+        disposition = QVBoxLayout(dialogue)
+        champ_nom = QLineEdit(action["nom"] if action else "", dialogue)
+        champ_nom.setPlaceholderText("Nom de l'action")
+        disposition.addWidget(champ_nom)
+        aide = QLabel(
+            "Code Python exécuté sur TON ordinateur. Variables : html (code HTML de la page active, "
+            "non enregistré), re, json. Mets le texte à copier dans resultat. "
+            "N'exécute que du code de confiance (il a un accès complet à ta machine).", dialogue)
+        aide.setWordWrap(True)
+        disposition.addWidget(aide)
+        champ_code = QPlainTextEdit(dialogue)
+        champ_code.setStyleSheet("font-family: Consolas, 'Courier New', monospace;")
+        champ_code.setPlainText(action["code"] if action else "resultat = ''\n")
+        disposition.addWidget(champ_code, 1)
+        boutons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, dialogue)
+        boutons.accepted.connect(dialogue.accept)
+        boutons.rejected.connect(dialogue.reject)
+        disposition.addWidget(boutons)
+        if dialogue.exec() != QDialog.DialogCode.Accepted:
+            return None
+        nom = champ_nom.text().strip()
+        if not nom:
+            return None
+        return {"nom": nom, "code": champ_code.toPlainText()}
+
+    def _nouvelle_action(self):
+        action = self._editer_action(None)
+        if action is None:
+            return
+        self._actions.append(action)
+        self._sauver_actions()
+        self._rafraichir_liste_actions(len(self._actions) - 1)
+
+    def _modifier_action_selectionnee(self):
+        ligne = self.liste_actions.currentRow()
+        if ligne < 0 or ligne >= len(self._actions):
+            return
+        action = self._editer_action(self._actions[ligne])
+        if action is None:
+            return
+        self._actions[ligne] = action
+        self._sauver_actions()
+        self._rafraichir_liste_actions(ligne)
+
+    def _supprimer_action_selectionnee(self):
+        ligne = self.liste_actions.currentRow()
+        if ligne < 0 or ligne >= len(self._actions):
+            return
+        nom = self._actions[ligne]["nom"]
+        if QMessageBox.question(self, "Supprimer l'action", f"Supprimer l'action « {nom} » ?") != QMessageBox.StandardButton.Yes:
+            return
+        del self._actions[ligne]
+        self._sauver_actions()
+        self._rafraichir_liste_actions(ligne)
+
+    def _executer_action_selectionnee(self):
+        from PySide6.QtWidgets import QToolTip
+        ligne = self.liste_actions.currentRow()
+        if ligne < 0 or ligne >= len(self._actions):
+            QToolTip.showText(QCursor.pos(), "Sélectionne d'abord une action dans la liste.")
+            return
+        requete_id = self._prochain_requete_id()
+        self._requetes_actions[requete_id] = self._actions[ligne]
+        # Même commande que la sauvegarde de page, mais le HTML reste en mémoire (rien n'est écrit sur disque).
+        self.commande_controle_distance.emit({
+            "requete_id": requete_id,
+            "commande": {"action": "get_html", "selecteur": "", "cadre": ""},
+        })
+        QTimer.singleShot(30000, lambda rid=requete_id: self._expirer_action(rid))
+
+    def _expirer_action(self, requete_id: str):
+        action = self._requetes_actions.pop(requete_id, None)
+        if action is not None:
+            from PySide6.QtWidgets import QToolTip
+            QToolTip.showText(QCursor.pos(), f"Action « {action['nom']} » : aucune réponse (délai dépassé).")
+
+    def _traiter_resultat_action(self, data: dict) -> bool:
+        """True si ce command_result répondait à l'exécution d'une action de cette fenêtre."""
+        requetes = getattr(self, "_requetes_actions", None)
+        requete_id = data.get("requete_id")
+        if not requetes or requete_id not in requetes:
+            return False
+        action = requetes.pop(requete_id)
+        nom = action["nom"]
+        from PySide6.QtWidgets import QToolTip
+        if not data.get("ok", False):
+            QToolTip.showText(QCursor.pos(), f"Action « {nom} » : page indisponible ({data.get('error', 'erreur inconnue')})")
+            return True
+        html = data.get("result")
+        if not isinstance(html, str) or not html.strip():
+            QToolTip.showText(QCursor.pos(), f"Action « {nom} » : le navigateur a renvoyé une page vide.")
+            return True
+        espace = {"html": html, "resultat": "", "re": re, "json": json}
+        try:
+            exec(compile(action["code"], f"<action {nom}>", "exec"), espace)
+        except Exception as exc:  # noqa: BLE001 -- code écrit par l'utilisateur : toute erreur est rapportée, jamais propagée
+            log_reseau_t.warning(f"[actions] « {nom} » a échoué : {type(exc).__name__}: {exc}")
+            QToolTip.showText(QCursor.pos(), f"Action « {nom} » : erreur -- {type(exc).__name__}: {exc}")
+            return True
+        resultat = espace.get("resultat")
+        texte = "" if resultat is None else str(resultat)
+        if not texte.strip():
+            QToolTip.showText(QCursor.pos(), f"Action « {nom} » : aucun résultat (rien copié).")
+            return True
+        QGuiApplication.clipboard().setText(texte)
+        apercu = texte if len(texte) <= 60 else texte[:57] + "…"
+        QToolTip.showText(QCursor.pos(), f"Action « {nom} » : copié -- {apercu}")
+        return True
 
     def _repositionner_panneau_flottant(self):
         """Replaque colonne_reglages contre le bord droit de colonne_image,
