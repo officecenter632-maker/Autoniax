@@ -73674,7 +73674,7 @@ class TaskConfigScreen(QWidget):
         self.bouton_sauver_page_html.setCursor(Qt.PointingHandCursor)
         self.bouton_sauver_page_html.setToolTip(
             "Sauvegarder la page HTML actuelle du navigateur (onglet actif du profil actif) "
-            "et la copier dans le presse-papier\n"
+            "en fichier .html et copier ce fichier dans le presse-papier\n"
             "Clic droit : ouvrir le dossier des sauvegardes"
         )
         self.bouton_sauver_page_html.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -85182,7 +85182,7 @@ class TaskConfigScreen(QWidget):
         self.bouton_sauver_page_html.setIcon(qta.icon("mdi6.content-save-outline", color=Mocha.subtext0))
         self.bouton_sauver_page_html.setToolTip(
             "Sauvegarder la page HTML actuelle du navigateur (onglet actif du profil actif) "
-            "et la copier dans le presse-papier\n"
+            "en fichier .html et copier ce fichier dans le presse-papier\n"
             "Clic droit : ouvrir le dossier des sauvegardes"
         )
 
@@ -85205,22 +85205,25 @@ class TaskConfigScreen(QWidget):
             self._notify_status("Sauvegarde de la page : le navigateur a renvoyé une page vide.", error=True)
             self._terminer_sauvegarde_page_html("mdi6.alert-circle-outline", DarculaTheme.rouge, "Page vide")
             return
-        # AJOUT (demande explicite utilisateur : "quand on appuie sur le
-        # bouton d'enregistrer le code de la page, ça copie directement dans
-        # le presse-papier le code HTML sauvegardé") -- copié AVANT l'écriture
-        # disque : même si l'écriture échoue, le HTML reste dans le presse-papier.
-        QGuiApplication.clipboard().setText(html)
+        # PATCH (demande explicite utilisateur : "dans le presse-papier, ça doit copier aussi en
+        # fichier, pas en texte brut") -- le fichier .html est écrit D'ABORD, puis c'est CE FICHIER
+        # (CF_HDROP / liste d'URLs, comme le bouton "code" du notebook) qui est placé dans le
+        # presse-papier, PAS son texte. Repli : si l'écriture disque échoue, le HTML brut est copié.
         try:
             dossier = self._dossier_sauvegarde_pages_html()
             dossier.mkdir(parents=True, exist_ok=True)
             chemin = dossier / f"{time.strftime('%Y%m%d_%H%M%S')}_page.html"
             chemin.write_text(html, encoding="utf-8")
         except OSError as exc:
-            self._notify_status(f"Écriture de la page impossible : {exc} (HTML tout de même copié dans le presse-papier)", error=True)
+            QGuiApplication.clipboard().setText(html)
+            self._notify_status(f"Écriture de la page impossible : {exc} (HTML copié en texte dans le presse-papier)", error=True)
             self._terminer_sauvegarde_page_html("mdi6.alert-circle-outline", DarculaTheme.rouge, "Échec d'écriture")
             return
-        self._terminer_sauvegarde_page_html("mdi6.check", Mocha.green, "Page sauvegardée et copiée !")
-        self._notify_status(f"Page HTML sauvegardée et copiée dans le presse-papier ({len(html)} caractères) : {chemin}")
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(str(chemin))])
+        QGuiApplication.clipboard().setMimeData(mime)
+        self._terminer_sauvegarde_page_html("mdi6.check", Mocha.green, "Page sauvegardée, fichier .html copié !")
+        self._notify_status(f"Page HTML sauvegardée et fichier copié dans le presse-papier ({len(html)} caractères) : {chemin}")
 
     # ------------------------------------------------------------------
     # Capture propre affichée dans une visionneuse (bouton
