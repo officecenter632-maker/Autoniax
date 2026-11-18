@@ -21204,7 +21204,35 @@ def _demander_confirmation_regeneration_navigateur(parent, nom_profil: str):
     return case_garder.isChecked()
 
 
-class PanneauProprietesSautoniax(QWidget):
+class _ReglageCaptureSynchroMixin:
+    """Garde le combo "Qualité" des fenêtres de rendu réseau synchronisé avec
+    la valeur RÉELLEMENT appliquée côté serveurT (une seule préférence par
+    pilote, partagée par toutes les fenêtres).
+
+    Avant ce mixin, seule la fenêtre ouverte depuis TaskConfigScreen
+    restaurait la qualité sauvegardée ; les fenêtres ouvertes depuis l'œil de
+    l'onglet Instances sAutoniax et depuis Projets Distribués repartaient
+    toujours sur "Élevée (100)" alors que le serveur était déjà, par exemple,
+    à 5. Choisir "100" dans ce combo n'envoyait alors rien (aucun changement
+    d'index), d'où l'impression d'être "bloqué à 100".
+    """
+
+    _reglage_capture_courant: tuple = ("full", 100)
+
+    def synchroniser_reglage_capture(self, resolution: str, qualite: int):
+        """Mémorise la valeur courante ET met à jour la fenêtre déjà ouverte
+        (sans redéclencher le signal : blockSignals dans
+        PanneauRenduInstance.definir_reglage_capture_initial)."""
+        self._reglage_capture_courant = (resolution, qualite)
+        self._appliquer_reglage_capture_a_fenetre()
+
+    def _appliquer_reglage_capture_a_fenetre(self):
+        fenetre = getattr(self, "_fenetre_rendu_reseau", None)
+        if fenetre is not None:
+            fenetre.panneau.definir_reglage_capture_initial(*self._reglage_capture_courant)
+
+
+class PanneauProprietesSautoniax(_ReglageCaptureSynchroMixin, QWidget):
     """Panneau de droite de l'onglet "Instances" (PATCH -- refonte deux
     colonnes, demande explicite utilisateur : "je veux que tu reorgnise
     de facon tres coherente, professionels"). Affiche le détail d'UN
@@ -23425,6 +23453,9 @@ class PanneauProprietesSautoniax(QWidget):
             self._fenetre_rendu_reseau.panneau.demande_preference_capture.connect(
                 self.demande_preference_capture_reseau.emit
             )
+            # PATCH synchro qualité : affiche la valeur réellement appliquée,
+            # pas l'index 0 (100) par défaut du combo.
+            self._appliquer_reglage_capture_a_fenetre()
 
             def _sur_commande_controle_distance(payload: dict):
                 if self._rendu_reseau_cible is None:
@@ -25589,7 +25620,7 @@ class InstancesConnecteesScreen(QWidget):
         self.resultat_action_confirme.emit(ok, texte)
 
 
-class ProjetsDistribuesScreen(QWidget):
+class ProjetsDistribuesScreen(_ReglageCaptureSynchroMixin, QWidget):
     """Onglet "Projets Distribués" de ReseauScreen (Patch 4.4.b -- cœur
     du patch réseau). Deux zones :
 
@@ -26250,6 +26281,9 @@ class ProjetsDistribuesScreen(QWidget):
             self._fenetre_rendu_reseau.panneau.demande_preference_capture.connect(
                 self.demande_preference_capture_reseau.emit
             )
+            # PATCH synchro qualité : affiche la valeur réellement appliquée,
+            # pas l'index 0 (100) par défaut du combo.
+            self._appliquer_reglage_capture_a_fenetre()
 
             def _sur_commande_controle_distance(payload: dict):
                 if self._rendu_reseau_cible is None:
@@ -71841,7 +71875,7 @@ class VisionneuseLibCode(QDialog):
         self._ecran._copier_code_lib(self._lib_id)
 
 
-class TaskConfigScreen(QWidget):
+class TaskConfigScreen(_ReglageCaptureSynchroMixin, QWidget):
     """
     Écran TaskConfig (section sidebar) : scripts d'automatisation en pur
     Python (décision explicite utilisateur).
@@ -71938,6 +71972,8 @@ class TaskConfigScreen(QWidget):
     # Réponse générique via capture_recue, déjà routée par
     # sur_capture_reseau_recue (cf. section 5.2 de la spec).
     demande_capture_ponctuelle_instance_clone = Signal(str, str)
+    # PATCH synchro qualité : prévient MainWindow pour aligner les autres fenêtres.
+    preference_capture_changee = Signal(str, int)
     # PATCH (mode local dans le panneau clone -- cf. SPEC_mode_clone_
     # local.md, section 3.9) : "Kill" (ferme le navigateur entier) pour un
     # profil LOCAL du panneau clone. MÊME patron que Api2ApiScreen.
@@ -80769,6 +80805,7 @@ class TaskConfigScreen(QWidget):
                     self.reglages.preference_capture_resolution = resolution
                     self.reglages.preference_capture_qualite = qualite
                     self.reglages.save()
+                self.preference_capture_changee.emit(resolution, qualite)
 
             self._fenetre_rendu_reseau.panneau.demande_preference_capture.connect(_sur_demande_preference_capture)
 
@@ -116663,8 +116700,21 @@ class MainWindow(QMainWindow):
         panneau_proprietes.demande_taux_capture_instance_reseau.connect(
             self.client_serveur_t.definir_taux_capture_instance
         )
+        # PATCH synchro qualité -- point central : envoie au serveurT, PERSISTE
+        # (reglages.save) et aligne le combo de TOUTES les fenêtres de rendu.
+        def _synchroniser_reglage_capture_partout(resolution: str, qualite: int):
+            for _ecran in (panneau_proprietes, taskconfig_screen, reseau_screen.projets_distribues_screen):
+                _ecran.synchroniser_reglage_capture(resolution, qualite)
+
+        def _sur_preference_capture_depuis_ecran_relais(resolution: str, qualite: int):
+            self.client_serveur_t.definir_preference_capture(resolution, qualite)
+            self.reglages.preference_capture_resolution = resolution
+            self.reglages.preference_capture_qualite = qualite
+            self.reglages.save()
+            _synchroniser_reglage_capture_partout(resolution, qualite)
+
         panneau_proprietes.demande_preference_capture_reseau.connect(
-            self.client_serveur_t.definir_preference_capture
+            _sur_preference_capture_depuis_ecran_relais
         )
         self.client_serveur_t.capture_recue.connect(
             panneau_proprietes.sur_capture_reseau_recue
@@ -117248,7 +117298,23 @@ class MainWindow(QMainWindow):
             )
         )
         reseau_screen.projets_distribues_screen.demande_preference_capture_reseau.connect(
-            lambda resolution, qualite: self.client_serveur_t.definir_preference_capture(resolution, qualite)
+            _sur_preference_capture_depuis_ecran_relais
+        )
+        # TaskConfigScreen envoie/persiste lui-même ; on aligne seulement les autres.
+        taskconfig_screen.preference_capture_changee.connect(_synchroniser_reglage_capture_partout)
+        # Valeur initiale : une ancienne valeur invalide (ex. 80, d'avant les
+        # paliers 100/50/10/5) s'affichait comme 100 mais le serveur la
+        # remplaçait par 100 sans le dire -> on la normalise et on la persiste.
+        _qualite_initiale = self.reglages.preference_capture_qualite
+        if _qualite_initiale not in (100, 50, 10, 5):
+            _qualite_initiale = 100
+            self.reglages.preference_capture_qualite = _qualite_initiale
+            self.reglages.save()
+            self.client_serveur_t.definir_preference_capture(
+                self.reglages.preference_capture_resolution, _qualite_initiale,
+            )
+        _synchroniser_reglage_capture_partout(
+            self.reglages.preference_capture_resolution, _qualite_initiale,
         )
         # PATCH (liste déroulante d'onglet actif) -- signal GLOBAL
         # command_result_recu, filtré en interne par
