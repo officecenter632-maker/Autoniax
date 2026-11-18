@@ -65731,6 +65731,11 @@ class BarreOngletsReseau(QWidget):
     TAILLE_MIN_BOUTON = 44
     LONGUEUR_MAX_TITRE = 13
 
+    # PATCH (demande explicite utilisateur : le bouton "nouvel onglet" doit être un "+" placé À LA SUITE
+    # des onglets déjà créés, comme dans un vrai navigateur) -- émis au clic sur le "+" ; la fenêtre
+    # hôte (FenetreRenduTaskReseau) envoie alors la commande newTab.
+    nouvel_onglet_demande = Signal()
+
     def __init__(self, combo, bouton_rafraichir, parent=None):
         super().__init__(parent)
         self.setObjectName("BarreOngletsReseau")
@@ -65867,7 +65872,22 @@ class BarreOngletsReseau(QWidget):
             vide = QLabel("Aucun onglet", self._zone_boutons)
             vide.setStyleSheet(f"color: {Mocha.overlay1}; font-size: 11px; padding-left: 6px;")
             self._layout_boutons.addWidget(vide)
+        # Bouton "+" : toujours juste après le dernier onglet (reconstruit avec eux).
+        bouton_plus = QToolButton(self._zone_boutons)
+        bouton_plus.setIcon(qta.icon("mdi6.plus", color=Mocha.text))
+        bouton_plus.setIconSize(QSize(16, 16))
+        bouton_plus.setFixedSize(24, 22)
+        bouton_plus.setCursor(Qt.PointingHandCursor)
+        bouton_plus.setFocusPolicy(Qt.NoFocus)
+        bouton_plus.setToolTip("Nouvel onglet")
+        bouton_plus.clicked.connect(self._sur_clic_nouvel_onglet)
+        self._layout_boutons.addWidget(bouton_plus)
         self._layout_boutons.addStretch(1)
+
+    def _sur_clic_nouvel_onglet(self):
+        self.nouvel_onglet_demande.emit()
+        # Le nouvel onglet devient l'actif côté instance : on actualise la liste un peu après.
+        QTimer.singleShot(1500, self._sur_clic_rafraichir)
 
 
 class FenetreRenduTaskReseau(QWidget):
@@ -66135,6 +66155,9 @@ class FenetreRenduTaskReseau(QWidget):
         # _verifier_survol_barre_onglets. Actualisation à l'apparition
         # seulement, plus de minuteur périodique.
         self.barre_onglets.hide()
+        self.barre_onglets.nouvel_onglet_demande.connect(
+            lambda: self._emettre_commande("newTab", url="autoniax:accueil")   # résolu côté instance (_url_nouvel_onglet)
+        )
 
         # --- Toggle "Ajuster à la fenêtre" -- câblage RÉEL (cf. bloc
         # self._ajuster_a_la_fenetre plus haut, avant self.panneau) : le
@@ -66517,22 +66540,36 @@ class FenetreRenduTaskReseau(QWidget):
         self.bouton_suivant.setToolTip("Page suivante")
         self.bouton_suivant.clicked.connect(lambda: self._emettre_commande("goForward"))
 
-        # AJOUT (demande explicite utilisateur : "un petit bouton aussi pour
-        # le nouvel onglet") -- même rangée flottante, même patron que
-        # bouton_precedent/bouton_suivant. Émet "newTab" (déjà supportée par le
-        # serveur et par les deux moteurs, nodriver et Camoufox) vers about:blank ;
-        # le nouvel onglet devient l'onglet actif côté sAutoniax, donc le rendu
-        # le suit. La liste d'onglets du panneau se met à jour à l'ouverture
-        # de la liste déroulante ou via son bouton Rafraîchir.
-        self.bouton_nouvel_onglet = QToolButton(self.panneau.colonne_image)
-        self.bouton_nouvel_onglet.setObjectName("APIFeaturesMenuButton")
-        self.bouton_nouvel_onglet.setIcon(qta.icon("mdi6.tab-plus", color=Mocha.subtext0))
-        self.bouton_nouvel_onglet.setIconSize(QSize(14, 14))
-        self.bouton_nouvel_onglet.setCursor(Qt.PointingHandCursor)
-        self.bouton_nouvel_onglet.setToolTip("Nouvel onglet (page d'ouverture par défaut)")
-        self.bouton_nouvel_onglet.clicked.connect(
-            lambda: self._emettre_commande("newTab", url="autoniax:accueil")   # résolu côté instance (_url_nouvel_onglet)
+        # PATCH (demande explicite utilisateur : "un bouton qui permet de sauvegarder la page actuelle
+        # directement quand on est dans l'interface de pilote distant ... en bas dans le coin gauche ...
+        # un bouton un peu grand") -- gros bouton flottant, coin BAS-GAUCHE de colonne_image (hors layout,
+        # placé à la main dans _repositionner_point_statut_connexion). Même action que la disquette de la
+        # barre d'outils du notebook : get_html sur l'onglet actif de l'instance, fichier .html dans
+        # Téléchargements/saver_pages, puis ce FICHIER est copié dans le presse-papier. Le résultat revient
+        # par traiter_resultat_copie_distante (point d'entrée déjà branché dans les 3 écrans hôtes).
+        self._BOUTON_SAUVER_TAILLE = 48
+        self._requetes_sauvegarde_page: set = set()
+        self.bouton_sauver_page = QToolButton(self.panneau.colonne_image)
+        self.bouton_sauver_page.setObjectName("BoutonSauverPageDistante")
+        self.bouton_sauver_page.setIcon(qta.icon("mdi6.content-save-outline", color=Mocha.text))
+        self.bouton_sauver_page.setIconSize(QSize(28, 28))
+        self.bouton_sauver_page.setFixedSize(self._BOUTON_SAUVER_TAILLE, self._BOUTON_SAUVER_TAILLE)
+        self.bouton_sauver_page.setCursor(Qt.PointingHandCursor)
+        self.bouton_sauver_page.setFocusPolicy(Qt.NoFocus)  # Espace = raccourci Auto/Manuel de la fenêtre
+        self.bouton_sauver_page.setStyleSheet(
+            f"""
+            #BoutonSauverPageDistante {{
+                background: {Mocha.mantle}; border: 1px solid {Mocha.surface1}; border-radius: 12px;
+            }}
+            #BoutonSauverPageDistante:hover {{ background: {Mocha.surface0}; }}
+            #BoutonSauverPageDistante:disabled {{ background: {Mocha.mantle}; }}
+            """
         )
+        self.bouton_sauver_page.setToolTip(
+            "Sauvegarder la page actuelle (onglet actif) en fichier .html\n"
+            "et copier ce fichier dans le presse-papier"
+        )
+        self.bouton_sauver_page.clicked.connect(self._sur_clic_sauver_page)
 
         # --- PATCH (mode sélection multiple sur le rendu réseau, demande
         # explicite utilisateur) -- bouton ciseau, MÊME rangée flottante
@@ -66657,7 +66694,7 @@ class FenetreRenduTaskReseau(QWidget):
         self.point_statut_execution.raise_()
         self.bouton_precedent.raise_()
         self.bouton_suivant.raise_()
-        self.bouton_nouvel_onglet.raise_()
+        self.bouton_sauver_page.raise_()
         self.bouton_selection_zone.raise_()
         self.bouton_vider_selection.raise_()
         self.champ_adresse.raise_()
@@ -66710,12 +66747,8 @@ class FenetreRenduTaskReseau(QWidget):
         # bouton_vider_selection enchaînés juste après bouton_suivant,
         # même ligne, même espacement constant que le reste de cette
         # rangée flottante nord-ouest.
-        self.bouton_nouvel_onglet.setGeometry(
-            x_apres_points + 2 * (self._BOUTON_NAV_TAILLE + self._POINT_STATUT_ESPACEMENT),
-            y_boutons, self._BOUTON_NAV_TAILLE, self._BOUTON_NAV_TAILLE,
-        )
-        self.bouton_nouvel_onglet.raise_()
-        x_ciseau = x_apres_points + 3 * (self._BOUTON_NAV_TAILLE + self._POINT_STATUT_ESPACEMENT)
+        # (le bouton "nouvel onglet" n'est plus ici : c'est le "+" de BarreOngletsReseau)
+        x_ciseau = x_apres_points + 2 * (self._BOUTON_NAV_TAILLE + self._POINT_STATUT_ESPACEMENT)
         self.bouton_selection_zone.setGeometry(
             x_ciseau, y_boutons, self._BOUTON_NAV_TAILLE, self._BOUTON_NAV_TAILLE,
         )
@@ -66769,6 +66802,82 @@ class FenetreRenduTaskReseau(QWidget):
             self._POINT_STATUT_MARGE, y_badge, largeur_rangee, self.badge_mode_rafraichissement.height(),
         )
         self.badge_mode_rafraichissement.raise_()
+        # Gros bouton de sauvegarde : coin BAS-GAUCHE de colonne_image.
+        taille = self._BOUTON_SAUVER_TAILLE
+        self.bouton_sauver_page.setGeometry(
+            self._POINT_STATUT_MARGE,
+            max(0, self.panneau.colonne_image.height() - taille - self._POINT_STATUT_MARGE),
+            taille, taille,
+        )
+        self.bouton_sauver_page.raise_()
+
+    # ------------------------------------------------------------------
+    # Sauvegarde de la page de l'onglet actif (bouton bas-gauche, cf. bouton_sauver_page)
+    # ------------------------------------------------------------------
+    def _sur_clic_sauver_page(self):
+        if self._requetes_sauvegarde_page:
+            return  # une sauvegarde est déjà en cours
+        requete_id = self._prochain_requete_id()
+        self._requetes_sauvegarde_page.add(requete_id)
+        self.bouton_sauver_page.setEnabled(False)
+        self.bouton_sauver_page.setToolTip("Récupération de la page en cours…")
+        self.commande_controle_distance.emit({
+            "requete_id": requete_id,
+            "commande": {"action": "get_html", "selecteur": "", "cadre": ""},
+        })
+        QTimer.singleShot(30000, lambda rid=requete_id: self._expirer_sauvegarde_page(rid))
+
+    def _terminer_sauvegarde_page(self, icone: str, couleur, message: str):
+        self.bouton_sauver_page.setEnabled(True)
+        self.bouton_sauver_page.setIcon(qta.icon(icone, color=couleur))
+        from PySide6.QtWidgets import QToolTip
+        QToolTip.showText(QCursor.pos(), message)
+        QTimer.singleShot(1500, self._restaurer_bouton_sauver_page)
+
+    def _restaurer_bouton_sauver_page(self):
+        self.bouton_sauver_page.setIcon(qta.icon("mdi6.content-save-outline", color=Mocha.text))
+        self.bouton_sauver_page.setToolTip(
+            "Sauvegarder la page actuelle (onglet actif) en fichier .html\n"
+            "et copier ce fichier dans le presse-papier"
+        )
+
+    def _expirer_sauvegarde_page(self, requete_id: str):
+        if requete_id not in self._requetes_sauvegarde_page:
+            return  # déjà traitée
+        self._requetes_sauvegarde_page.discard(requete_id)
+        self._terminer_sauvegarde_page("mdi6.alert-circle-outline", Mocha.red,
+                                       "Sauvegarde de la page : aucune réponse (délai dépassé).")
+
+    def _traiter_resultat_sauvegarde_page(self, data: dict) -> bool:
+        """True si ce command_result répondait à une sauvegarde de page de cette fenêtre."""
+        requete_id = data.get("requete_id")
+        if requete_id not in self._requetes_sauvegarde_page:
+            return False
+        self._requetes_sauvegarde_page.discard(requete_id)
+        if not data.get("ok", False):
+            self._terminer_sauvegarde_page("mdi6.alert-circle-outline", Mocha.red,
+                                           f"Sauvegarde impossible : {data.get('error', 'erreur inconnue')}")
+            return True
+        html = data.get("result")
+        if not isinstance(html, str) or not html.strip():
+            self._terminer_sauvegarde_page("mdi6.alert-circle-outline", Mocha.red,
+                                           "Sauvegarde : le navigateur a renvoyé une page vide.")
+            return True
+        try:
+            dossier = Path.home() / "Downloads" / "saver_pages"
+            dossier.mkdir(parents=True, exist_ok=True)
+            chemin = dossier / f"{time.strftime('%Y%m%d_%H%M%S')}_page.html"
+            chemin.write_text(html, encoding="utf-8")
+        except OSError as exc:
+            QGuiApplication.clipboard().setText(html)  # repli : au moins le texte
+            self._terminer_sauvegarde_page("mdi6.alert-circle-outline", Mocha.red,
+                                           f"Écriture impossible : {exc} (HTML copié en texte)")
+            return True
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(str(chemin))])
+        QGuiApplication.clipboard().setMimeData(mime)
+        self._terminer_sauvegarde_page("mdi6.check", Mocha.green, f"Page sauvegardée, fichier copié : {chemin.name}")
+        return True
 
     def definir_statut_derniere_execution(self, couleur_hex: str, tooltip: str):
         """PATCH -- point d'entrée unique pour piloter point_statut_
@@ -67692,6 +67801,8 @@ class FenetreRenduTaskReseau(QWidget):
         """PATCH Ctrl+C -- appelé par l'hôte (3 écrans) pour chaque command_result.
         Retourne True si la réponse concernait un Ctrl+C de cette vue."""
         if self._traiter_resultat_copie_adresse(data):
+            return True
+        if self._traiter_resultat_sauvegarde_page(data):
             return True
         requetes = getattr(self, "_requetes_copie_distante", None)
         requete_id = data.get("requete_id")
