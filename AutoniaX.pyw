@@ -68467,7 +68467,15 @@ class FenetreRenduTaskReseau(QWidget):
             return False
         self._requete_synchro_presse_papier = None
         if not data.get("ok", False):
-            return True   # instance ancienne (sans get_clipboard_info) ou injoignable : silence, on réessaiera
+            # Instance ancienne (sans get_clipboard_info) ou injoignable : on réessaiera, mais on le DIT une fois
+            # (infobulle + log) au lieu de rester muet, sans quoi la panne est invisible.
+            if not getattr(self, "_synchro_presse_papier_erreur_signalee", False):
+                self._synchro_presse_papier_erreur_signalee = True
+                erreur = data.get("error") or data.get("erreur") or "erreur inconnue"
+                log_reseau_t.warning(f"[synchro presse-papier] get_clipboard_info refusé par l'instance : {erreur}")
+                from PySide6.QtWidgets import QToolTip
+                QToolTip.showText(QCursor.pos(), f"Synchro presse-papier indisponible : {erreur} (sAutoniax à mettre à jour ?)")
+            return True
         resultat = data.get("result")
         if not isinstance(resultat, dict):
             return True
@@ -68478,6 +68486,7 @@ class FenetreRenduTaskReseau(QWidget):
         if precedent == "__jamais__" or ts is None or ts == precedent or not isinstance(texte, str) or not texte:
             return True
         QGuiApplication.clipboard().setText(texte)
+        log_reseau_t.info(f"[synchro presse-papier] copie distante reçue ({len(texte)} caractères)")
         from PySide6.QtWidgets import QToolTip
         QToolTip.showText(QCursor.pos(), f"Copié depuis le navigateur distant ({len(texte)} caractères)")
         return True
@@ -68488,6 +68497,7 @@ class FenetreRenduTaskReseau(QWidget):
         if hasattr(self, "_minuteur_synchro_presse_papier") and self.isVisible():
             self._ts_presse_papier_distant_vu = "__jamais__"
             self._requete_synchro_presse_papier = None
+            self._synchro_presse_papier_erreur_signalee = False
             self._minuteur_synchro_presse_papier.start()
         super().showEvent(event)
 
