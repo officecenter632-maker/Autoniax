@@ -65710,6 +65710,27 @@ class DialogueChoixCaptureOuNouvelle(QWidget):
         super().keyPressEvent(event)
 
 
+class _BoutonOngletReseau(QPushButton):
+    """Bouton d'onglet de BarreOngletsReseau. PATCH (demande explicite utilisateur : "pour fermer un onglet, je
+    veux qu'on appuie 2 fois dessus avec un clic droit") -- un DOUBLE clic DROIT émet fermeture_demandee ; le
+    clic gauche garde son rôle (changer d'onglet), un simple clic droit ne fait rien."""
+
+    fermeture_demandee = Signal()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.RightButton:
+            event.accept()  # un clic droit simple ne fait rien (et ne remonte pas au parent)
+            return
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.RightButton:
+            event.accept()
+            self.fermeture_demandee.emit()
+            return
+        super().mouseDoubleClickEvent(event)
+
+
 class BarreOngletsReseau(QWidget):
     """PATCH (demande explicite utilisateur : \"une barre minimaliste
     d'onglets sur une ligne, avec des boutons en horizontal représentant
@@ -65735,6 +65756,8 @@ class BarreOngletsReseau(QWidget):
     # des onglets déjà créés, comme dans un vrai navigateur) -- émis au clic sur le "+" ; la fenêtre
     # hôte (FenetreRenduTaskReseau) envoie alors la commande newTab.
     nouvel_onglet_demande = Signal()
+    # PATCH (double clic droit sur un onglet) -- émis avec le tab_id de l'onglet à fermer.
+    fermer_onglet_demande = Signal(str)
 
     def __init__(self, combo, bouton_rafraichir, parent=None):
         super().__init__(parent)
@@ -65855,10 +65878,11 @@ class BarreOngletsReseau(QWidget):
                 continue
             nb_reels += 1
             court = titre if len(titre) <= self.LONGUEUR_MAX_TITRE else titre[: self.LONGUEUR_MAX_TITRE - 1] + "…"
-            bouton = QPushButton(court, self._zone_boutons)
+            bouton = _BoutonOngletReseau(court, self._zone_boutons)
             bouton.setCheckable(True)
             bouton.setChecked(index == actif)
-            bouton.setToolTip(titre)
+            bouton.setToolTip(f"{titre}\nDouble clic droit : fermer l'onglet")
+            bouton.fermeture_demandee.connect(lambda tid=str(tab_id): self._sur_fermeture_onglet(tid))
             bouton.setCursor(Qt.PointingHandCursor)
             # NoFocus : sinon Espace (raccourci Auto/Manuel de la fenêtre)
             # activerait le dernier bouton cliqué.
@@ -65883,6 +65907,15 @@ class BarreOngletsReseau(QWidget):
         bouton_plus.clicked.connect(self._sur_clic_nouvel_onglet)
         self._layout_boutons.addWidget(bouton_plus)
         self._layout_boutons.addStretch(1)
+
+    def _sur_fermeture_onglet(self, tab_id: str):
+        if self._nb_reels <= 1:
+            from PySide6.QtWidgets import QToolTip
+            QToolTip.showText(QCursor.pos(), "Dernier onglet : impossible de le fermer.")
+            return
+        self.fermer_onglet_demande.emit(tab_id)
+        # La liste est actualisée un peu après la fermeture (l'onglet disparaît de la barre).
+        QTimer.singleShot(1200, self._sur_clic_rafraichir)
 
     def _sur_clic_nouvel_onglet(self):
         self.nouvel_onglet_demande.emit()
@@ -66155,6 +66188,9 @@ class FenetreRenduTaskReseau(QWidget):
         # _verifier_survol_barre_onglets. Actualisation à l'apparition
         # seulement, plus de minuteur périodique.
         self.barre_onglets.hide()
+        self.barre_onglets.fermer_onglet_demande.connect(
+            lambda tab_id: self._emettre_commande("closeTab", tabId=tab_id)
+        )
         self.barre_onglets.nouvel_onglet_demande.connect(
             lambda: self._emettre_commande("newTab", url="autoniax:accueil")   # résolu côté instance (_url_nouvel_onglet)
         )
@@ -125656,6 +125692,31 @@ async def action_switch_tab(browser, tab_id: str):
     raise ValueError(f"onglet introuvable pour tab_id={tab_id!r}")
 
 
+async def action_close_tab(browser, tab_id: str, page_active):
+    """closeTab(tabId) -- PATCH (demande explicite utilisateur : fermer un onglet par double clic droit sur
+    son bouton dans la barre d'onglets du pilote distant). Ferme l'onglet `tab_id` du profil et retourne la
+    page ACTIVE à retenir : `page_active` inchangée si un autre onglet a été fermé, sinon le dernier onglet
+    restant (basculé comme par switchTab) -- le streaming de capture ne doit jamais rester sur un onglet mort.
+    Refuse de fermer le DERNIER onglet (fermer la fenêtre tuerait l'instance). Timeout explicite : un onglet
+    interne qui ne répond pas à Target.closeTarget bloquerait sinon indéfiniment (cf. _fermer_onglet_arriere_plan)."""
+    await browser.update_targets()
+    pages = [t for t in browser.tabs if t.target is not None and t.target.type_ == "page"]
+    cible = next((t for t in pages if str(t.target.target_id) == str(tab_id)), None)
+    if cible is None:
+        raise ValueError(f"onglet introuvable pour tab_id={tab_id!r}")
+    if len(pages) <= 1:
+        raise ValueError("dernier onglet ouvert : fermeture refusée")
+    id_actif = str(page_active.target.target_id) if page_active is not None else None
+    try:
+        await asyncio.wait_for(cible.close(), timeout=5.0)
+    except asyncio.TimeoutError:
+        raise ValueError("l'onglet ne répond pas à la demande de fermeture")
+    if str(cible.target.target_id) != id_actif:
+        return page_active
+    restants = [t for t in pages if t is not cible]
+    return await action_switch_tab(browser, str(restants[-1].target.target_id))
+
+
 # ---------------------------------------------------------------------------
 # PATCH (retour utilisateur : « ça ne remonte pas, mais la barre des tâches
 # clignote ») -- bringToFront() ne faisait que Target.activateTarget (CDP) :
@@ -133526,6 +133587,30 @@ async def action_camoufox_switch_tab(context, gestion: GestionOngletsCamoufox, t
     return page
 
 
+async def action_camoufox_close_tab(context, gestion: GestionOngletsCamoufox, tab_id: str, page_active):
+    """closeTab(tabId) -- équivalent Playwright de action_close_tab (cf. sa docstring) : retourne la page
+    active à retenir (inchangée, ou le dernier onglet restant si l'actif vient d'être fermé). Refuse de fermer
+    le dernier onglet. KeyError si introuvable, ValueError sinon -- traduits en command_result ok=False."""
+    gestion.resynchroniser(context.pages)
+    cible = gestion.par_id(tab_id)
+    if cible is None:
+        raise KeyError(f"onglet introuvable : {tab_id!r}")
+    if len([p for p in context.pages if not p.is_closed()]) <= 1:
+        raise ValueError("dernier onglet ouvert : fermeture refusée")
+    try:
+        await asyncio.wait_for(cible.close(), timeout=5.0)
+    except asyncio.TimeoutError:
+        raise ValueError("l'onglet ne répond pas à la demande de fermeture")
+    if cible is not page_active:
+        return page_active
+    restants = [p for p in context.pages if p is not cible and not p.is_closed()]
+    if not restants:
+        raise ValueError("aucun onglet restant après la fermeture")
+    nouvelle = restants[-1]
+    await nouvelle.bring_to_front()
+    return nouvelle
+
+
 async def action_camoufox_bring_to_front(page_active) -> None:
     """bringToFront() -- équivalent Playwright de action_bring_to_front
     (CDP/nodriver, cf. sa docstring pour le contexte complet de la
@@ -137331,6 +137416,10 @@ async def _executer_commande_camoufox(
         elif action == "switchTab":
             nouvel_onglet = await action_camoufox_switch_tab(context, gestion, str(data["tabId"]))
             etat_navigateur["page"] = nouvel_onglet
+        elif action == "closeTab":
+            # PATCH (double clic droit sur un onglet du pilote distant) -- cf. docstring action_camoufox_close_tab.
+            etat_navigateur["page"] = await action_camoufox_close_tab(context, gestion, str(data["tabId"]), page)
+            resultat = {"ferme": True}
         elif action == "bringToFront":
             # AJOUT (clic droit "voir ce profil" dans le panneau clone,
             # cf. docstring de action_camoufox_bring_to_front) -- pas de
@@ -139241,7 +139330,7 @@ ACTIONS_4_2 = {"moveCursor", "mousemove", "click", "scroll", "paste", "copy", "l
 # séparé de ACTIONS_4_2 pour ne pas fausser la traçabilité avec le cahier
 # des charges -- ACTIONS_SUPPORTEES (l'union des deux) est ce qu'utilisent
 # réellement le filtrage et le dispatch ci-dessous.
-ACTIONS_ETENDUES = {"type_text", "capture_propre", "mouse_drag", "drag", "drag_page", "clear", "get_clipboard", "shutdown", "newTab", "navigate", "resetInterface", "clearBrowsingData", "remplacerRessources", "isInterfaceInitialisee", "getHomeTabId", "set_download_dir", "getScreenInfo", "press_key", "scroll_simple", "goBack", "goForward", "bringToFront", "dom_paste", "dom_clear", "get_last_assistant_message", "get_html", "find_elements", "evaluer_js"}
+ACTIONS_ETENDUES = {"type_text", "capture_propre", "mouse_drag", "drag", "drag_page", "clear", "get_clipboard", "shutdown", "newTab", "navigate", "resetInterface", "clearBrowsingData", "remplacerRessources", "isInterfaceInitialisee", "getHomeTabId", "set_download_dir", "getScreenInfo", "press_key", "scroll_simple", "goBack", "goForward", "bringToFront", "dom_paste", "dom_clear", "get_last_assistant_message", "get_html", "find_elements", "evaluer_js", "closeTab"}
 # PATCH (demande explicite utilisateur -- généralisation de Composant.id_dom,
 # "composant.id_dom.paste(), et clear()" -> composant.dom_paste()/
 # dom_clear(), cf. action_dom_paste/action_dom_clear juste au-dessus) :
@@ -139596,6 +139685,14 @@ async def _executer_commande(browser, etat_navigateur: dict, data: dict, arret_d
             # docstring.
             await _installer_interception_presse_papier(nouvel_onglet, etat_navigateur)
             await _installer_synchro_blocage_media_sur_rechargement(nouvel_onglet, etat_navigateur)
+        elif action == "closeTab":
+            # PATCH (double clic droit sur un onglet du pilote distant) -- cf. docstring action_close_tab.
+            nouvelle_page = await action_close_tab(browser, str(data["tabId"]), page)
+            if nouvelle_page is not page:
+                etat_navigateur["page"] = nouvelle_page
+                await _installer_interception_presse_papier(nouvelle_page, etat_navigateur)
+                await _installer_synchro_blocage_media_sur_rechargement(nouvelle_page, etat_navigateur)
+            resultat = {"ferme": True}
         elif action == "bringToFront":
             # AJOUT (clic droit "voir ce profil" dans le panneau clone,
             # cf. docstring de action_bring_to_front) -- même patron que
@@ -142126,6 +142223,7 @@ async def srv_gerer_force_unlink(ws, data: dict):
 srv_ACTIONS_SUPPORTEES = {
     "set_fps", "set_streaming",
     "moveCursor", "mousemove", "click", "scroll", "paste", "copy", "listTabs", "switchTab",
+    "closeTab",  # PATCH : fermeture d'un onglet depuis la barre d'onglets du pilote distant
     # type_text : hors 8 actions officielles de la section 4.2 (cf.
     # instance_nodriver.py, ACTIONS_ETENDUES) mais déjà envoyée par
     # SequenceurActionReseau (AutoniaX.py) pour l'action "saisir", et déjà
