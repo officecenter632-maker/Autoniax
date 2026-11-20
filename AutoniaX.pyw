@@ -9059,6 +9059,12 @@ class Task:
     # moment depuis l'état réel du fichier WORKSPACE, donc aucune raison
     # de le dupliquer dans project.json).
     workspace_fichier: str = "" 
+    # AJOUT (demande explicite utilisateur : "pour chaque notebook on puisse
+    # definir l'app de bureau de coordination") : chemin du fichier Python
+    # (.py/.pyw...) de l'app de coordination PROPRE à ce Task -- ouvert par
+    # le bouton de la bande "Accès rapide" (cf. BarreAccesRapideTask.
+    # bouton_app_coordination). "" = non configuré. Persisté dans project.json.
+    app_coordination_chemin: str = ""
     workspace_mode_repartition: str = "fixe"  # "fixe" | "relatif"
     workspace_nombre_fixe: int = 1  # valeur N du QSpinBox en mode "fixe", >= 1
     # AJOUT (demande explicite utilisateur : "lors de l'attribution de task
@@ -9166,6 +9172,7 @@ class Task:
             "couleur_icone": self.couleur_icone,
             "ordre_epingle": self.ordre_epingle,
             "workspace_fichier": self.workspace_fichier,
+            "app_coordination_chemin": self.app_coordination_chemin,
             "workspace_mode_repartition": self.workspace_mode_repartition,
             "workspace_nombre_fixe": self.workspace_nombre_fixe,
             "workspace_champs_exclus": list(self.workspace_champs_exclus),
@@ -9310,6 +9317,9 @@ class Task:
         # proposera directement le sélecteur de fichier au premier clic,
         # exactement comme pour un Task neuf).
         d.setdefault("workspace_fichier", "")
+        d.setdefault("app_coordination_chemin", "")
+        if not isinstance(d.get("app_coordination_chemin"), str):
+            d["app_coordination_chemin"] = ""
         # Filet de sécurité SYSTÈME : une valeur corrompue/inattendue
         # (édition manuelle du JSON, type inattendu, etc.) retombe sur ""
         # plutôt que de propager un type invalide jusqu'à l'UI/au scan.
@@ -19521,6 +19531,17 @@ def build_stylesheet() -> str:
         color: {m.subtext0};
         font-size: 11px;
         font-weight: 600;
+    }}
+
+    #BoutonAppCoordination {{
+        background-color: {m.surface0};
+        border: 1px solid {m.surface1};
+        border-radius: {RADIUS}px;
+    }}
+
+    #BoutonAppCoordination:hover {{
+        border: 1px solid {m.lavender};
+        background-color: {m.surface1};
     }}
 
     #AccesRapideItem {{
@@ -58880,6 +58901,10 @@ class BarreAccesRapideTask(QWidget):
     # cf. AccesRapideItem.clique_droit -- clic droit sur une tuile va
     # directement à la sortie de la cellule visée plutôt qu'à son début.
     demande_acces_sortie_cellule = Signal(str)  # cellule_id
+    # AJOUT (app de coordination par notebook) : clic gauche / clic droit
+    # sur bouton_app_coordination -- traités par TaskConfigScreen.
+    demande_ouvrir_app_coordination = Signal()
+    demande_configurer_app_coordination = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -58915,6 +58940,45 @@ class BarreAccesRapideTask(QWidget):
         self.scroll.setWidget(self.contenu)
         root_layout.addWidget(self.scroll, 1)
 
+        # AJOUT (demande explicite utilisateur : "juste sur la ligne de
+        # acces rapide, apres les boutons, une icone moyennement grosse
+        # [...] clic droit pour configurer le path, clic gauche pour lancer
+        # son ouverture") -- app de bureau de coordination du notebook.
+        self.bouton_app_coordination = QToolButton(self)
+        self.bouton_app_coordination.setObjectName("BoutonAppCoordination")
+        self.bouton_app_coordination.setCursor(Qt.PointingHandCursor)
+        self.bouton_app_coordination.setFixedSize(36, 36)
+        self.bouton_app_coordination.setIconSize(QSize(24, 24))
+        self.bouton_app_coordination.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.bouton_app_coordination.clicked.connect(self.demande_ouvrir_app_coordination.emit)
+        self.bouton_app_coordination.customContextMenuRequested.connect(
+            lambda _pos: self.demande_configurer_app_coordination.emit()
+        )
+        root_layout.addWidget(self.bouton_app_coordination, 0, Qt.AlignVCenter)
+        self.definir_app_coordination("")
+
+    def definir_app_coordination(self, chemin: str):
+        """Met à jour l'aspect du bouton d'app de coordination : icône
+        grisée + info-bulle "clic droit pour configurer" tant qu'aucun
+        chemin n'est défini, icône colorée + chemin en info-bulle sinon."""
+        configure = bool(chemin)
+        couleur = Mocha.lavender if configure else Mocha.overlay0
+        icone = _icone_qta_premiere_disponible(
+            ["mdi6.language-python", "mdi6.file-code-outline", "mdi6.application-outline"], couleur
+        )
+        if icone is not None:
+            self.bouton_app_coordination.setIcon(icone)
+        else:
+            self.bouton_app_coordination.setText("Py")
+        if configure:
+            self.bouton_app_coordination.setToolTip(
+                f"App de coordination : {chemin}\nClic gauche : ouvrir -- clic droit : changer le chemin"
+            )
+        else:
+            self.bouton_app_coordination.setToolTip(
+                "App de coordination non définie -- clic droit pour configurer"
+            )
+
     def rafraichir(self, task: Optional[Task]):
         """Reconstruit entièrement la liste depuis task.cellules +
         task.cellule_variables -- même contrat exact que l'ancien
@@ -58928,6 +58992,8 @@ class BarreAccesRapideTask(QWidget):
                 w.setParent(None)
                 w.deleteLater()
         self._items.clear()
+
+        self.definir_app_coordination(getattr(task, "app_coordination_chemin", "") if task is not None else "")
 
         if task is None:
             self._afficher_placeholder()
@@ -74567,6 +74633,12 @@ class TaskConfigScreen(_ReglageCaptureSynchroMixin, QWidget):
         self.barre_acces_rapide.demande_acces_sortie_cellule.connect(
             self._sur_clic_droit_acces_rapide
         )
+        self.barre_acces_rapide.demande_ouvrir_app_coordination.connect(
+            self._sur_clic_app_coordination
+        )
+        self.barre_acces_rapide.demande_configurer_app_coordination.connect(
+            self._sur_clic_droit_app_coordination
+        )
         outer_layout.addWidget(self.barre_acces_rapide)
 
         # PATCH (Lib) : bande des libs du projet sous l'accès rapide -- par lib : mettre à jour (presse-papiers) + copier le code.
@@ -75593,6 +75665,65 @@ class TaskConfigScreen(_ReglageCaptureSynchroMixin, QWidget):
             self.notebook_scroll.ensureWidgetVisible(widget, 0, 80)
 
         self._surligner_cellule(widget)
+
+    def _sur_clic_droit_app_coordination(self):
+        """CLIC DROIT sur le bouton d'app de coordination (bande Accès
+        rapide) : choisit/modifie le chemin du fichier Python propre à CE
+        notebook, persisté dans project.json (Task.app_coordination_chemin)."""
+        task = self._task_courant_obj()
+        if task is None:
+            return
+        dossier_initial = ""
+        if task.app_coordination_chemin:
+            dossier_initial = os.path.dirname(task.app_coordination_chemin)
+        fichier, _filtre = BoiteDialogueAutoniaX.ouvrir_fichier(
+            self, "Choisir l'app de coordination (fichier Python)", dossier_initial,
+            "Fichiers Python (*.py *.pyw);;Tous les fichiers (*)",
+        )
+        if not fichier:
+            return
+        task.app_coordination_chemin = fichier
+        self.project.save()
+        self.barre_acces_rapide.definir_app_coordination(fichier)
+
+    def _sur_clic_app_coordination(self):
+        """CLIC GAUCHE sur le bouton d'app de coordination : ouvre le
+        fichier avec l'éditeur/handler PAR DÉFAUT du système ; un fichier
+        .pyw est lancé directement avec pythonw (donc sans console)."""
+        task = self._task_courant_obj()
+        if task is None:
+            return
+        chemin = task.app_coordination_chemin
+        if not chemin:
+            BoiteDialogueAutoniaX.information(
+                self, "App de coordination",
+                "Aucune app de coordination définie pour ce notebook.\n"
+                "Faites un clic droit sur l'icône pour choisir le fichier.",
+            )
+            return
+        if not os.path.isfile(chemin):
+            BoiteDialogueAutoniaX.warning(
+                self, "App de coordination", f"Fichier introuvable :\n{chemin}"
+            )
+            return
+        try:
+            if chemin.lower().endswith(".pyw") and not getattr(sys, "frozen", False):
+                kwargs = {}
+                if os.name == "nt":
+                    kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                subprocess.Popen(
+                    [_python_sans_console(), chemin],
+                    cwd=os.path.dirname(chemin) or None,
+                    **kwargs,
+                )
+            elif hasattr(os, "startfile"):
+                os.startfile(chemin)
+            else:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(chemin))
+        except Exception as e:
+            BoiteDialogueAutoniaX.warning(
+                self, "App de coordination", f"Impossible d'ouvrir le fichier :\n{e}"
+            )
 
     def _sur_clic_droit_acces_rapide(self, cellule_id: str):
         """Handler du clic DROIT sur une tuile de BarreAccesRapideTask
