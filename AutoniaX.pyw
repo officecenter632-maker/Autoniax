@@ -58898,6 +58898,53 @@ def _pid_a_fenetre_visible(pid: int) -> bool:
         return False
 
 
+def _amener_fenetre_au_premier_plan(pid: int) -> bool:
+    """Amène UNE FOIS au premier plan la fenêtre visible du process `pid`
+    (restaurée si réduite) -- pas de mode "toujours au-dessus". Win32 via
+    ctypes (pas de psutil). Retourne False si aucune fenêtre n'est trouvée
+    ou hors Windows. Le clic utilisateur vient d'avoir lieu dans AutoniaX,
+    qui détient donc le droit de passer une fenêtre au premier plan ; en
+    cas de refus de Windows, repli par AttachThreadInput."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes.wintypes
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        trouvees = []
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+        def _cb(hwnd, _lparam):
+            pid_f = ctypes.wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid_f))
+            if int(pid_f.value) == pid and user32.IsWindowVisible(hwnd) and user32.GetWindowTextLengthW(hwnd) > 0:
+                trouvees.append(hwnd)
+            return True
+
+        user32.EnumWindows(_cb, 0)
+        if not trouvees:
+            return False
+        hwnd = trouvees[0]
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        else:
+            user32.ShowWindow(hwnd, 5)  # SW_SHOW
+        if not user32.SetForegroundWindow(hwnd):
+            fg = user32.GetForegroundWindow()
+            tid_fg = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+            tid_moi = kernel32.GetCurrentThreadId()
+            if tid_fg and tid_fg != tid_moi:
+                user32.AttachThreadInput(tid_moi, tid_fg, True)
+                user32.BringWindowToTop(hwnd)
+                user32.SetForegroundWindow(hwnd)
+                user32.AttachThreadInput(tid_moi, tid_fg, False)
+            else:
+                user32.BringWindowToTop(hwnd)
+        return True
+    except Exception:
+        return False
+
+
 class BarreAccesRapideTask(QWidget):
     """PATCH (retour utilisateur : "es ce que tu peu une fois mettre la
     liste ici, je veux que tu met l'acces rapide ici, des bouton que
@@ -59012,7 +59059,7 @@ class BarreAccesRapideTask(QWidget):
         icone = None
         if etat == "ouvert":
             icone = _icone_qta_premiere_disponible(["mdi6.stop-circle-outline", "mdi6.stop"], Mocha.red)
-            btn.setToolTip(f"App de coordination ouverte : {chemin}\nClic gauche : arrêter")
+            btn.setToolTip(f"App de coordination ouverte : {chemin}\nClic gauche : arrêter -- clic droit : premier plan")
         elif etat == "demarrage":
             try:
                 icone = qta.icon("mdi6.loading", color=Mocha.peach, animation=qta.Spin(btn))
@@ -75734,10 +75781,22 @@ class TaskConfigScreen(_ReglageCaptureSynchroMixin, QWidget):
 
     def _sur_clic_droit_app_coordination(self):
         """CLIC DROIT sur le bouton d'app de coordination (bande Accès
-        rapide) : choisit/modifie le chemin du fichier Python propre à CE
+        rapide) : si l'app tourne, amène sa fenêtre au premier plan ;
+        sinon choisit/modifie le chemin du fichier Python propre à CE
         notebook, persisté dans project.json (Task.app_coordination_chemin)."""
         task = self._task_courant_obj()
         if task is None:
+            return
+        # App déjà lancée (démarrage/ouverte) : le clic droit AMÈNE SA
+        # FENÊTRE AU PREMIER PLAN (une fois) au lieu de changer le chemin.
+        entree = self._apps_coordination().get(task.id)
+        if entree is not None:
+            if not _amener_fenetre_au_premier_plan(entree["proc"].pid) and entree["etat"] == "ouvert":
+                BoiteDialogueAutoniaX.warning(
+                    self, "App de coordination",
+                    "Impossible d'amener la fenêtre au premier plan "
+                    "(aucune fenêtre trouvée, ou fonction réservée à Windows).",
+                )
             return
         dossier_initial = ""
         if task.app_coordination_chemin:
