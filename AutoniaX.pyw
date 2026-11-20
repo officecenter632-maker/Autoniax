@@ -19544,6 +19544,14 @@ def build_stylesheet() -> str:
         background-color: {m.surface1};
     }}
 
+    #BoutonAppCoordination[etat="demarrage"] {{
+        border: 1px solid {m.peach};
+    }}
+
+    #BoutonAppCoordination[etat="ouvert"] {{
+        border: 1px solid {m.red};
+    }}
+
     #AccesRapideItem {{
         background-color: {m.surface0};
         border: 1px solid {m.surface1};
@@ -58862,6 +58870,34 @@ class AccesRapideItem(QFrame):
         super().mousePressEvent(event)
 
 
+def _pid_a_fenetre_visible(pid: int) -> bool:
+    """True si le process `pid` possède au moins une fenêtre de premier
+    niveau VISIBLE et titrée (EnumWindows, API Win32 standard -- pas de
+    psutil, cf. _pid_parent). Sert à distinguer "app en cours de
+    démarrage" de "app ouverte" pour le bouton d'app de coordination.
+    Hors Windows : toujours False (l'appelant retombe sur un délai)."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes.wintypes
+        user32 = ctypes.windll.user32
+        trouve = [False]
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+        def _cb(hwnd, _lparam):
+            pid_f = ctypes.wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid_f))
+            if int(pid_f.value) == pid and user32.IsWindowVisible(hwnd) and user32.GetWindowTextLengthW(hwnd) > 0:
+                trouve[0] = True
+                return False
+            return True
+
+        user32.EnumWindows(_cb, 0)
+        return trouve[0]
+    except Exception:
+        return False
+
+
 class BarreAccesRapideTask(QWidget):
     """PATCH (retour utilisateur : "es ce que tu peu une fois mettre la
     liste ici, je veux que tu met l'acces rapide ici, des bouton que
@@ -58909,6 +58945,10 @@ class BarreAccesRapideTask(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("BarreAccesRapideTask")
+        # callable(task) -> "ferme" | "demarrage" | "ouvert", posé par
+        # TaskConfigScreen (état de l'app de coordination de CE notebook).
+        self.fournisseur_etat_app = None
+        self._etat_app = None
         self._items: dict = {}  # cellule_id -> AccesRapideItem, cf. rafraichir_titre
 
         root_layout = QHBoxLayout(self)
@@ -58957,27 +58997,45 @@ class BarreAccesRapideTask(QWidget):
         root_layout.addWidget(self.bouton_app_coordination, 0, Qt.AlignVCenter)
         self.definir_app_coordination("")
 
-    def definir_app_coordination(self, chemin: str):
-        """Met à jour l'aspect du bouton d'app de coordination : icône
-        grisée + info-bulle "clic droit pour configurer" tant qu'aucun
-        chemin n'est défini, icône colorée + chemin en info-bulle sinon."""
-        configure = bool(chemin)
-        couleur = Mocha.lavender if configure else Mocha.overlay0
-        icone = _icone_qta_premiere_disponible(
-            ["mdi6.language-python", "mdi6.file-code-outline", "mdi6.application-outline"], couleur
-        )
+    def definir_app_coordination(self, chemin: str, etat: str = "ferme"):
+        """Met à jour le bouton d'app de coordination selon son état :
+        "ferme" (icône Python, grisée si aucun chemin), "demarrage"
+        (sablier/spinner orange, clic ignoré), "ouvert" (icône stop rouge,
+        clic gauche = arrêt avec confirmation)."""
+        if (chemin, etat) == self._etat_app:
+            return
+        self._etat_app = (chemin, etat)
+        btn = self.bouton_app_coordination
+        btn.setProperty("etat", etat)
+        btn.style().unpolish(btn)
+        btn.style().polish(btn)
+        icone = None
+        if etat == "ouvert":
+            icone = _icone_qta_premiere_disponible(["mdi6.stop-circle-outline", "mdi6.stop"], Mocha.red)
+            btn.setToolTip(f"App de coordination ouverte : {chemin}\nClic gauche : arrêter (confirmation)")
+        elif etat == "demarrage":
+            try:
+                icone = qta.icon("mdi6.loading", color=Mocha.peach, animation=qta.Spin(btn))
+            except Exception:
+                icone = _icone_qta_premiere_disponible(["mdi6.timer-sand", "mdi6.loading"], Mocha.peach)
+            btn.setToolTip("Démarrage de l'app de coordination en cours...")
+        else:
+            configure = bool(chemin)
+            couleur = Mocha.lavender if configure else Mocha.overlay0
+            icone = _icone_qta_premiere_disponible(
+                ["mdi6.language-python", "mdi6.file-code-outline", "mdi6.application-outline"], couleur
+            )
+            if configure:
+                btn.setToolTip(
+                    f"App de coordination : {chemin}\nClic gauche : ouvrir -- clic droit : changer le chemin"
+                )
+            else:
+                btn.setToolTip("App de coordination non définie -- clic droit pour configurer")
         if icone is not None:
-            self.bouton_app_coordination.setIcon(icone)
+            btn.setIcon(icone)
+            btn.setText("")
         else:
-            self.bouton_app_coordination.setText("Py")
-        if configure:
-            self.bouton_app_coordination.setToolTip(
-                f"App de coordination : {chemin}\nClic gauche : ouvrir -- clic droit : changer le chemin"
-            )
-        else:
-            self.bouton_app_coordination.setToolTip(
-                "App de coordination non définie -- clic droit pour configurer"
-            )
+            btn.setText({"ouvert": "■", "demarrage": "…"}.get(etat, "Py"))
 
     def rafraichir(self, task: Optional[Task]):
         """Reconstruit entièrement la liste depuis task.cellules +
@@ -58993,7 +59051,14 @@ class BarreAccesRapideTask(QWidget):
                 w.deleteLater()
         self._items.clear()
 
-        self.definir_app_coordination(getattr(task, "app_coordination_chemin", "") if task is not None else "")
+        chemin_app = getattr(task, "app_coordination_chemin", "") if task is not None else ""
+        etat_app = "ferme"
+        if task is not None and self.fournisseur_etat_app is not None:
+            try:
+                etat_app = self.fournisseur_etat_app(task)
+            except Exception:
+                etat_app = "ferme"
+        self.definir_app_coordination(chemin_app, etat_app)
 
         if task is None:
             self._afficher_placeholder()
@@ -74633,6 +74698,7 @@ class TaskConfigScreen(_ReglageCaptureSynchroMixin, QWidget):
         self.barre_acces_rapide.demande_acces_sortie_cellule.connect(
             self._sur_clic_droit_acces_rapide
         )
+        self.barre_acces_rapide.fournisseur_etat_app = self._etat_app_coordination_pour
         self.barre_acces_rapide.demande_ouvrir_app_coordination.connect(
             self._sur_clic_app_coordination
         )
@@ -75686,12 +75752,100 @@ class TaskConfigScreen(_ReglageCaptureSynchroMixin, QWidget):
         self.project.save()
         self.barre_acces_rapide.definir_app_coordination(fichier)
 
-    def _sur_clic_app_coordination(self):
-        """CLIC GAUCHE sur le bouton d'app de coordination : ouvre le
-        fichier avec l'éditeur/handler PAR DÉFAUT du système ; un fichier
-        .pyw est lancé directement avec pythonw (donc sans console)."""
+    # --- Suivi de l'app de coordination (processus lancés par AutoniaX,
+    # un par notebook) : {task_id: {"proc": Popen, "t0": float, "etat": str}}.
+    # Pas de psutil (absent du projet) : seuls les .pyw lancés ICI sont suivis ;
+    # un fichier ouvert via l'éditeur par défaut ne l'est pas.
+    DELAI_MAX_DEMARRAGE_APP_S = 15.0
+
+    def _apps_coordination(self) -> dict:
+        d = self.__dict__.get("_apps_coord_suivies")
+        if d is None:
+            d = {}
+            self._apps_coord_suivies = d
+            self._timer_apps_coord = QTimer(self)
+            self._timer_apps_coord.setInterval(500)
+            self._timer_apps_coord.timeout.connect(self._tick_apps_coordination)
+        return d
+
+    def _etat_app_coordination_pour(self, task) -> str:
+        entree = self._apps_coordination().get(task.id)
+        return entree["etat"] if entree else "ferme"
+
+    def _maj_bouton_app_coordination(self):
         task = self._task_courant_obj()
         if task is None:
+            return
+        self.barre_acces_rapide.definir_app_coordination(
+            task.app_coordination_chemin, self._etat_app_coordination_pour(task)
+        )
+
+    def _tick_apps_coordination(self):
+        suivies = self._apps_coordination()
+        for task_id in list(suivies):
+            entree = suivies[task_id]
+            rc = entree["proc"].poll()
+            if rc is not None:
+                del suivies[task_id]
+                if entree["etat"] == "demarrage" and rc != 0 and not entree.get("arret_demande"):
+                    BoiteDialogueAutoniaX.warning(
+                        self, "App de coordination",
+                        f"L'app s'est arrêtée pendant son démarrage (code {rc}).",
+                    )
+            elif entree["etat"] == "demarrage":
+                ecoule = time.monotonic() - entree["t0"]
+                if _pid_a_fenetre_visible(entree["proc"].pid) or ecoule > self.DELAI_MAX_DEMARRAGE_APP_S:
+                    entree["etat"] = "ouvert"
+        if not suivies:
+            self._timer_apps_coord.stop()
+        self._maj_bouton_app_coordination()
+
+    def _arreter_app_coordination(self, task_id: str):
+        entree = self._apps_coordination().get(task_id)
+        if not entree:
+            return
+        entree["arret_demande"] = True
+        proc = entree["proc"]
+        try:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    capture_output=True, timeout=10,
+                )
+            else:
+                proc.terminate()
+        except Exception:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+    def _sur_clic_app_coordination(self):
+        """CLIC GAUCHE sur le bouton d'app de coordination.
+        - fermée : ouvre le fichier avec l'éditeur/handler PAR DÉFAUT ; un
+          .pyw est lancé avec pythonw (sans console) et suivi (état
+          "démarrage" puis "ouvert") ;
+        - démarrage : ignoré ;
+        - ouverte : demande confirmation puis arrête le processus."""
+        task = self._task_courant_obj()
+        if task is None:
+            return
+        suivies = self._apps_coordination()
+        entree = suivies.get(task.id)
+        if entree is not None:
+            if entree["etat"] == "demarrage":
+                return
+            if BoiteDialogueAutoniaX.question(
+                self, "Arrêter l'app de coordination",
+                "L'app de coordination de ce notebook est ouverte. L'arrêter ?",
+                texte_oui="Arrêter", texte_non="Annuler",
+                texte_informatif="Le processus sera terminé de force : un ordre en cours "
+                                 "(lot de démarrage, réveil...) serait interrompu.",
+            ):
+                # L'app a pu se fermer pendant que la boîte était ouverte.
+                if task.id in suivies:
+                    self._arreter_app_coordination(task.id)
             return
         chemin = task.app_coordination_chemin
         if not chemin:
@@ -75711,11 +75865,14 @@ class TaskConfigScreen(_ReglageCaptureSynchroMixin, QWidget):
                 kwargs = {}
                 if os.name == "nt":
                     kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                subprocess.Popen(
+                proc = subprocess.Popen(
                     [_python_sans_console(), chemin],
                     cwd=os.path.dirname(chemin) or None,
                     **kwargs,
                 )
+                suivies[task.id] = {"proc": proc, "t0": time.monotonic(), "etat": "demarrage"}
+                self._timer_apps_coord.start()
+                self._maj_bouton_app_coordination()
             elif hasattr(os, "startfile"):
                 os.startfile(chemin)
             else:
