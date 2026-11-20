@@ -21119,6 +21119,10 @@ def _id_executant_depuis_cle_profil_clone(cle_profil: str) -> str:
 # même Task puisque task.mode_execution est soit "local" soit "reseau",
 # jamais les deux à la fois pour un Task donné).
 ID_EXECUTANT_LOCAL = "local"
+
+# PATCH ARRET CONFIRME -- délai (s) après lequel un « Arrêter » sans confirmation passe à « Arrêt non confirmé »
+# (jamais à « Arrêté » : sans preuve de mort du code, on ne l'affiche pas).
+DELAI_CONFIRMATION_ARRET_S = 15.0
 # Libellé affiché par le panneau clone pour ID_EXECUTANT_LOCAL (colonne
 # sAutoniax par ligne, sous-titre du panneau -- cf. PanneauExecutionClone.
 # _nom_executant/rafraichir_liste, paramètre noms_par_id_executant).
@@ -30624,6 +30628,27 @@ def _cle_naturelle(texte: str) -> list:
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", str(texte))]
 
 
+def _charger_json_correspondance(texte):
+    """json.loads tolerant pour le texte colle depuis une IA : d'abord tel quel ; sinon retire le bloc de code
+    markdown (```json ... ```), remplace les guillemets typographiques par des guillemets droits et ne garde que
+    ce qui est entre la premiere '{' et la derniere '}'. En cas d'echec, leve l'erreur du texte d'origine."""
+    try:
+        return json.loads(texte)
+    except (json.JSONDecodeError, ValueError) as erreur_origine:
+        t = str(texte or "").strip()
+        m = re.search(r"```[ \t]*(?:json|JSON)?[ \t]*\r?\n?(.*?)```", t, re.S)
+        if m:
+            t = m.group(1).strip()
+        t = t.replace("\u201c", '"').replace("\u201d", '"').replace("\u201e", '"').replace("\u00ab", '"').replace("\u00bb", '"')
+        debut, fin = t.find("{"), t.rfind("}")
+        if debut != -1 and fin > debut:
+            t = t[debut:fin + 1]
+        try:
+            return json.loads(t)
+        except (json.JSONDecodeError, ValueError):
+            raise erreur_origine
+
+
 def valider_correspondance(texte: str) -> tuple:
     """Parse et valide le JSON. Retourne (correspondance, avertissements) ou
     leve ErreurCorrespondance. Ne modifie rien."""
@@ -30638,7 +30663,7 @@ def valider_correspondance_complete(texte: str) -> tuple:
     if texte is None or not str(texte).strip():
         raise ErreurCorrespondance("Le presse-papiers est vide.")
     try:
-        donnees = json.loads(texte)
+        donnees = _charger_json_correspondance(texte)
     except (json.JSONDecodeError, ValueError) as e:
         raise ErreurCorrespondance(f"JSON invalide : {e}")
     if not isinstance(donnees, dict):
@@ -30661,13 +30686,18 @@ def valider_correspondance_complete(texte: str) -> tuple:
             if coche_valeur is not None and not isinstance(coche_valeur, bool):
                 raise ErreurCorrespondance(f"'coche' doit etre true ou false : {cle!r}.")
             valeur = valeur.get("email")
-            if valeur is None and coche_valeur is False:
+            if valeur is None and coche_valeur is not None:
                 valeur = ""
         if not isinstance(cle, str) or not isinstance(valeur, str):
             raise ErreurCorrespondance(f"Cle ou valeur qui n'est pas une chaine : {cle!r}.")
         c, v = cle.strip(), valeur.strip()
-        if c and not v and coche_valeur is False:
-            # PATCH : profil decoche par le JSON et sans e-mail -> aucune entree d'e-mail enregistree (il n'est pas envoye).
+        if c and not v and coche_valeur is not None:
+            # PATCH : profil avec "coche" (true ou false) et sans e-mail -> aucune entree d'e-mail enregistree.
+            # Un profil coche sans e-mail n'est plus refuse : avertissement, cases et sites conserves.
+            if coche_valeur is True:
+                avertissements.append(f"Profil coche sans e-mail : {c!r} (e-mail non enregistre).")
+                if sites_valeur is not None:
+                    sites_par_profil[c] = normaliser_sites(sites_valeur)
             continue
         if not c or not v:
             raise ErreurCorrespondance(f"Cle ou valeur vide : {cle!r} -> {valeur!r}.")
@@ -30692,7 +30722,7 @@ def coches_depuis_texte(texte: str) -> dict:
     Sert a cocher/decocher les cases de l'arbre « Envoyer vers Kaggle ». Ne leve jamais d'erreur (le JSON a deja
     ete valide par valider_correspondance_complete) ; les entrees sans \"coche\" ne touchent pas aux cases."""
     try:
-        donnees = json.loads(texte)
+        donnees = _charger_json_correspondance(texte)
     except (json.JSONDecodeError, ValueError, TypeError):
         return {}
     coches: dict = {}
@@ -30713,7 +30743,11 @@ PROMPT_CORRESPONDANCE_IA = (
     "FORMAT EXIGÉ : un objet JSON { \"sAutoniax-N/nom_profil_local\": { \"sautoniax\": \"sAutoniax-N\", "
     "\"profil\": \"nom_profil_local\", \"email\": \"email@domaine.com\", \"sites\": [\"google\", \"tiktok\"], "
     "\"coche\": true } }.\n"
-    "RÈGLE N°1 (prioritaire) : la LISTE BRUTE que je te donne dans CE message est la SEULE source de vérité pour "
+    "DEUX CAS. CAS A : ce message contient une LISTE BRUTE d'e-mails (attribution d'e-mails) : applique à la lettre toutes les règles ci-dessous. "
+    "CAS B : ce message ne contient PAS de liste brute (par exemple je te demande seulement d'ajouter un site) : ne modifie QUE le champ demandé "
+    "(\"sites\") et recopie TOUS les autres champs, \"email\" ET \"coche\", EXACTEMENT comme dans le JSON actuel : ne passe JAMAIS un \"coche\" de true à false, "
+    "n'efface et n'invente aucun e-mail. Les règles ci-dessous sur \"email\", \"coche\" et l'INVARIANT ne s'appliquent QU'au CAS A.\n"
+    "RÈGLE N°1 (CAS A, prioritaire) : la LISTE BRUTE que je te donne dans CE message est la SEULE source de vérité pour "
     "\"email\" et \"coche\". Chaque ligne de la liste brute contient : e-mail, nom du profil, sAuto-N (= sAutoniax-N), "
     "puis éventuellement les sites. Les e-mails et les \"coche\" déjà présents dans le JSON actuel ne sont PAS une "
     "source : ils reflètent un état ancien, ne les conserve JAMAIS par défaut. Une entrée n'a un e-mail et "
@@ -30741,8 +30775,19 @@ PROMPT_CORRESPONDANCE_IA = (
     "un mot par site (ex. google, youtube, tiktok, facebook). Garde les sites déjà présents dans le JSON actuel "
     "(même pour une entrée décochée) et ajoute ceux de la ligne brute correspondante (colonne des sites, séparés "
     "par des virgules), sans doublon ; mets [] si tu n'en sais rien.\n"
-    "- Réponds UNIQUEMENT avec le JSON valide : aucun texte avant ou après, aucune explication, "
-    "pas de bloc de code markdown.\n"
+    "- INVARIANT ABSOLU (l'application REFUSE l'import sinon) : \"coche\": true exige un \"email\" NON VIDE ; "
+    "un \"email\" vide impose \"coche\": false. (CAS A seulement) Le JSON actuel peut contenir des entrées avec \"email\": \"\" et "
+    "\"coche\": true : dans ce cas A c'est un état invalide à corriger, ne le recopie JAMAIS tel quel.\n"
+    "- N'invente et ne devine JAMAIS un e-mail (ni à partir du nom du profil, ni d'une autre source) : "
+    "seul compte l'e-mail d'une ligne brute de ce message, ou celui que je te donne explicitement dans ce message.\n"
+    "- FORMAT DE LA RÉPONSE : place le JSON complet dans UN SEUL bloc de code markdown "
+    "(``` json ... ``` : ouvre avec trois accents graves suivis de json, ferme avec trois accents graves) afin que je "
+    "puisse le copier en un clic avec le bouton « Copier » du bloc. Rien d'autre que ce bloc : aucun texte avant ou "
+    "après, aucune explication, pas de JSON en dehors du bloc, pas de second bloc. Dans le bloc : uniquement des "
+    "guillemets droits \" (JAMAIS de guillemets typographiques “ ” ), aucun commentaire, aucune virgule finale.\n"
+    "- AVANT de répondre, vérifie en silence : (1) toutes les entrées du JSON actuel sont présentes, avec les mêmes "
+    "clés ; (2) en CAS A seulement, aucune entrée n'a \"coche\": true avec un \"email\" vide (en CAS B, \"email\" et \"coche\" sont identiques au JSON actuel) ; (3) aucun e-mail n'apparaît deux fois ; "
+    "(4) le JSON est valide ; (5) la réponse est un seul bloc de code, sans texte autour.\n"
     "JSON actuel :\n"
 )
 
@@ -31437,8 +31482,9 @@ class GestionnaireKaggle:
             if avert_type:
                 _log_kaggle.warning("%s : %s", nom_profil, avert_type)
             # sites fournis par l'ordre d'envoi (JSON de l'IA) ; None = non fournis -> tags locaux du profil
-            sites_envoi = (normaliser_sites(sites) if sites is not None
-                           else _kg_sites_declares_local(nom_profil))
+            # PATCH : sites de l'ordre UNION sites reels du profil (un ordre ancien ne doit pas effacer un site ajoute)
+            sites_envoi = (normaliser_sites(list(sites) + list(_kg_sites_declares_local(nom_profil)))
+                           if sites is not None else _kg_sites_declares_local(nom_profil))
             meta = {"nom_archive": nom_archive, "nom_local_origine": nom_profil,
                     "taille": taille, "date_envoi_utc": date_envoi, "instance": instance,
                     "type_instance": type_profil or "",
@@ -31470,8 +31516,9 @@ class GestionnaireKaggle:
             else:
                 # la date de creation vit dans le sous-titre existant : on la conserve, jamais ecrasee
                 existant = self._lire_dataset_cible(ref)
-                if existant and existant.get("cree_le"):
-                    metadonnees["subtitle"] = sous_titre_creation(existant["cree_le"], sites_envoi)
+                # PATCH sites : le sous-titre (date + sites) est TOUJOURS reecrit au re-envoi. Avant, il ne l'etait que si
+                # l'ancien sous-titre contenait deja 'ax;cree=' -> sinon l'ancienne liste de sites restait affichee.
+                metadonnees["subtitle"] = sous_titre_creation((existant or {}).get("cree_le") or date_envoi, sites_envoi)
                 if existant:
                     self._j(f"Ancien dataset : {formater_taille_octets(existant.get('taille_octets', 0))}")
                 # Re-envoi = nouvelle VERSION du dataset existant (plus de suppression/recreation) : le telechargement
@@ -31549,6 +31596,7 @@ class GestionnaireKaggle:
             t0 = time.monotonic()
             fichiers_publies = self._attendre_fichier_publie(ref, nom_zip, taille, liste_avant)
             self._j(f"Kaggle a termine le traitement apres {_kg_duree(t0)}")
+            self._forcer_sous_titre(ref, metadonnees)  # PATCH sites : verifie/impose le sous-titre apres la nouvelle version
             prog("Verification", 90)
             verif = self._verifier_envoi(ref, nom_zip, taille, nb_zip, nb_zip_non_vides, taille_contenu_zip,
                                          liste_avant=liste_avant, fichiers_initiaux=fichiers_publies)
@@ -31691,6 +31739,33 @@ class GestionnaireKaggle:
             return {}
         finally:
             shutil.rmtree(dossier, ignore_errors=True)
+
+    def _forcer_sous_titre(self, ref: str, metadonnees: dict) -> None:
+        """PATCH sites : Kaggle peut ignorer le sous-titre d'une nouvelle VERSION. On relit le sous-titre en ligne et, s'il
+        differe de celui voulu, on le met a jour via dataset_metadata_update. Jamais bloquant (simple journal)."""
+        voulu = str((metadonnees or {}).get("subtitle") or "")
+        if not voulu:
+            return
+        try:
+            actuel = str(self._metadonnees_dataset(ref).get("subtitle") or "")
+            if actuel == voulu:
+                self._j("Sous-titre (sites) deja a jour sur Kaggle")
+                return
+            dossier = tempfile.mkdtemp(prefix="kg_sub_")
+            try:
+                meta = {"id": ref, "title": metadonnees.get("title"), "subtitle": voulu,
+                        "description": metadonnees.get("description") or "", "licenses": [{"name": "other"}],
+                        "isPrivate": True}
+                with open(os.path.join(dossier, "dataset-metadata.json"), "w", encoding="utf-8") as f:
+                    json.dump(meta, f, ensure_ascii=False)
+                api = self.authentifier()
+                self._avec_429(f"Sous-titre de {ref}", lambda: api.dataset_metadata_update(ref, dossier))
+                self._j(f"Sous-titre (sites) corrige sur Kaggle : {voulu}")
+            finally:
+                shutil.rmtree(dossier, ignore_errors=True)
+        except Exception as e:
+            _log_kaggle.warning("Sous-titre non mis a jour pour %s : %r", ref, e)
+            self._j(f"Sous-titre (sites) non mis a jour : {e}")
 
     def _lire_dataset_cible(self, ref: str) -> dict:
         """Lecture ciblee du SEUL dataset concerne (au lieu de lister tous les datasets du compte) :
@@ -32933,7 +33008,7 @@ class ProfilsKaggleScreen(QWidget):
         self.bouton_copier_ia.setIcon(qta.icon("mdi6.content-copy", color=Mocha.text))
         self.bouton_copier_ia.setCursor(Qt.PointingHandCursor)
         self.bouton_copier_ia.setToolTip(
-            "Copie un court prompt + le JSON actuel (tous les profils listés et la correspondance enregistrée).\n"
+            "Copie un court prompt + le JSON actuel (profils cochés, correspondance enregistrée et SITES déjà connectés de chaque profil).\n"
             "Colle-le dans une IA : elle renvoie uniquement le JSON bien nommé, à importer avec le bouton de gauche.")
         self.bouton_copier_ia.clicked.connect(self._sur_clic_copier_ia)
         haut.addWidget(self.bouton_copier_ia)
@@ -33377,10 +33452,24 @@ class ProfilsKaggleScreen(QWidget):
         if perimes & set(cles):
             self.ajouter_journal("Email enregistre deja utilise par une archive existante -> propose vide pour : "
                                  + ", ".join(sorted(perimes & set(cles))))
-        texte = construire_texte_correspondance_ia(cles, correspondance, sites_enreg)
+        # PATCH (demande utilisateur) : « Copier pour IA » doit mentionner les SITES ACTUELS de chaque profil (ceux de la
+        # colonne « Sites » = sites reellement connectes du profil, lus sur la machine), et pas seulement ceux d'une
+        # correspondance deja importee (vide tant que rien n'a ete importe -> le JSON partait avec "sites": []).
+        # Pour chaque profil coche : sites actuels du profil UNION sites deja presents dans la correspondance importee.
+        sites_copie = {}
+        for (_i, _nom), _it in self._items.items():
+            if _it.checkState(self.COL_PROFIL) != Qt.Checked:
+                continue
+            _nom_exec = self._sautoniax.get(_i, _i)
+            _actuels = _it.data(self.COL_SITES, Qt.UserRole) or []
+            _importes = chercher_correspondance(sites_enreg, _nom_exec, _nom) or []
+            sites_copie[cle_correspondance(_nom_exec, _nom)] = normaliser_sites(list(_actuels) + list(_importes))
+        texte = construire_texte_correspondance_ia(cles, correspondance, sites_copie)
         QGuiApplication.clipboard().setText(texte)
         nb_entrees = len(json.loads(texte[texte.rindex(MARQUEUR_JSON_CORRESPONDANCE_IA) + len(MARQUEUR_JSON_CORRESPONDANCE_IA):]))
-        self.ajouter_journal(f"Prompt + JSON copiés dans le presse-papiers ({nb_entrees} entrée(s)).")
+        nb_avec_sites = sum(1 for v in sites_copie.values() if v)
+        self.ajouter_journal(f"Prompt + JSON copiés dans le presse-papiers ({nb_entrees} entrée(s), "
+                             f"{nb_avec_sites} avec des sites déjà connectés).")
 
     def texte_journal(self) -> str:
         return "\n".join(self.journal.item(i).text() for i in range(self.journal.count()))
@@ -33771,7 +33860,11 @@ class ProfilsKaggleScreen(QWidget):
                       "modifie_ts": ligne["modifie_ts"]}
             tags_corr = chercher_correspondance(sites_corr, ligne["nom_executant"], ligne["nom_local"])
             if tags_corr is not None:  # absent = ancien format : les tags du profil ne sont pas touches
-                entree["sites"] = list(tags_corr)
+                # PATCH : un JSON importe AVANT l'ajout d'un site (ex. chatgpt) ne doit pas l'effacer sur Kaggle :
+                # sites envoyes = sites du JSON UNION sites reels du profil (colonne « Sites », comme « Copier pour IA »).
+                _it_loc = self._items.get((ligne["id_executant"], ligne["nom_local"]))
+                _tags_locaux = (_it_loc.data(self.COL_SITES, Qt.UserRole) or []) if _it_loc is not None else []
+                entree["sites"] = normaliser_sites(list(tags_corr) + list(_tags_locaux))
             profils.append(entree)
         self._operation_id = uuid.uuid4().hex[:12]
         self._supprimer_operation = bool(supprimer)
@@ -68734,6 +68827,14 @@ class CloneProfilEtat:
     id_executant_sautoniax: str = ""
     coche: bool = False  # état de la checkbox dans le panneau clone
     statut: str = "inactif"  # "inactif" | "en_attente" | "en_cours" | "succes" | "erreur" | "arrete"
+    # PATCH ARRET CONFIRME -- « Arrêter » ne passe plus le statut à "arrete" au clic : le statut reste "en_cours" tant que la
+    # preuve que le code est mort n'est pas arrivée (distant : arreter_execution_profil_resultat_reel ; local : fin réelle du
+    # thread d'exécution). arret_etat décrit l'attente : "" | "en_cours" | "non_confirme".
+    arret_etat: str = ""
+    arret_demande_ts: float = 0.0
+    arret_id: int = 0                          # identifie la demande d'arrêt courante (ignore les délais/sondages périmés)
+    arret_moteur: Optional[object] = None      # moteur LOCAL détaché dont on attend la fin du thread
+    arret_message: str = ""                    # raison du dernier échec/doute (infobulle)
     cellule_courante_id: Optional[str] = None
     # id de cellule (task.cellule_variables.id ou task.cellules[i].id) ->
     # TaskCellule TEMPORAIRE portant la sortie de CE profil pour CETTE
@@ -70404,6 +70505,18 @@ class PanneauExecutionClone(QWidget):
         self.table_profils.setColumnWidth(1, plus_long_exec + 16)
 
     @staticmethod
+    def _statut_affiche(etat_profil) -> str:
+        """PATCH ARRET CONFIRME : statut à AFFICHER. Le statut réel reste "en_cours" pendant l'attente de confirmation
+        d'arrêt (séquence/boutons continuent de voir le profil comme actif) ; seul l'affichage change."""
+        arret = getattr(etat_profil, "arret_etat", "")
+        if etat_profil.statut in ("en_attente", "en_cours"):
+            if arret == "en_cours":
+                return "arret_en_cours"
+            if arret == "non_confirme":
+                return "arret_non_confirme"
+        return etat_profil.statut
+
+    @staticmethod
     def _libelle_statut(statut: str) -> str:
         # SUPPRIMÉ (SPEC_lot_corrections_2026-09.md section 2) : entrée
         # "deconnecte" -- ce statut n'existe plus, un profil dont le
@@ -70412,6 +70525,7 @@ class PanneauExecutionClone(QWidget):
         return {
             "inactif": "Inactif", "en_attente": "En attente", "en_cours": "En cours",
             "succes": "Succès", "erreur": "Erreur", "arrete": "Arrêté",
+            "arret_en_cours": "Arrêt en cours…", "arret_non_confirme": "Arrêt non confirmé",
         }.get(statut, statut)
 
     @staticmethod
@@ -70430,6 +70544,7 @@ class PanneauExecutionClone(QWidget):
         couleur_hex = {
             "inactif": Mocha.subtext0, "en_attente": Mocha.subtext0, "en_cours": Mocha.blue,
             "succes": Mocha.green, "erreur": Mocha.red, "arrete": Mocha.peach,
+            "arret_en_cours": Mocha.peach, "arret_non_confirme": Mocha.red,
         }.get(statut, Mocha.subtext0)
         return QColor(couleur_hex)
 
@@ -71061,9 +71176,12 @@ class PanneauExecutionClone(QWidget):
         ligne.setSpacing(4)
 
         nom_profil = _nom_depuis_cle_profil_clone(cle_profil)
-        libelle_statut = self._libelle_statut(etat_profil.statut)
+        statut_affiche = self._statut_affiche(etat_profil)   # PATCH ARRET CONFIRME
+        libelle_statut = self._libelle_statut(statut_affiche)
         texte_statut = QLabel(libelle_statut, conteneur)
-        texte_statut.setToolTip(libelle_statut)
+        texte_statut.setToolTip(
+            libelle_statut + (f" -- {etat_profil.arret_message}" if statut_affiche == "arret_non_confirme" and etat_profil.arret_message else "")
+        )
         # CORRECTIF (retour utilisateur explicite : "quand je selctionne
         # un clone et que je lance sont execution, sont labels : en
         # cours ... est vert, alors que sa devais rester bleu") -- ce
@@ -71081,7 +71199,7 @@ class PanneauExecutionClone(QWidget):
         # rien n'est perdu en retirant le vert du texte lui-même --
         # seule la redondance/le conflit avec le code couleur du statut
         # technique est supprimé.
-        couleur_texte = self._couleur_statut(etat_profil.statut)
+        couleur_texte = self._couleur_statut(statut_affiche)
         texte_statut.setStyleSheet(f"color: {couleur_texte.name()};")
         ligne.addWidget(texte_statut)
 
@@ -71132,11 +71250,11 @@ class PanneauExecutionClone(QWidget):
 
         badge = BadgeStatutNotebook(conteneur)
         if etat_profil.statut in ("en_attente", "en_cours"):
-            badge.definir_en_cours(f"« {nom_profil} » -- {self._libelle_statut(etat_profil.statut).lower()}")
+            badge.definir_en_cours(f"« {nom_profil} » -- {self._libelle_statut(self._statut_affiche(etat_profil)).lower()}")
         else:
             badge.definir_statut(
-                self._couleur_statut(etat_profil.statut).name(),
-                f"« {nom_profil} » -- {self._libelle_statut(etat_profil.statut)}",
+                self._couleur_statut(self._statut_affiche(etat_profil)).name(),
+                f"« {nom_profil} » -- {self._libelle_statut(self._statut_affiche(etat_profil))}",
             )
         ligne.addWidget(badge)
 
@@ -77271,6 +77389,7 @@ class TaskConfigScreen(_ReglageCaptureSynchroMixin, QWidget):
             # dévier ce profil de son sAutoniax d'origine pour CE lot.
             profil_etat.id_executant_sautoniax = id_executant_profil
             profil_etat.statut = "en_attente"
+            profil_etat.arret_etat = ""   # PATCH ARRET CONFIRME
             profil_etat.reprise_apres_coupure = False      # PATCH H
             profil_etat.cellules_resultats = {}
             profil_etat.moteur_courant = None
@@ -77911,6 +78030,7 @@ class TaskConfigScreen(_ReglageCaptureSynchroMixin, QWidget):
             profil_etat.id_executant_sautoniax = ID_EXECUTANT_LOCAL
             profil_etat.instance_id = instance_id
             profil_etat.statut = "en_attente"
+            profil_etat.arret_etat = ""   # PATCH ARRET CONFIRME
             profil_etat.reprise_apres_coupure = False      # PATCH H
             profil_etat.cellules_resultats = {}
             profil_etat.moteur_courant = None
@@ -78428,9 +78548,9 @@ class TaskConfigScreen(_ReglageCaptureSynchroMixin, QWidget):
             # thread daemon abandonné en local) jusqu'à sa fin naturelle.
             # _detacher_moteur_courant_profil gère les deux types de
             # moteur indifféremment (cf. sa docstring).
-            self._detacher_moteur_courant_profil(profil_etat)
-            profil_etat.statut = "arrete"
-            profil_etat.cellule_courante_id = None
+            # PATCH ARRET CONFIRME : même logique que l'arrêt individuel ; « Arrêté » seulement sur confirmation.
+            if not self._demander_arret_profil_clone(task, etat, nom_profil_boucle, profil_etat):
+                continue   # déjà en cours d'arrêt (double clic)
             if nom_profil_boucle == etat.profil_actif:
                 profil_actif_arrete = True
         # CORRECTIF (cf. docstring ci-dessus) : sequence_en_cours n'est
@@ -78520,6 +78640,8 @@ class TaskConfigScreen(_ReglageCaptureSynchroMixin, QWidget):
             return
 
         profil_etat.statut = "en_attente"
+
+        profil_etat.arret_etat = ""   # PATCH ARRET CONFIRME
         profil_etat.reprise_apres_coupure = False      # PATCH H
         profil_etat.cellules_resultats = {}
         profil_etat.moteur_courant = None
@@ -78679,6 +78801,8 @@ class TaskConfigScreen(_ReglageCaptureSynchroMixin, QWidget):
             return
 
         profil_etat.statut = "en_attente"
+
+        profil_etat.arret_etat = ""   # PATCH ARRET CONFIRME
         profil_etat.reprise_apres_coupure = False      # PATCH H
         profil_etat.cellules_resultats = {}
         profil_etat.moteur_courant = None
@@ -78793,70 +78917,130 @@ class TaskConfigScreen(_ReglageCaptureSynchroMixin, QWidget):
         profil_etat = etat.profils.get(cle_profil)
         if profil_etat is None:
             return
-        # CORRECTIF (cf. docstring de _detacher_moteur_courant_profil) :
-        # retire aussi l'entrée du registre de routage clone si le moteur
-        # est un moteur RÉSEAU -- sinon elle reste orpheline indéfiniment
-        # si le sAutoniax ne répond jamais après cet arrêt manuel (le
-        # résultat, s'il finit par arriver, serait de toute façon ignoré
-        # par moteur.sur_resultat_recu puisque self._arrete est déjà True
-        # à ce point, cf. sa docstring -- mais autant ne pas laisser
-        # grossir ce dict pour rien). No-op propre pour un moteur LOCAL
-        # (pas de _session_id, cf. sa docstring).
-        self._detacher_moteur_courant_profil(profil_etat)
-        # VRAI ARRÊT RÉSEAU DU CODE (Section 8, cf. docstring ci-dessus) --
-        # envoyé indépendamment du détachement UI qui précède : même si
-        # moteur_courant était déjà None ici (cas limite : le profil est
-        # "en_attente", pas encore "en_cours", donc jamais eu de moteur --
-        # ou le résultat réseau est déjà arrivé entre-temps), le
-        # sAutoniax peut malgré tout avoir un exécuteur actif pour ce
-        # nom_profil (ex. relance rapide) -- arreter_execution_profil est
-        # de toute façon un no-op inoffensif côté sAutoniax si aucun
-        # exécuteur n'est trouvé pour ce nom (cf. _sur_arreter_execution_
-        # profil_demande, message d'échec propre ou ok=True selon le cas,
-        # jamais d'exception).
-        #
-        # BUGFIX (relecture complète de la chaîne mode local) : la garde
-        # `if id_executant and self._client_serveur_t is not None`
-        # laissait passer un profil LOCAL (id_executant == "local", une
-        # chaîne non vide donc vraie) dès que self._client_serveur_t
-        # n'était pas None -- ce qui n'a AUCUN rapport avec le mode du
-        # Task actuellement ouvert : self._client_serveur_t est injecté
-        # une seule fois par MainWindow (cf. definir_client_reseau_t) et
-        # reste vivant tant que le module 'websockets' est disponible et
-        # qu'une connexion serveurT existe, INDÉPENDAMMENT du fait que CE
-        # Task précis soit en mode local ou réseau. Résultat concret sans
-        # ce correctif : sur un Task LOCAL, avec une connexion serveurT
-        # par ailleurs active (ex. d'autres Tasks réseau ouverts), cliquer
-        # sur "Arrêter" pour un profil local envoyait un VRAI message
-        # réseau arreter_execution_profil("local", nom_profil) au serveurT
-        # -- un aller-retour réseau inutile pour une action purement
-        # locale, avec "local" comme id_executant qui ne correspond à
-        # aucun sAutoniax réel (échec propre côté serveur, sans crash,
-        # mais confus et hors de propos). Correctif : même garde que
-        # _sur_demande_kill_clone_profil (cf. sa docstring), qui bifurque
-        # déjà correctement sur ID_EXECUTANT_LOCAL -- pour un profil
-        # local, le détachement UI ci-dessus suffit (rien à interrompre
-        # côté réseau, cf. spec §3.8 : "Arrêter" en local ne fait que
-        # détacher l'UI du thread daemon abandonné, jamais de vrai arrêt
-        # réseau puisqu'il n'y en a pas).
-        if _id_executant_depuis_cle_profil_clone(cle_profil) != ID_EXECUTANT_LOCAL:
-            id_executant = _id_executant_depuis_cle_profil_clone(cle_profil)
-            nom_profil_nu = profil_etat.nom_profil or _nom_depuis_cle_profil_clone(cle_profil)
-            if id_executant and self._client_serveur_t is not None:
-                self._client_serveur_t.arreter_execution_profil(id_executant, nom_profil_nu)
-        etait_actif_et_en_cours = (
-            cle_profil == etat.profil_actif and profil_etat.statut in ("en_attente", "en_cours")
-        )
-        if profil_etat.statut in ("en_attente", "en_cours"):
-            profil_etat.statut = "arrete"
-            profil_etat.cellule_courante_id = None
+        # PATCH ARRET CONFIRME : remplace détachement + envoi réseau + statut "arrete" IMMÉDIAT par
+        # _demander_arret_profil_clone : « Arrêt en cours… » puis « Arrêté » seulement sur confirmation réelle.
+        self._demander_arret_profil_clone(task, etat, cle_profil, profil_etat)
         self._verifier_fin_sequence_clone(task, etat)
         self._rafraichir_panneau_clone_si_ouvert(task, etat)
-        # Section 6.2 : arrêt individuel d'un profil qui se trouve être
-        # le profil actif -- le bouton global doit repasser à "Lancer"
-        # tout de suite.
-        if etait_actif_et_en_cours:
-            self._rafraichir_bouton_global()
+
+    # ------------------------------------------------------------------
+    # PATCH ARRET CONFIRME -- « Arrêter » ne dit « Arrêté » qu'avec la PREUVE que le code est mort.
+    #   distant : message arreter_execution_profil_resultat_reel du sAutoniax (ok=True = exécution réellement terminée) ;
+    #   local   : le thread d'exécution n'est plus vivant (MoteurExecutionCellule.thread_actif()).
+    # Entre le clic et la preuve, arret_etat = "en_cours" (statut réel inchangé). Sans preuve après DELAI_CONFIRMATION_ARRET_S :
+    # "non_confirme" (réessayer = recliquer Arrêter) ; une confirmation tardive peut encore faire passer à « Arrêté ».
+    # ------------------------------------------------------------------
+    def _task_pour_arret(self, task_id):
+        try:
+            return self.project.find_task(task_id)
+        except Exception:
+            return None
+
+    def _profil_arret(self, task_id, cle_profil):
+        etat = self._executions_clone.get(task_id)
+        profil_etat = etat.profils.get(cle_profil) if etat is not None else None
+        return etat, profil_etat
+
+    def _demander_arret_profil_clone(self, task, etat, cle_profil, profil_etat) -> bool:
+        """Lance l'arrêt du CODE d'un profil (jamais le navigateur). Retourne False si rien n'a été fait (double clic)."""
+        if profil_etat.arret_etat == "en_cours":
+            return False
+        id_executant = _id_executant_depuis_cle_profil_clone(cle_profil)
+        nom_nu = profil_etat.nom_profil or _nom_depuis_cle_profil_clone(cle_profil)
+        est_local = (id_executant == ID_EXECUTANT_LOCAL)
+        moteur_local = profil_etat.moteur_courant if est_local else None
+        if est_local and moteur_local is None:
+            moteur_local = profil_etat.arret_moteur   # réessai après « non confirmé » : moteur déjà détaché
+        self._detacher_moteur_courant_profil(profil_etat)   # en local, arreter() injecte aussi l'exception d'arrêt
+        profil_etat.arret_id += 1
+        arret_id = profil_etat.arret_id
+        profil_etat.arret_demande_ts = time.time()
+        profil_etat.arret_message = ""
+        task_id = task.id
+        if est_local:
+            profil_etat.arret_moteur = moteur_local
+            if moteur_local is None or not moteur_local.thread_actif():
+                self._finaliser_arret_profil(task, etat, cle_profil, profil_etat, True, "")   # rien ne tourne
+                return True
+            moteur_local.interrompre_thread()
+            profil_etat.arret_etat = "en_cours"
+            QTimer.singleShot(250, lambda: self._sonder_arret_local(task_id, cle_profil, arret_id))
+        else:
+            profil_etat.arret_etat = "en_cours"
+            if not id_executant or self._client_serveur_t is None:
+                self._finaliser_arret_profil(task, etat, cle_profil, profil_etat, False, "Non connecté au serveurT.")
+                return True
+            try:
+                self._client_serveur_t.arreter_execution_profil(id_executant, nom_nu)
+            except Exception as e:
+                log.warning(f"[Arrêter] envoi de l'arrêt réseau impossible pour {cle_profil!r} : {e!r}")
+                self._finaliser_arret_profil(task, etat, cle_profil, profil_etat, False, f"Envoi impossible : {e}")
+                return True
+        QTimer.singleShot(int(DELAI_CONFIRMATION_ARRET_S * 1000), lambda: self._sur_delai_arret_profil(task_id, cle_profil, arret_id))
+        self._rafraichir_panneau_clone_si_ouvert(task, etat)
+        return True
+
+    def _finaliser_arret_profil(self, task, etat, cle_profil, profil_etat, ok: bool, message: str):
+        """ok=True : preuve de mort reçue -> "arrete". ok=False : « Arrêt non confirmé » (statut inchangé)."""
+        if ok:
+            etait_actif = (cle_profil == etat.profil_actif)
+            profil_etat.arret_etat = ""
+            profil_etat.arret_message = ""
+            profil_etat.arret_moteur = None
+            if profil_etat.statut in ("en_attente", "en_cours"):
+                profil_etat.statut = "arrete"
+                profil_etat.cellule_courante_id = None
+            log.info(f"[Arrêter] arrêt CONFIRMÉ pour {cle_profil!r}")
+            if task is not None:
+                self._verifier_fin_sequence_clone(task, etat)
+                self._rafraichir_panneau_clone_si_ouvert(task, etat)
+                if etait_actif:
+                    self._rafraichir_bouton_global()
+        else:
+            profil_etat.arret_etat = "non_confirme"
+            profil_etat.arret_message = message or "aucune confirmation d'arrêt reçue"
+            log.warning(f"[Arrêter] arrêt NON confirmé pour {cle_profil!r} : {profil_etat.arret_message}")
+            if task is not None:
+                self._rafraichir_panneau_clone_si_ouvert(task, etat)
+
+    def _sonder_arret_local(self, task_id, cle_profil, arret_id):
+        etat, profil_etat = self._profil_arret(task_id, cle_profil)
+        if profil_etat is None or profil_etat.arret_etat != "en_cours" or profil_etat.arret_id != arret_id:
+            return
+        moteur = profil_etat.arret_moteur
+        if moteur is None or not moteur.thread_actif():
+            self._finaliser_arret_profil(self._task_pour_arret(task_id), etat, cle_profil, profil_etat, True, "")
+            return
+        QTimer.singleShot(250, lambda: self._sonder_arret_local(task_id, cle_profil, arret_id))
+
+    def _sur_delai_arret_profil(self, task_id, cle_profil, arret_id):
+        etat, profil_etat = self._profil_arret(task_id, cle_profil)
+        if profil_etat is None or profil_etat.arret_etat != "en_cours" or profil_etat.arret_id != arret_id:
+            return
+        self._finaliser_arret_profil(
+            self._task_pour_arret(task_id), etat, cle_profil, profil_etat, False,
+            f"aucune confirmation après {int(DELAI_CONFIRMATION_ARRET_S)} s -- le code tourne peut-être encore (recliquer sur Arrêter pour réessayer)",
+        )
+
+    def _appliquer_confirmation_arret(self, id_executant: str, nom_profil: str, ok: bool, message: str):
+        for task_id, etat in list(self._executions_clone.items()):
+            for cle, profil_etat in list(etat.profils.items()):
+                if profil_etat.arret_etat not in ("en_cours", "non_confirme"):
+                    continue
+                if _id_executant_depuis_cle_profil_clone(cle) != id_executant:
+                    continue
+                if (profil_etat.nom_profil or _nom_depuis_cle_profil_clone(cle)) != nom_profil:
+                    continue
+                self._finaliser_arret_profil(self._task_pour_arret(task_id), etat, cle, profil_etat, bool(ok), message)
+
+    def sur_arret_execution_confirme(self, id_executant: str, nom_profil: str, ok: bool, message: str = ""):
+        """Slot de arreter_execution_profil_resultat_reel_recu : confirmation (ok=True) ou échec réel de l'arrêt côté sAutoniax."""
+        self._appliquer_confirmation_arret(id_executant, nom_profil, ok, message)
+
+    def sur_arret_execution_refuse(self, ok: bool, id_executant: str, nom_profil: str, erreur: str = ""):
+        """Slot de arreter_execution_profil_resultat (échec immédiat d'envoi, ex. « Non connecté au serveurT »)."""
+        if not ok:
+            self._appliquer_confirmation_arret(id_executant, nom_profil, False, erreur)
 
     def _sur_demande_kill_clone_profil(self, cle_profil: str):
         """AJOUT (SPEC_lot_corrections_2026-09.md section 9) : nouveau
@@ -98456,6 +98640,35 @@ class MoteurExecutionCellule(QObject):
         self._thread.start()
         log_cellule.info(f"[{self.cellule_id}][exec={self._execution_id}] thread.start() appelé (thread daemon={self._thread.daemon}, is_alive juste après start={self._thread.is_alive()})")
 
+    # PATCH ARRET LOCAL REEL -- mettre à False pour revenir à l'ancien comportement (simple détachement du thread daemon).
+    INTERRUPTION_THREAD_ACTIVEE = True
+
+    def thread_actif(self) -> bool:
+        """True tant que le thread d'exécution du code utilisateur tourne encore (preuve de vie/de mort)."""
+        t = self._thread
+        return t is not None and t.is_alive()
+
+    def interrompre_thread(self) -> bool:
+        """PATCH ARRET LOCAL REEL : injecte ArretExecutionNotebookDistant (BaseException : un `except Exception` du code
+        utilisateur ne l'avale pas, ses `finally` s'exécutent) dans le thread d'exécution. Interrompt toute boucle Python ;
+        ne peut PAS interrompre un appel bloqué dans du code C (le thread reste vivant : l'arrêt n'est alors PAS confirmé).
+        Sans effet sur le thread courant. Retourne True si une injection a eu lieu."""
+        if not self.INTERRUPTION_THREAD_ACTIVEE:
+            return False
+        t = self._thread
+        if t is None or not t.is_alive() or t.ident is None or t.ident == threading.get_ident():
+            return False
+        try:
+            n = ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(t.ident), ctypes.py_object(ArretExecutionNotebookDistant))
+            if n > 1:
+                ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(t.ident), None)
+                return False
+            log_cellule.info(f"[{self.cellule_id}][exec={self._execution_id}] interrompre_thread() : exception d'arrêt injectée dans le thread d'exécution")
+            return n == 1
+        except Exception as e:
+            log_cellule.warning(f"[{self.cellule_id}] interrompre_thread() impossible : {e!r}")
+            return False
+
     def arreter(self):
         """Détache proprement cette exécution SANS attendre la fin du
         thread (cf. discussion utilisateur : on ne peut pas tuer un
@@ -98509,6 +98722,7 @@ class MoteurExecutionCellule(QObject):
             return ""  # déjà arrêté, idempotent -- rien de nouveau à lire
         log_cellule.info(f"[{self.cellule_id}][exec={self._execution_id}] arreter() : détachement -- unlink forcé immédiat, thread daemon abandonné en arrière-plan")
         self._arrete.set()
+        self.interrompre_thread()   # PATCH ARRET LOCAL REEL
         for instance_id in list(self._instances_necessaires):
             occupation = self._registre.get(instance_id)
             if occupation is not None and occupation[2] == self.cellule_id:
@@ -98665,6 +98879,9 @@ class MoteurExecutionCellule(QObject):
             # stdout avant ce correctif, comportement inchangé.
             with _capturer_stdout_stderr_thread_courant(tampon_stdout, capturer_stderr=False):
                 exec(code, namespace)
+        except ArretExecutionNotebookDistant:   # PATCH ARRET LOCAL REEL : interruption demandée (Arrêter), pas une erreur du script
+            erreur = "exécution interrompue (Arrêter)"
+            log_cellule.info(f"[{self.cellule_id}] exec() interrompu par Arrêter (exception d'arrêt reçue dans le thread)")
         except Exception as exc:
             erreur = traceback.format_exc()
             # cf. _extraire_ligne_erreur : distingue SyntaxError (lève à
@@ -116908,6 +117125,14 @@ class MainWindow(QMainWindow):
         # d'écrire ce câblage).
         self.client_serveur_t.arreter_execution_profil_resultat_reel_recu.connect(
             taskconfig_screen.sur_profil_isole_change_ailleurs
+        )
+        # PATCH ARRET CONFIRME : la confirmation (ou l'échec) réelle de l'arrêt pilote le STATUT du profil ; l'accusé
+        # négatif immédiat (non connecté au serveurT...) n'était auparavant connecté nulle part.
+        self.client_serveur_t.arreter_execution_profil_resultat_reel_recu.connect(
+            taskconfig_screen.sur_arret_execution_confirme
+        )
+        self.client_serveur_t.arreter_execution_profil_resultat.connect(
+            taskconfig_screen.sur_arret_execution_refuse
         )
 
         panneau_proprietes.demande_demarrer_profil.connect(
@@ -148888,10 +149113,29 @@ async def _main_async_sautoniax(
             _controle_en_cours = namespace_notebook_distant.get("controle_arret")
             if _controle_en_cours is None:
                 log.info(f"[sAutoniax] arreter_execution_profil reçu (profil='{nom_profil}') -- aucune exécution en cours, rien à arrêter.")
-            else:
-                _declenche = _controle_en_cours.arreter()
-                log.info(f"[sAutoniax] arreter_execution_profil reçu (profil='{nom_profil}') -- arrêt de l'exécution notebook {'déclenché' if _declenche else 'déjà demandé'}.")
-            client_t.envoyer_arreter_execution_profil_resultat(nom_profil, True, "")
+                client_t.envoyer_arreter_execution_profil_resultat(nom_profil, True, "")
+                return
+            _declenche = _controle_en_cours.arreter()
+            log.info(f"[sAutoniax] arreter_execution_profil reçu (profil='{nom_profil}') -- arrêt de l'exécution notebook {'déclenché' if _declenche else 'déjà demandé'}.")
+
+            # PATCH ARRET CONFIRME : la réponse n'est plus envoyée tout de suite (ok=True aussitôt alors que le code pouvait
+            # tourner encore). On attend la FIN RÉELLE du thread d'exécution (controle.actif repasse à False), puis on
+            # confirme ; si le thread résiste 5 s, ok=False (« Arrêt non confirmé » côté pilote).
+            def _attendre_fin_reelle_arret(_ctl=_controle_en_cours, _nom=nom_profil):
+                _t0 = time.time()
+                while _ctl.actif and time.time() - _t0 < 5.0:
+                    time.sleep(0.1)
+                try:
+                    if _ctl.actif:
+                        log.warning(f"[sAutoniax] arreter_execution_profil (profil='{_nom}') : le code tourne encore après 5 s -- arrêt NON confirmé.")
+                        client_t.envoyer_arreter_execution_profil_resultat(_nom, False, "le code tourne encore 5 s après l'ordre d'arrêt")
+                    else:
+                        log.info(f"[sAutoniax] arreter_execution_profil (profil='{_nom}') : exécution réellement terminée -- arrêt confirmé.")
+                        client_t.envoyer_arreter_execution_profil_resultat(_nom, True, "")
+                except Exception as _e_conf:
+                    log.warning(f"[sAutoniax] arreter_execution_profil : envoi de la confirmation impossible ({_e_conf!r}).")
+
+            threading.Thread(target=_attendre_fin_reelle_arret, name="autoniax-confirmation-arret", daemon=True).start()
             return
         if nom_profil not in _instances_isolees:
             log.info(f"[sAutoniax] arreter_execution_profil reçu (profil='{nom_profil}') -- pas un profil isolé actif, ignoré.")
