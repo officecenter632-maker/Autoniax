@@ -34,7 +34,7 @@ from PySide6.QtCore import Qt, QTimer, QUrl, QSize
 from PySide6.QtGui import QDesktopServices, QAction
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QListWidget,
                                QListWidgetItem, QLabel, QPushButton, QCheckBox, QFrame, QScrollArea,
-                               QPlainTextEdit, QTabWidget, QSystemTrayIcon, QMenu, QMessageBox)
+                               QPlainTextEdit, QTabWidget, QSystemTrayIcon, QMenu, QToolButton)
 from collections import deque
 import qtawesome as qta
 
@@ -214,7 +214,7 @@ def ouvrir_config():
 
 
 class BotCarte(QWidget):
-    def __init__(self, bid):
+    def __init__(self, bid, on_reveil=None):
         super().__init__()
         self.bid = bid
         lay = QHBoxLayout(self)
@@ -230,6 +230,18 @@ class BotCarte(QWidget):
         col.addWidget(self.nom)
         col.addWidget(self.sous)
         lay.addLayout(col, 1)
+        self.btn_reveil = QToolButton()    # ordre manuel : réveille les onglets de tous les notebooks en cours de CE bot
+        self.btn_reveil.setAutoRaise(True)
+        try:
+            self.btn_reveil.setIcon(qta.icon("mdi6.cursor-default-click-outline", color=BLEU_FONCE))
+        except Exception:
+            self.btn_reveil.setIcon(qta.icon("mdi6.refresh", color=BLEU_FONCE))
+        self.btn_reveil.setFixedSize(30, 30)
+        self.btn_reveil.setIconSize(QSize(20, 20))
+        self.btn_reveil.setToolTip("Réveiller : active l'onglet de chaque notebook en cours et clique dans une cellule")
+        if on_reveil is not None:
+            self.btn_reveil.clicked.connect(lambda _c=False: on_reveil(self.bid))
+        lay.addWidget(self.btn_reveil)
         self.setFixedHeight(56)    # hauteur fixe : plus de ligne écrasée / tronquée dans la sidebar
         self.setAttribute(Qt.WA_TranslucentBackground)
 
@@ -240,6 +252,7 @@ class BotCarte(QWidget):
         self.nom.setText(str(info.get("compte") or info.get("profil") or self.bid))
         n = sum(1 for v in info["notebooks"].values() if isinstance(v, dict) and v.get("statut") == "en_cours")
         self.sous.setText(f"{n} en cours" if vivant else "Hors ligne")
+        self.btn_reveil.setEnabled(bool(vivant) and n > 0)
 
 
 class LigneNotebook(QFrame):
@@ -414,15 +427,6 @@ class Fenetre(QMainWindow):
         self.btn_journal.setCheckable(True)
         self.btn_journal.toggled.connect(self._basculer_journal)
         pied.addWidget(self.btn_journal)
-        self.btn_reveil = QPushButton(" Garder éveillés")
-        self.btn_reveil.setObjectName("discret")
-        try:
-            self.btn_reveil.setIcon(qta.icon("mdi6.cursor-default-click-outline", color=BLEU_FONCE))
-        except Exception:
-            self.btn_reveil.setIcon(qta.icon("mdi6.refresh", color=BLEU_FONCE))
-        self.btn_reveil.setToolTip("Active l'onglet de chaque notebook en cours et clique dans une cellule, pour éviter la coupure par inactivité.")
-        self.btn_reveil.clicked.connect(self._reveiller_en_cours)
-        pied.addWidget(self.btn_reveil)
         self.btn_demarrer = QPushButton(" Démarrer la sélection")
         self.btn_demarrer.setIcon(qta.icon("mdi6.play", color="white"))
         self.btn_demarrer.clicked.connect(self._demarrer_selection)
@@ -555,33 +559,24 @@ class Fenetre(QMainWindow):
             self.dernier.pop((bot, n), None)
         self._rafraichir_lignes()
 
-    def _reveiller_en_cours(self):
-        """Réveille les onglets des notebooks EN COURS du bot affiché (boîte de confirmation d'abord)."""
-        bot = self.bot_affiche
-        info = self.bots.get(bot) if bot else None
-        if not info:
-            return
-        if not info.get("vivant"):
+    def _reveiller_bot(self, bid):
+        """Bouton de la carte d'un bot : ordre de réveil pour TOUS les notebooks en cours de ce bot (pas de confirmation)."""
+        info = self.bots.get(bid)
+        if not info or not info.get("vivant"):
             self.message.setText("Bot hors ligne : réveil impossible")
             return
         noms = sorted(n for n, v in info["notebooks"].items() if isinstance(v, dict) and v.get("statut") == "en_cours")
         if not noms:
             self.message.setText("Aucun notebook en cours à réveiller")
             return
-        rep = QMessageBox.question(
-            self, "Garder éveillés",
-            f"Activer l'onglet de {len(noms)} notebook(s) en cours et cliquer dans une cellule ?\n\n" + "\n".join("• " + n for n in noms)
-            + "\n\nUn onglet fermé dans le navigateur est abandonné (jamais rouvert).")
-        if rep != QMessageBox.Yes:
-            return
         try:
-            oid = self.pont.reveiller(bot, noms)
+            oid = self.pont.reveiller(bid, noms)
         except OSError as e:
             self.message.setText(f"Envoi impossible : {e}")
-            self._log(f"ERREUR envoi réveil à {bot} : {e}")
+            self._log(f"ERREUR envoi réveil à {bid} : {e}")
             return
-        self._log(f"→ {bot} : réveiller {noms} (ordre {oid})")
-        self.message.setText(f"Réveil demandé ({len(noms)} notebook(s))…")
+        self._log(f"→ {bid} : réveiller {noms} (ordre {oid})")
+        self.message.setText(f"Réveil demandé à {bid} ({len(noms)} notebook(s))…")
 
     # ---- rafraîchissement ----
     def tick(self):
@@ -661,7 +656,7 @@ class Fenetre(QMainWindow):
                 self.vivant_prec[bid] = vivant
             if bid not in self.items:
                 item = QListWidgetItem()
-                carte = BotCarte(bid)
+                carte = BotCarte(bid, self._reveiller_bot)
                 item.setData(Qt.UserRole, bid)
                 item.setSizeHint(QSize(240, 56))
                 self.liste.addItem(item)

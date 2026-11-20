@@ -1132,7 +1132,7 @@ ESSAIS_RUN_LOT = 3    # clics max sur Run par notebook
 ESSAIS_OUVERTURE = 3    # passes max d'ouverture : un notebook dont l'ouverture echoue est reessaye APRES les autres
 MOTS_REESSAI = ("onglet", "playwright", "timeout", "navigation", "ouvert", "runtimeerror")
 DELAI_SESSION_LOT = 300.0    # attente max (s) du demarrage de la session d'un notebook du lot, apres son Start session
-REVEIL_S = 300.0    # periode (s) du reveil automatique des onglets de notebooks en cours (anti-coupure par inactivite) ; 0 = desactive (ordre "reveiller" de l'app seul)
+REVEIL_S = 0.0    # periode (s) du reveil AUTOMATIQUE (0 = desactive) : seul l'ordre "reveiller" envoye par l'app (bouton de la carte du bot) reveille
 SELECTEUR_CELLULES = 'iframe[name="notebook-editor-cells"]'    # zone des cellules : une iframe d'un AUTRE domaine (jupyter-proxy.kaggle.net), inaccessible en JS -> vrai clic souris sur l'iframe
 _P_LOGS = []        # journal en memoire (200 dernieres lignes)
 _P_A_ECRIRE = []    # lignes pas encore ecrites sur disque
