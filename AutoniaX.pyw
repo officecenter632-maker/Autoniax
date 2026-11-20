@@ -59023,7 +59023,7 @@ class BarreAccesRapideTask(QWidget):
             configure = bool(chemin)
             couleur = Mocha.lavender if configure else Mocha.overlay0
             icone = _icone_qta_premiere_disponible(
-                ["mdi6.application-cog-outline", "mdi6.application-cog", "mdi6.application-outline"], couleur
+                ["mdi6.monitor-eye", "mdi6.monitor-dashboard", "mdi6.application-outline"], couleur
             )
             if configure:
                 btn.setToolTip(
