@@ -59001,7 +59001,7 @@ class BarreAccesRapideTask(QWidget):
         """Met à jour le bouton d'app de coordination selon son état :
         "ferme" (icône Python, grisée si aucun chemin), "demarrage"
         (sablier/spinner orange, clic ignoré), "ouvert" (icône stop rouge,
-        clic gauche = arrêt avec confirmation)."""
+        clic gauche = arrêt direct)."""
         if (chemin, etat) == self._etat_app:
             return
         self._etat_app = (chemin, etat)
@@ -59012,7 +59012,7 @@ class BarreAccesRapideTask(QWidget):
         icone = None
         if etat == "ouvert":
             icone = _icone_qta_premiere_disponible(["mdi6.stop-circle-outline", "mdi6.stop"], Mocha.red)
-            btn.setToolTip(f"App de coordination ouverte : {chemin}\nClic gauche : arrêter (confirmation)")
+            btn.setToolTip(f"App de coordination ouverte : {chemin}\nClic gauche : arrêter")
         elif etat == "demarrage":
             try:
                 icone = qta.icon("mdi6.loading", color=Mocha.peach, animation=qta.Spin(btn))
@@ -59023,7 +59023,7 @@ class BarreAccesRapideTask(QWidget):
             configure = bool(chemin)
             couleur = Mocha.lavender if configure else Mocha.overlay0
             icone = _icone_qta_premiere_disponible(
-                ["mdi6.language-python", "mdi6.file-code-outline", "mdi6.application-outline"], couleur
+                ["mdi6.application-cog-outline", "mdi6.application-cog", "mdi6.application-outline"], couleur
             )
             if configure:
                 btn.setToolTip(
@@ -75827,7 +75827,7 @@ class TaskConfigScreen(_ReglageCaptureSynchroMixin, QWidget):
           .pyw est lancé avec pythonw (sans console) et suivi (état
           "démarrage" puis "ouvert") ;
         - démarrage : ignoré ;
-        - ouverte : demande confirmation puis arrête le processus."""
+        - ouverte : arrête le processus (sans confirmation)."""
         task = self._task_courant_obj()
         if task is None:
             return
@@ -75836,16 +75836,8 @@ class TaskConfigScreen(_ReglageCaptureSynchroMixin, QWidget):
         if entree is not None:
             if entree["etat"] == "demarrage":
                 return
-            if BoiteDialogueAutoniaX.question(
-                self, "Arrêter l'app de coordination",
-                "L'app de coordination de ce notebook est ouverte. L'arrêter ?",
-                texte_oui="Arrêter", texte_non="Annuler",
-                texte_informatif="Le processus sera terminé de force : un ordre en cours "
-                                 "(lot de démarrage, réveil...) serait interrompu.",
-            ):
-                # L'app a pu se fermer pendant que la boîte était ouverte.
-                if task.id in suivies:
-                    self._arreter_app_coordination(task.id)
+            # Arrêt direct, sans confirmation (demande explicite utilisateur).
+            self._arreter_app_coordination(task.id)
             return
         chemin = task.app_coordination_chemin
         if not chemin:
