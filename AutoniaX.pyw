@@ -58469,6 +58469,26 @@ class PanneauComposantsImportesTask(QWidget):
         if self.LARGEUR_MIN_SPLITTER <= l <= self.LARGEUR_MAX_SPLITTER:
             self._largeur_memorisee = l
 
+    def _appliquer_visibilite_replie(self):
+        """Rend visible/masqué le contenu du panneau selon l'état du
+        bouton chevron (replié = seul le chevron reste visible). CORRECTIF
+        ("on est censé ne pas voir de débris, je suis obligé de déplier et
+        replier pour que ça se ferme bien") : rafraichir() et
+        _afficher_placeholder() forçaient setVisible(True) sur la barre
+        d'onglets, le séparateur, le stack et le texte d'attente sans tenir
+        compte de l'état replié -- tout rafraîchissement APRÈS le repli
+        (le repli se fait à l'ouverture du Task, les rafraîchissements
+        arrivent ensuite) faisait réapparaître ces morceaux dans la bande
+        étroite. Toute la logique de visibilité passe désormais ici."""
+        replie = self.bouton_replier.isChecked()
+        self._titre_label.setVisible(not replie)
+        self.import_button.setVisible(not replie)
+        y_a_des_services = self.stack.count() > 0
+        self.barre_onglets_scroll.setVisible(not replie and y_a_des_services)
+        self._separateur_onglets.setVisible(not replie and y_a_des_services)
+        self.stack.setVisible(not replie and y_a_des_services)
+        self.placeholder_label.setVisible(not replie and not y_a_des_services)
+
     def _basculer_replie(self, replie: bool):
         """Connecté à bouton_replier.toggled -- bascule la largeur fixe du
         panneau entre LARGEUR_DEPLOYEE et LARGEUR_REPLIEE, et masque tout
@@ -58503,13 +58523,7 @@ class PanneauComposantsImportesTask(QWidget):
         else:
             self._header_layout.setContentsMargins(14, 12, 14, 12)
             self.bouton_replier.setStyleSheet("")
-        self._titre_label.setVisible(not replie)
-        self.import_button.setVisible(not replie)
-        y_a_des_services = self.stack.count() > 0
-        self.barre_onglets_scroll.setVisible(not replie and y_a_des_services)
-        self._separateur_onglets.setVisible(not replie and y_a_des_services)
-        self.stack.setVisible(not replie and y_a_des_services)
-        self.placeholder_label.setVisible(not replie and not y_a_des_services)
+        self._appliquer_visibilite_replie()
         self.bouton_replier.setIcon(self._icone_repliee if replie else self._icone_deployee)
         self.bouton_replier.setToolTip(
             "Déplier le panneau des composants importés" if replie
@@ -58597,6 +58611,8 @@ class PanneauComposantsImportesTask(QWidget):
 
         groupe_boutons.button(index_a_restaurer).setChecked(True)
         self.stack.setCurrentIndex(index_a_restaurer)
+        if self.bouton_replier.isChecked():
+            self._appliquer_visibilite_replie()
 
     def _construire_onglet_service(
         self, task: Task, nom_service: str, composants: list, index: int, groupe_boutons: QButtonGroup,
@@ -58740,6 +58756,8 @@ class PanneauComposantsImportesTask(QWidget):
         self._separateur_onglets.setVisible(False)
         self.stack.setVisible(False)
         self.placeholder_label.setVisible(True)
+        if self.bouton_replier.isChecked():
+            self._appliquer_visibilite_replie()
 
     def _sur_clic_composant(self, nom_composant: str):
         nom_variable = nom_variable_python(nom_composant)
@@ -75582,6 +75600,16 @@ class TaskConfigScreen(_ReglageCaptureSynchroMixin, QWidget):
             self.panneau_composants._basculer_replie(True)  # ré-applique la largeur repliée
         else:
             _bouton_repli.setChecked(True)  # déclenche _basculer_replie(True)
+        # CORRECTIF (débris à gauche) : ce repli se fait pendant que la page
+        # est encore masquée (sans vraie géométrie de splitter) ; on le
+        # ré-applique une fois la page affichée, sauf si l'utilisateur a
+        # déjà redéplié le panneau entre-temps.
+        _panneau_a_replier = self.panneau_composants
+        QTimer.singleShot(
+            0,
+            lambda: _panneau_a_replier._basculer_replie(True)
+            if _panneau_a_replier.bouton_replier.isChecked() else None,
+        )
         t = _chrono("panneau_composants replié par défaut", t)
         t_etape = _etape_terminee("finitions", t_etape)
 
