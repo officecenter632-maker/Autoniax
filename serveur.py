@@ -1346,6 +1346,45 @@ class _VueConnexionsGarde(dict):
         return super().get(key, default)
 
 
+class AttributionNoms:
+    """Attribue automatiquement le nom ("sAutoniax-N") de chaque executant, a partir d'une cle aleatoire
+    qu'il genere lui-meme au demarrage (champ "cle_instance" du register). Plus aucun numero a regler
+    a la main dans les notebooks.
+
+    Un numero attribue n'est JAMAIS libere : il reste lie a sa cle jusqu'au redemarrage complet du serveur
+    (table en memoire).
+      - cle connue            -> meme nom qu'avant (reconnexion apres coupure : numero conserve)
+      - cle inconnue          -> nom demande s'il est de la forme sAutoniax-N et pas encore attribue
+                                 (reprise apres redemarrage du serveur), sinon le plus petit N jamais attribue
+      - cle absente (ancien client) -> comportement historique, nom inchange"""
+
+    PREFIXE = "sAutoniax-"
+
+    def __init__(self):
+        import re as _re_noms
+        self._motif = _re_noms.compile(r"^sAutoniax-(\d+)$")
+        self._par_cle: dict[str, str] = {}
+
+    def attribuer(self, cle: str, nom_demande: str, registre_executants, id_connexion_courante: str) -> str:
+        cle = (cle or "").strip()
+        if not cle:
+            return nom_demande
+        nom = self._par_cle.get(cle)
+        if nom is None:
+            pris = set(self._par_cle.values())
+            pris |= {c.nom for c in registre_executants if c.id_connexion != id_connexion_courante}
+            if self._motif.match(nom_demande or "") and nom_demande not in pris:
+                nom = nom_demande
+            else:
+                n = 0
+                while f"{self.PREFIXE}{n}" in pris:
+                    n += 1
+                nom = f"{self.PREFIXE}{n}"
+            self._par_cle[cle] = nom
+            logger.info("AttributionNoms : cle %s... -> %s", cle[:8], nom)
+        return nom
+
+
 class Registre:
     """Registre en mémoire de toutes les connexions actives -- juste un
     dict, comme prévu par le cahier ("Stockage d'état côté serveurT : en
@@ -1651,6 +1690,7 @@ class Registre:
 COMMANDES_INSTANCE_EN_ATTENTE: dict[str, str] = {}
 
 registre = Registre()
+attribution_noms = AttributionNoms()
 
 
 # ======================================================================
@@ -2243,6 +2283,12 @@ async def route_websocket(websocket: WebSocket):
 
                 connexion.role = role
                 connexion.nom = message.get("nom", "")
+                # PATCH identite automatique : le nom final est attribue ici a partir de "cle_instance".
+                if role == "executant":
+                    connexion.nom = attribution_noms.attribuer(
+                        message.get("cle_instance", ""), connexion.nom,
+                        registre.executants(), connexion.id_connexion,
+                    )
                 # AJOUT (cf. docstring Connexion.id_pilote_stable) : reçu
                 # tel quel, "" si absent (ancien mAutoniax non mis à jour --
                 # Registre.pilote_par_id retombe alors sur son repli
@@ -2312,6 +2358,7 @@ async def route_websocket(websocket: WebSocket):
                 await websocket.send_text(json.dumps({
                     "type": "register_ok",
                     "id": id_public,
+                    "nom_attribue": connexion.nom if role == "executant" else "",
                 }))
 
                 if role == "executant":

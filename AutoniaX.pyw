@@ -91036,7 +91036,7 @@ class ClientServeurT(QObject):
     TAILLE_CHUNK_RELAIS_OCTETS = 512 * 1024
 
     def __init__(self, server_url: str = "", nom: str = "mAutoniax",
-                 config_stockage: Optional[dict] = None, role: str = "pilote"):
+                 config_stockage: Optional[dict] = None, role: str = "pilote", cle_instance: str = ""):
         super().__init__()
         # PATCH (plus de repli Render -- SERVEUR_T_URL supprimée) --
         # server_url par défaut vide : de toute façon réécrite par
@@ -91046,6 +91046,8 @@ class ClientServeurT(QObject):
         # connecter réellement.
         self.server_url = server_url
         self.nom = nom
+        # PATCH identite automatique : cle aleatoire envoyee au register, le serveurT en deduit le nom.
+        self._cle_instance = cle_instance
         # PATCH (mode sAutoniax -- demande explicite utilisateur : cette
         # classe était figée sur role="pilote" en dur (cf. _boucle_async),
         # alors que les handlers envoyer_capture/telecharger_fichier
@@ -93926,6 +93928,7 @@ class ClientServeurT(QObject):
                 await self._ws.send(json.dumps({
                     "type": "register", "role": self.role, "nom": self.nom,
                     "id_pilote_stable": self._id_pilote_stable,
+                    "cle_instance": self._cle_instance,
                 }))
 
                 # PATCH (identité stable par nom) -- AVANT ce patch,
@@ -95832,6 +95835,13 @@ class ClientServeurT(QObject):
             # coupure) -- pas seulement au premier register.
             id_recu = data.get("id", "")
             self._id_serveur = id_recu
+            # PATCH identite automatique : le serveurT impose le nom ("sAutoniax-N") ; self.nom sert ensuite
+            # partout (register de reconnexion, sautoniax_pret, tunnel proxy).
+            nom_attribue = data.get("nom_attribue", "")
+            if nom_attribue and self.role == "executant":
+                if nom_attribue != self.nom:
+                    log_reseau_t.info(f"nom attribue par le serveurT : {nom_attribue!r} (demande : {self.nom!r})")
+                self.nom = nom_attribue
             log_reseau_t.info(f"<- register_ok (id={id_recu!r})")
             self.id_serveur_recu.emit(id_recu)
         elif data.get("type") == "erreur":
@@ -148559,6 +148569,7 @@ async def _resoudre_proxy_effectif_profil(
 async def _main_async_sautoniax(
     server_url_t: str, nom_profil: str, instance_id: str,
     url_ouverture: Optional[str], intervalle_capture_s: float,
+    cle_instance: str = "",
 ) -> bool:
     """Orchestration complète du mode sAutoniax (PATCH -- demande
     explicite utilisateur, cf. cahier : exécuter AutoniaX "quelque part
@@ -148628,7 +148639,7 @@ async def _main_async_sautoniax(
     # chaque callback ne fait que threading.Event.set() ou
     # loop.call_soon_threadsafe(...), tous deux thread-safe par
     # construction.
-    client_t = ClientServeurT(server_url=server_url_t, nom=instance_id, role="executant")
+    client_t = ClientServeurT(server_url=server_url_t, nom=instance_id, role="executant", cle_instance=cle_instance)
     loop = asyncio.get_running_loop()
     # PATCH (SPEC_proxy_natif_tunnel.md, section 6 -- câblage) : un seul
     # RelaisProxyLocal par process sAutoniaX, créé ici (avant les deux
@@ -148672,6 +148683,10 @@ async def _main_async_sautoniax(
     log.info("[sAutoniax] attente de la connexion au serveurT...")
     await loop.run_in_executor(None, connecte_event.wait)
     log.info("[sAutoniax] connecté au serveurT.")
+    # PATCH identite automatique : adopte le nom attribue par le serveurT (identique a client_t.nom).
+    if cle_instance and client_t.nom:
+        instance_id = client_t.nom
+        log.info(f"[sAutoniax] identité attribuée par le serveurT : {instance_id!r}")
 
     # BUGFIX CRITIQUE (spec A.3, signal "sAutoniax prêt" envoyé TROP TÔT) --
     # client_t.envoyer_sautoniax_pret() vivait auparavant ICI, juste après
@@ -151272,6 +151287,7 @@ def main_sautoniax():
     # tentative de connexion côté ClientServeurT._boucle_async (lecture
     # ServeurT/url_tunnel.txt sur B2), cette valeur ne sert que de
     # placeholder avant la première tentative.
+    parser.add_argument("--cle-instance", default=os.environ.get("AUTONIAX_CLE_INSTANCE", ""), help="Cle aleatoire d'identification : le serveurT en deduit le nom sAutoniax-N (plus de numero a regler a la main)")
     parser.add_argument("--server-url-t", default="", help="URL du serveurT (optionnel -- résolue automatiquement via Backblaze B2 à chaque tentative de connexion, cf. resoudre_url_serveurt)")
     parser.add_argument("--url", default=None, help="Site ouvert par défaut au démarrage (prioritaire sur la welcome page AutoniaX)")
     parser.add_argument("--intervalle-capture", type=float, default=5.0, help="Secondes entre deux captures envoyées au serveurT (défaut 5.0)")
@@ -151337,6 +151353,7 @@ def main_sautoniax():
     try:
         redemarrage_demande = loop_principale.run_until_complete(_main_async_sautoniax(
             args.server_url_t, args.profil, instance_id, args.url, args.intervalle_capture,
+            args.cle_instance,
         ))
     except KeyboardInterrupt:
         redemarrage_demande = False
