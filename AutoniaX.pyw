@@ -1489,61 +1489,8 @@ def get_notebook_execution_path() -> Path:
     return chemin
 
 
-def renumeroter_instance_id_notebook(numero: int) -> None:
-    """PATCH (demande explicite utilisateur : boutons radio 1-10 dans
-    l'onglet "sAutoniax Manager" pour changer le numéro d'instance sans
-    avoir à éditer le notebook à la main sur Kaggle) -- ouvre le fichier
-    .ipynb réel sur disque (get_notebook_execution_path, cf. sa
-    docstring : fichier STATIQUE, pas de contenu embarqué en dur ici) et
-    réécrit en place la ligne `INSTANCE_ID = "sAutoniax-N"` trouvée dans
-    ses cellules de code, en remplaçant N par `numero`.
-
-    Modifie UNIQUEMENT cette ligne (regex ciblée sur le nom de variable,
-    tolérante aux espaces et à un éventuel commentaire inline `# ...`
-    qui la suit) -- tout le reste du notebook (autres cellules, autres
-    variables NOM_PROFIL/SERVEUR_T_URL, outputs, métadonnées) reste
-    strictement inchangé, y compris l'ordre et le formatage JSON.
-
-    Lève FileNotFoundError si le notebook n'a encore jamais été déposé
-    (cf. get_notebook_execution_path : "ne crée RIEN"), et ValueError si
-    le fichier existe mais qu'aucune ligne INSTANCE_ID n'y a été
-    trouvée -- dans les deux cas c'est à l'appelant (bouton radio ci-
-    dessous) d'afficher un message clair plutôt que de laisser
-    remonter une exception brute."""
-    chemin = get_notebook_execution_path()
-    if not chemin.is_file():
-        raise FileNotFoundError(
-            f"{chemin.name} n'existe pas encore -- dépose d'abord le notebook."
-        )
-
-    with open(chemin, "r", encoding="utf-8") as f:
-        notebook = json.load(f)
-
-    motif = re.compile(r'INSTANCE_ID\s*=\s*"[^"]*"')
-    trouve = False
-    for cell in notebook.get("cells", []):
-        if cell.get("cell_type") != "code":
-            continue
-        source = cell.get("source", [])
-        for i, ligne in enumerate(source):
-            if motif.search(ligne):
-                source[i] = motif.sub(f'INSTANCE_ID = "sAutoniax-{numero}"', ligne)
-                trouve = True
-        if trouve:
-            break
-
-    if not trouve:
-        raise ValueError(
-            f"Aucune ligne INSTANCE_ID trouvée dans {chemin.name}."
-        )
-
-    with open(chemin, "w", encoding="utf-8") as f:
-        json.dump(notebook, f, ensure_ascii=False, indent=1)
-        f.write("\n")
-
-
 # Binaires que le notebook sAutoniax telecharge/installe au demarrage : (variable du notebook, libelle).
-# Tout est coche par defaut ; decocher un binaire inutilise evite son telechargement sur Kaggle.
+# Decocher un binaire inutilise evite son telechargement sur Kaggle (sAutoniax Manager : Camoufox seul coche par defaut).
 BINAIRES_SAUTONIAX = (
     ("INSTALLER_CAMOUFOX", "Camoufox"),
     ("INSTALLER_CHROME", "Chrome"),
@@ -35768,48 +35715,11 @@ class SAutoniaxManagerScreen(NotebookManagerScreen):
             parent=parent,
         )
 
-        # PATCH (demande explicite utilisateur : choisir le numéro
-        # d'instance directement depuis l'app plutôt que d'éditer
-        # INSTANCE_ID à la main sur Kaggle) -- 31 QRadioButton (0 à 30),
-        # sAutoniax-1 coché par défaut, qui réécrivent en place le
-        # notebook sur disque via renumeroter_instance_id_notebook. Reste
-        # PASSIF comme le reste de cet écran (aucun signal réseau) --
-        # juste une réécriture de fichier local.
-        label_numero = QLabel("Numéro d'instance (INSTANCE_ID)", self)
-        label_numero.setObjectName("PlaceholderSubtitle")
-        label_numero.setAlignment(Qt.AlignCenter)
-        self.layout().addWidget(label_numero)
+        # Plus de numero d'instance a choisir : le serveurT attribue automatiquement sAutoniax-N
+        # (cle aleatoire generee par le notebook a chaque session).
 
-        conteneur_radios = QWidget(self)
-        # PATCH : boutons radio de 0 à 30 (31 boutons) sur trois rangées (0-10, 11-21, 22-30) pour tenir dans la largeur.
-        ligne_radios = QGridLayout(conteneur_radios)
-        ligne_radios.setContentsMargins(0, 0, 0, 0)
-        ligne_radios.setHorizontalSpacing(8)
-        ligne_radios.setVerticalSpacing(4)
-
-        self._groupe_numero_instance = QButtonGroup(self)
-        self._groupe_numero_instance.setExclusive(True)
-        self._radios_numero_instance = []  # référence forte -- sinon garbage-collectés
-        for n in range(0, 31):
-            radio = QRadioButton(str(n), conteneur_radios)
-            radio.setCursor(Qt.PointingHandCursor)
-            if n == 1:
-                radio.setChecked(True)
-            self._groupe_numero_instance.addButton(radio, n)
-            self._radios_numero_instance.append(radio)
-            ligne_radios.addWidget(radio, n // 11, n % 11)
-
-        self.layout().addWidget(conteneur_radios, 0, Qt.AlignCenter)
-        self._groupe_numero_instance.idClicked.connect(self._sur_changement_numero_instance)
-
-        self.label_statut_numero_instance = QLabel("", self)
-        self.label_statut_numero_instance.setObjectName("PlaceholderSubtitle")
-        self.label_statut_numero_instance.setAlignment(Qt.AlignCenter)
-        self.label_statut_numero_instance.setWordWrap(True)
-        self.layout().addWidget(self.label_statut_numero_instance)
-
-        # Binaires a telecharger au demarrage du notebook : tout coche par defaut ; decocher ce qui
-        # n'est pas utilise (ex. tout sauf Camoufox) reecrit les INSTALLER_* du notebook sur disque.
+        # Binaires a telecharger au demarrage du notebook : seul Camoufox est coche par defaut ; cocher/decocher
+        # un binaire reecrit les INSTALLER_* du notebook sur disque.
         label_binaires = QLabel("Binaires à télécharger au démarrage", self)
         label_binaires.setObjectName("PlaceholderSubtitle")
         label_binaires.setAlignment(Qt.AlignCenter)
@@ -35821,9 +35731,8 @@ class SAutoniaxManagerScreen(NotebookManagerScreen):
         self._cases_binaires = {}
         for variable, libelle in BINAIRES_SAUTONIAX:
             case = QCheckBox(libelle, conteneur_binaires)
-            case.setChecked(True)
+            case.setChecked(variable == "INSTALLER_CAMOUFOX")  # uniquement Camoufox par defaut
             case.setCursor(Qt.PointingHandCursor)
-            case.toggled.connect(self._sur_changement_binaires)
             self._cases_binaires[variable] = case
             ligne_binaires.addWidget(case)
         self.layout().addWidget(conteneur_binaires, 0, Qt.AlignCenter)
@@ -35832,6 +35741,13 @@ class SAutoniaxManagerScreen(NotebookManagerScreen):
         self.label_statut_binaires.setAlignment(Qt.AlignCenter)
         self.label_statut_binaires.setWordWrap(True)
         self.layout().addWidget(self.label_statut_binaires)
+
+        # Connecte APRES les setChecked ci-dessus (sinon reecriture inutile du notebook), puis synchronise un
+        # notebook deja depose avec l'etat affiche (Camoufox seul). Rien n'est cree s'il n'a jamais ete depose.
+        for case in self._cases_binaires.values():
+            case.toggled.connect(self._sur_changement_binaires)
+        if get_notebook_execution_path().is_file():
+            self._appliquer_binaires()
 
     def _options_binaires(self) -> dict:
         return {variable: case.isChecked() for variable, case in self._cases_binaires.items()}
@@ -35852,27 +35768,6 @@ class SAutoniaxManagerScreen(NotebookManagerScreen):
     def _apres_depot_notebook(self) -> None:
         """Un notebook vient d'etre depose : on lui applique les cases cochees actuelles."""
         self._appliquer_binaires()
-
-    def _sur_changement_numero_instance(self, numero: int) -> None:
-        """Appelée au clic sur l'un des 31 boutons radio (0 à 30) -- réécrit
-        INSTANCE_ID dans le notebook déjà déposé sur disque. Si le
-        notebook n'existe pas encore (jamais glissé-déposé, cf.
-        get_notebook_execution_path) ou si sa cellule INSTANCE_ID est
-        introuvable/corrompue, affiche le message d'erreur sans faire
-        planter l'app -- l'utilisateur peut d'abord déposer/corriger le
-        notebook puis re-cliquer sur le même bouton radio pour
-        réessayer (idClicked se redéclenche même si déjà sélectionné
-        n'est PAS garanti par Qt : on reste tolérant à ce cas en
-        laissant le radio sélectionné quoi qu'il arrive, l'utilisateur
-        peut cliquer sur un autre puis revenir)."""
-        try:
-            renumeroter_instance_id_notebook(numero)
-        except (FileNotFoundError, ValueError, OSError, json.JSONDecodeError) as e:
-            self.label_statut_numero_instance.setText(f"Échec : {e}")
-            return
-        self.label_statut_numero_instance.setText(
-            f"INSTANCE_ID mis à jour : sAutoniax-{numero}."
-        )
 
 
 class SAutoniaxAvecServeurManagerScreen(NotebookManagerScreen):
