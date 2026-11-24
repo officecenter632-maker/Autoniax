@@ -16268,6 +16268,10 @@ class ReglagesApp:
     # reste stocké en clair dans reglages.json comme le reste de ce
     # fichier (aucun secret n'y est actuellement chiffré).
     github_token: Optional[str] = None
+
+    # PATCH (demande explicite utilisateur : bouton Paramètres "copier le dernier
+    # message Gmail") -- adresse du compte interrogé via GET /gmail/dernier du serveurT.
+    gmail_compte: str = "officecenter632@gmail.com"
     github_username: Optional[str] = None
     github_repo_url: Optional[str] = None
 
@@ -16438,6 +16442,7 @@ class ReglagesApp:
             "toujours_arriere_plan": self.toujours_arriere_plan,
             "mode_arriere_plan": self.mode_arriere_plan,
             "github_token": self.github_token,
+            "gmail_compte": self.gmail_compte,
             "github_username": self.github_username,
             "github_repo_url": self.github_repo_url,
             "drive_chemin_cle_json": self.drive_chemin_cle_json,
@@ -16493,6 +16498,7 @@ class ReglagesApp:
                 else "reduire"
             ),
             github_token=d.get("github_token"),
+            gmail_compte=str(d.get("gmail_compte") or "officecenter632@gmail.com").strip(),
             github_username=d.get("github_username"),
             github_repo_url=d.get("github_repo_url"),
             drive_chemin_cle_json=d.get("drive_chemin_cle_json"),
@@ -36964,6 +36970,8 @@ class ParametresScreen(QWidget):
     # motif, PAR SOURCE (décision explicite utilisateur), cf.
     # MainWindow._tenter_finaliser_copie_logs.
     demande_copier_tous_logs = Signal(list, str, int)
+    # PATCH Gmail : (adresse du compte) -> MainWindow.lancer_copie_dernier_gmail
+    demande_copier_dernier_gmail = Signal(str)
     # PATCH (onglet Raccourcis) -- émis à chaque changement RÉEL de
     # raccourci (modification ou reset), sans argument -- MainWindow
     # écoute ce signal pour que FenetreRenduTaskReseau (seul lecteur
@@ -37371,6 +37379,46 @@ class ParametresScreen(QWidget):
         description_bloquer_sortie.setWordWrap(True)
         description_bloquer_sortie.setObjectName("PlaceholderSubtitle")
         root_layout.addWidget(description_bloquer_sortie)
+
+        # PATCH (demande explicite utilisateur : "un bouton dans la page de\n        # parametres qui copie dans le presse papier le dernier message de cette\n        # adresse") -- interroge GET /gmail/dernier du serveurT (cf. serveur.py).\n        section_titre_gmail = QLabel("GMAIL", self)
+        section_titre_gmail.setObjectName("ReglagesLabel")
+        root_layout.addWidget(section_titre_gmail)
+
+        ligne_gmail = QHBoxLayout()
+        ligne_gmail.setSpacing(10)
+        label_gmail = QLabel("Compte", self)
+        label_gmail.setObjectName("PlaceholderSubtitle")
+        ligne_gmail.addWidget(label_gmail)
+        self.champ_gmail_compte = QLineEdit(self)
+        self.champ_gmail_compte.setText(self.reglages.gmail_compte)
+        self.champ_gmail_compte.setPlaceholderText("adresse@gmail.com")
+        self.champ_gmail_compte.setMinimumWidth(280)
+        self.champ_gmail_compte.setToolTip(
+            "Adresse Gmail dont on copie le dernier message reçu (boîte de réception). "
+            "Le compte doit être présent dans data.zip (GmailListener > \u00ab Mettre à jour le cloud \u00bb)."
+        )
+        self.champ_gmail_compte.editingFinished.connect(self._on_gmail_compte_modifie)
+        ligne_gmail.addWidget(self.champ_gmail_compte)
+        ligne_gmail.addStretch(1)
+        root_layout.addLayout(ligne_gmail)
+
+        ligne_bouton_gmail = QHBoxLayout()
+        ligne_bouton_gmail.setSpacing(10)
+        self.bouton_copier_dernier_gmail = QPushButton("Copier le dernier message Gmail", self)
+        self.bouton_copier_dernier_gmail.setCursor(Qt.PointingHandCursor)
+        self.bouton_copier_dernier_gmail.setToolTip(
+            "Copie dans le presse-papier le dernier message reçu du compte ci-dessus "
+            "(expéditeur, objet, date, texte complet)."
+        )
+        self.bouton_copier_dernier_gmail.clicked.connect(self._on_clic_copier_dernier_gmail)
+        ligne_bouton_gmail.addWidget(self.bouton_copier_dernier_gmail)
+        ligne_bouton_gmail.addStretch(1)
+        root_layout.addLayout(ligne_bouton_gmail)
+
+        self.label_statut_gmail = QLabel("", self)
+        self.label_statut_gmail.setObjectName("PlaceholderSubtitle")
+        self.label_statut_gmail.setWordWrap(True)
+        root_layout.addWidget(self.label_statut_gmail)
 
         # --- Section Panneau clone (TaskConfig) : pourcentage utilisé par
         # le bouton "Sélectionner aléatoirement" du panneau clone (SPEC_
@@ -38182,6 +38230,30 @@ class ParametresScreen(QWidget):
             if e.get("id") and e.get("role") == "executant"
         }
         self._rafraichir_liste_sources_logs()
+
+    def _on_gmail_compte_modifie(self):
+        """Persiste l'adresse Gmail saisie (réglage local machine)."""
+        self.reglages.gmail_compte = self.champ_gmail_compte.text().strip()
+        self.reglages.save()
+
+    def _on_clic_copier_dernier_gmail(self):
+        """Bouton \u00ab Copier le dernier message Gmail \u00bb : le travail réseau est fait
+        par MainWindow (QThread), retour via afficher_resultat_dernier_gmail."""
+        compte = self.champ_gmail_compte.text().strip()
+        if not compte or "@" not in compte:
+            self.label_statut_gmail.setStyleSheet(f"color: {Mocha.red};")
+            self.label_statut_gmail.setText("Saisissez une adresse Gmail valide.")
+            return
+        self._on_gmail_compte_modifie()
+        self.bouton_copier_dernier_gmail.setEnabled(False)
+        self.label_statut_gmail.setStyleSheet("")
+        self.label_statut_gmail.setText("Récupération du dernier message…")
+        self.demande_copier_dernier_gmail.emit(compte)
+
+    def afficher_resultat_dernier_gmail(self, ok: bool, message: str):
+        self.bouton_copier_dernier_gmail.setEnabled(True)
+        self.label_statut_gmail.setStyleSheet("" if ok else f"color: {Mocha.red};")
+        self.label_statut_gmail.setText(message)
 
     def _on_clic_copier_tous_logs(self):
         """Bouton "Copier les logs" -- même patron que _on_clic_charger_
@@ -114390,6 +114462,61 @@ class CopieLogsWorker(QObject):
             self.termine.emit(False, [], str(exc))
 
 
+class GmailDernierWorker(QObject):
+    """PATCH (bouton Paramètres \u00ab Copier le dernier message Gmail \u00bb) -- GET
+    {serveurT}/gmail/dernier?compte=... dans un QThread (jamais sur le thread GUI).
+    Émet (ok, texte_formaté, message_statut)."""
+
+    termine = Signal(bool, str, str)
+
+    def __init__(self, url_http_serveur: str, compte: str):
+        super().__init__()
+        self._url_http_serveur = url_http_serveur
+        self._compte = compte
+
+    @staticmethod
+    def formater_message(m: dict) -> str:
+        recu = m.get("recu_le") or ""
+        try:
+            recu = datetime.fromisoformat(recu).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+        nom = (m.get("expediteur_nom") or "").strip()
+        adr = (m.get("expediteur_adresse") or "").strip()
+        de = f"{nom} <{adr}>" if nom else adr
+        return (
+            f"de      : {de}\n"
+            f"objet   : {m.get('sujet') or ''}\n"
+            f"reçu le : {recu}\n"
+            f"---\n"
+            f"{(m.get('corps') or m.get('apercu') or '').strip()}\n"
+        )
+
+    def demarrer(self):
+        url = f"{self._url_http_serveur}/gmail/dernier?" + urllib.parse.urlencode({"compte": self._compte})
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, method="GET"), timeout=45) as rep_http:
+                data = json.loads(rep_http.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                corps = json.loads(exc.read().decode("utf-8"))
+                detail = corps.get("detail") or corps.get("erreur") or ""
+            except Exception:
+                pass
+            self.termine.emit(False, "", f"Erreur {exc.code} : {detail or exc.reason}")
+            return
+        except Exception as exc:
+            self.termine.emit(False, "", f"Serveur injoignable : {exc}")
+            return
+        message = data.get("message")
+        if not message:
+            self.termine.emit(False, "", f"Aucun message dans la boîte de réception de {self._compte}.")
+            return
+        self.termine.emit(True, self.formater_message(message),
+                          f"Dernier message copié ({message.get('sujet') or 'sans objet'}).")
+
+
 class PrechargementBanquesWorker(QObject):
     """Précharge TrajectoryBank ET ScrollBank (cf. _charger_banque_
     trajectoire_souris / _charger_banque_scroll_souris) dans un QThread
@@ -115973,6 +116100,30 @@ class MainWindow(QMainWindow):
             self.client_serveur_t.demander_logs_executant(id_executant)
 
         self._tenter_finaliser_copie_logs()
+
+    def lancer_copie_dernier_gmail(self, compte: str):
+        """PATCH Gmail -- câblée sur ParametresScreen.demande_copier_dernier_gmail."""
+        parametres_screen = self.screens.get("parametres")
+        if getattr(self, "_thread_gmail_dernier", None) is not None:
+            return
+        url_http = _url_http_depuis_url_websocket_serveur_t(self.client_serveur_t.server_url)
+        self._thread_gmail_dernier = QThread(self)
+        self._worker_gmail_dernier = GmailDernierWorker(url_http, compte)
+        self._worker_gmail_dernier.moveToThread(self._thread_gmail_dernier)
+        self._worker_gmail_dernier.termine.connect(self._sur_gmail_dernier_recu)
+        self._thread_gmail_dernier.started.connect(self._worker_gmail_dernier.demarrer)
+        self._thread_gmail_dernier.start()
+
+    def _sur_gmail_dernier_recu(self, ok: bool, texte: str, message: str):
+        self._thread_gmail_dernier.quit()
+        self._thread_gmail_dernier.wait()
+        self._thread_gmail_dernier = None
+        self._worker_gmail_dernier = None
+        if ok:
+            QGuiApplication.clipboard().setText(texte)
+        parametres_screen = self.screens.get("parametres")
+        if parametres_screen:
+            parametres_screen.afficher_resultat_dernier_gmail(ok, message)
 
     def _sur_logs_serveur_recus(self, ok: bool, lignes: list, erreur: str):
         """Callback de CopieLogsWorker.termine -- même nettoyage de
@@ -117740,6 +117891,7 @@ class MainWindow(QMainWindow):
         # instances_screen/dashboard_screen/reseau_screen ci-dessus, un
         # abonné de plus.
         parametres_screen.demande_copier_tous_logs.connect(self.lancer_copie_tous_logs)
+        parametres_screen.demande_copier_dernier_gmail.connect(self.lancer_copie_dernier_gmail)
         self.client_serveur_t.executants_detail_change.connect(parametres_screen.definir_executants_connus_logs)
         self.client_serveur_t.logs_executant_recu.connect(self._sur_logs_executant_recus)
 
