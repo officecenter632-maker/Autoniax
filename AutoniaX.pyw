@@ -32923,6 +32923,24 @@ class ListeCiblesQuatreColonnes(QListWidget):
         self._ajuster_colonnes()
 
 
+class _ListeTagsClicDroit(QListWidget):
+    """PATCH : liste de tags qui emet clic_droit(item) sur un clic droit, sans toucher a la selection (clic gauche = filtre)."""
+    clic_droit = Signal(object)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.RightButton:
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.RightButton:
+            self.clic_droit.emit(self.itemAt(event.position().toPoint()))
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
 class ProfilsKaggleScreen(QWidget):
     """Sous-onglet "Profils Kaggle" de ProfilsScreen (PATCH, phase 2 -- INTERFACE
     SEULE, aucun reseau ici : tout passe par des signaux relayes comme les autres
@@ -33029,6 +33047,7 @@ class ProfilsKaggleScreen(QWidget):
         # --- PATCH (demande utilisateur) : interface en 2 colonnes ---
         #   gauche : Envoyer vers Kaggle + Journaux ; droite : Telecharger depuis Kaggle uniquement.
         self._tags_filtres: set = set()
+        self._tags_exclus: set = set()  # PATCH : tags masques (clic droit) -> les profils qui les portent sont caches
         separation = QSplitter(Qt.Horizontal, self)
         separation.setChildrenCollapsible(False)
         layout.addWidget(separation, stretch=1)
@@ -33230,7 +33249,7 @@ class ProfilsKaggleScreen(QWidget):
         layout_d.addLayout(ligne_filtre)
 
         # Liste des tags globaux : un clic coche le tag (il entre dans le filtre), un autre clic le retire.
-        self.liste_tags = QListWidget(colonne_droite)
+        self.liste_tags = _ListeTagsClicDroit(colonne_droite)
         self.liste_tags.setObjectName("ProfilsKaggleTags")
         self.liste_tags.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.liste_tags.setSelectionMode(QAbstractItemView.MultiSelection)  # clic = bascule coche / decoche
@@ -33240,6 +33259,9 @@ class ProfilsKaggleScreen(QWidget):
         self.liste_tags.setSpacing(2)
         self.liste_tags.setFixedHeight(84)
         self.liste_tags.itemSelectionChanged.connect(self._sur_selection_tags)
+        self.liste_tags.clic_droit.connect(self._sur_clic_droit_tag)
+        self.liste_tags.setToolTip("Clic gauche : filtrer sur ce tag.\n"
+                                   "Clic droit : MASQUER tous les profils qui ont ce tag (re-clic droit : les réafficher).")
         layout_d.addWidget(self.liste_tags)
 
         ligne_tri_suppr = QHBoxLayout()
@@ -34009,6 +34031,7 @@ class ProfilsKaggleScreen(QWidget):
         """Liste des tags globaux (union des tags de tous les datasets). L'etat du filtre est conserve."""
         tags = sorted({str(t) for d in self._datasets for t in (d.get("sites") or []) if str(t)}, key=str.lower)
         self._tags_filtres &= set(tags)  # un tag qui a disparu quitte le filtre
+        self._tags_exclus &= set(tags)
         self.liste_tags.blockSignals(True)
         self.liste_tags.clear()
         for t in tags:
@@ -34023,18 +34046,46 @@ class ProfilsKaggleScreen(QWidget):
         for r in range(self.liste_tags.count()):
             it = self.liste_tags.item(r)
             tag = it.data(Qt.UserRole)
-            it.setText(("\u2611 " if it.isSelected() else "\u2610 ") + tag)
+            exclu = tag in self._tags_exclus
+            it.setText(("\u2612 " if exclu else ("\u2611 " if it.isSelected() else "\u2610 ")) + tag)
+            police = it.font()
+            police.setStrikeOut(exclu)
+            it.setFont(police)
+            if exclu:
+                it.setForeground(QBrush(QColor(Mocha.red)))
+            else:
+                it.setData(Qt.ForegroundRole, None)
 
     def _sur_selection_tags(self):
         self._tags_filtres = {self.liste_tags.item(r).data(Qt.UserRole)
                               for r in range(self.liste_tags.count()) if self.liste_tags.item(r).isSelected()}
+        self._tags_exclus -= self._tags_filtres  # clic gauche sur un tag masque : il redevient un filtre normal
+        self._rafraichir_texte_tags()
+        self._appliquer_filtre_tags()
+
+    def _sur_clic_droit_tag(self, item):
+        """PATCH : clic droit sur un tag = masque (ou reaffiche) tous les profils qui ont ce tag."""
+        if item is None:
+            return
+        tag = item.data(Qt.UserRole)
+        if tag in self._tags_exclus:
+            self._tags_exclus.discard(tag)
+        else:
+            self._tags_exclus.add(tag)
+            if tag in self._tags_filtres:  # un tag masque ne peut pas etre aussi un filtre
+                self._tags_filtres.discard(tag)
+                self.liste_tags.blockSignals(True)
+                item.setSelected(False)
+                self.liste_tags.blockSignals(False)
         self._rafraichir_texte_tags()
         self._appliquer_filtre_tags()
 
     def _passe_filtre_tags(self, sites) -> bool:
+        s = set(sites or [])
+        if self._tags_exclus & s:  # PATCH : un tag masque l'emporte sur tout le reste
+            return False
         if not self._tags_filtres:
             return True
-        s = set(sites or [])
         return self._tags_filtres <= s if self.case_tags_et.isChecked() else bool(self._tags_filtres & s)
 
     def _appliquer_filtre_tags(self):
