@@ -10087,7 +10087,9 @@ class Project:
         projet = Project._from_dict_base(d)
         projet.libs = [
             {"id": str(x.get("id") or uuid.uuid4().hex), "nom": str(x["nom"]), "code": str(x.get("code") or ""),
-             "modifie_le": str(x.get("modifie_le") or "")}
+             "modifie_le": str(x.get("modifie_le") or ""),
+             "historique": [{"code": str(h.get("code") or ""), "le": str(h.get("le") or "")}   # PATCH (restaurer l'ancienne version)
+                            for h in (x.get("historique") or []) if isinstance(h, dict) and str(h.get("code") or "").strip()][-5:]}
             for x in (d.get("libs") or []) if isinstance(x, dict) and x.get("nom")
         ]
         _rafraichir_registre_libs(projet)
@@ -73527,14 +73529,20 @@ class TaskConfigScreen(_ReglageCaptureSynchroMixin, QWidget):
             cl.addWidget(nom)
             for icone, tip, action in (
                 ("mdi6.clipboard-arrow-down-outline", "Mettre à jour depuis le presse-papiers", self._maj_lib_depuis_presse_papiers),
+                ("mdi6.rotate-left", "Restaurer l'ancienne version (avant la dernière mise à jour)", self._restaurer_version_lib),
                 ("mdi6.content-copy", "Copier le fichier .py", self._copier_code_lib),
                 ("mdi6.close", "Retirer de ce Task", self._retirer_lib_du_task),
             ):
                 b = QToolButton(cadre)
-                b.setIcon(qta.icon(icone, color=Mocha.text))
-                b.setToolTip(tip)
+                _restaurer = icone == "mdi6.rotate-left"
+                _hist = lib.get("historique") or []
+                b.setIcon(qta.icon(icone, color=Mocha.text if (not _restaurer or _hist) else Mocha.surface2))
+                b.setToolTip((f"{tip}\nVersions disponibles : {len(_hist)} (la plus récente : {_hist[-1].get('le') or '—'})" if _hist else
+                              "Aucune ancienne version (créée à la prochaine mise à jour)") if _restaurer else tip)
                 b.setCursor(Qt.PointingHandCursor)
                 b.setAutoRaise(True)
+                if _restaurer and not _hist:
+                    b.setEnabled(False)
                 b.clicked.connect(lambda _=False, i=lib["id"], a=action: a(i))
                 cl.addWidget(b)
             lay.addWidget(cadre)
@@ -73902,6 +73910,7 @@ class TaskConfigScreen(_ReglageCaptureSynchroMixin, QWidget):
             BoiteDialogueAutoniaX.warning(parent, "Enregistrer la lib",
                                           f"Le code n'est pas du Python valide (ligne {err.lineno} : {err.msg}). La lib n'a pas été modifiée.")
             return False
+        self._archiver_version_lib(lib, code if code.endswith("\n") else code + "\n")   # PATCH (restaurer l'ancienne version)
         lib["code"] = code if code.endswith("\n") else code + "\n"
         lib["modifie_le"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         _rafraichir_registre_libs(self.project)
@@ -73909,6 +73918,37 @@ class TaskConfigScreen(_ReglageCaptureSynchroMixin, QWidget):
         self._rafraichir_liste_libs()
         self._notify_status(f"Lib « {lib['nom']}.py » enregistrée ({len(lib['code'].splitlines())} lignes).")
         return True
+
+    def _archiver_version_lib(self, lib: dict, nouveau_code: str):
+        """PATCH : garde l'ancienne version (5 max) avant qu'une mise à jour l'écrase. Rien n'est archivé si le code ne change pas
+        (sinon une 2e mise à jour identique écraserait la sauvegarde par une copie du code fautif) ni si l'ancienne lib était vide."""
+        ancien = lib.get("code") or ""
+        if not ancien.strip() or ancien == nouveau_code:
+            return
+        hist = lib.get("historique")
+        if not isinstance(hist, list):
+            hist = []
+        hist.append({"code": ancien, "le": lib.get("modifie_le") or ""})
+        lib["historique"] = hist[-5:]
+
+    def _restaurer_version_lib(self, lib_id: str):
+        """PATCH (bouton flèche circulaire de la bande Lib) : remet la version d'AVANT la dernière mise à jour.
+        Plusieurs clics remontent de version en version (5 max)."""
+        lib = self.project.find_lib(lib_id)
+        if lib is None:
+            return
+        hist = lib.get("historique")
+        if not isinstance(hist, list) or not hist:
+            self._notify_status(f"Lib « {lib['nom']}.py » : aucune ancienne version à restaurer.")
+            return
+        ancienne = hist.pop()
+        lib["code"] = ancienne["code"] if ancienne["code"].endswith("\n") else ancienne["code"] + "\n"
+        lib["modifie_le"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        _rafraichir_registre_libs(self.project)
+        self.project.save()
+        self._rafraichir_liste_libs()
+        self._notify_status(f"Lib « {lib['nom']}.py » restaurée à la version d'avant ({len(lib['code'].splitlines())} lignes, "
+                            f"datée du {ancienne.get('le') or '—'}). Versions restantes : {len(hist)}.")
 
     def _copier_code_lib(self, lib_id: str):
         lib = self.project.find_lib(lib_id)
@@ -73952,6 +73992,10 @@ class TaskConfigScreen(_ReglageCaptureSynchroMixin, QWidget):
             lib_id = item.data(Qt.UserRole)
             menu.addAction(qta.icon("mdi6.clipboard-arrow-down-outline", color=Mocha.text), "Mettre à jour (depuis le presse-papiers)",
                            lambda: self._maj_lib_depuis_presse_papiers(lib_id))
+            _l = self.project.find_lib(lib_id)
+            _a = menu.addAction(qta.icon("mdi6.rotate-left", color=Mocha.text), "Restaurer l'ancienne version",
+                                lambda: self._restaurer_version_lib(lib_id))
+            _a.setEnabled(bool(_l and _l.get("historique")))
             menu.addSeparator()
             menu.addAction("Renommer", lambda: self._renommer_lib(lib_id))
             menu.addAction("Supprimer", lambda: self._supprimer_lib(lib_id))
@@ -73974,6 +74018,7 @@ class TaskConfigScreen(_ReglageCaptureSynchroMixin, QWidget):
             BoiteDialogueAutoniaX.warning(self, "Mettre à jour la lib",
                                           f"Le presse-papiers n'est pas du Python valide (ligne {err.lineno} : {err.msg}). La lib n'a pas été modifiée.")
             return
+        self._archiver_version_lib(lib, code if code.endswith("\n") else code + "\n")   # PATCH (restaurer l'ancienne version)
         lib["code"] = code if code.endswith("\n") else code + "\n"
         lib["modifie_le"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         _rafraichir_registre_libs(self.project)
