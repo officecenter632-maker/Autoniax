@@ -37380,7 +37380,10 @@ class ParametresScreen(QWidget):
         description_bloquer_sortie.setObjectName("PlaceholderSubtitle")
         root_layout.addWidget(description_bloquer_sortie)
 
-        # PATCH (demande explicite utilisateur : "un bouton dans la page de\n        # parametres qui copie dans le presse papier le dernier message de cette\n        # adresse") -- interroge GET /gmail/dernier du serveurT (cf. serveur.py).\n        section_titre_gmail = QLabel("GMAIL", self)
+        # PATCH (demande explicite utilisateur : "un bouton dans la page de
+        # parametres qui copie dans le presse papier le dernier message de cette
+        # adresse") -- interroge GET /gmail/dernier du serveurT (cf. serveur.py).
+        section_titre_gmail = QLabel("GMAIL", self)
         section_titre_gmail.setObjectName("ReglagesLabel")
         root_layout.addWidget(section_titre_gmail)
 
