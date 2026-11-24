@@ -33368,6 +33368,14 @@ class ProfilsKaggleScreen(QWidget):
             b.setFixedWidth(max(34, self.bouton_telecharger.sizeHint().height()))
             ligne_telecharger.addWidget(b)
         ligne_telecharger.addWidget(self.bouton_telecharger, stretch=1)
+        # PATCH : case « Demarrer apres repartition » (cochee par defaut) : chaque profil repartit demarre tout seul sur
+        # son sAutoniax des qu'il est telecharge et restaure, plus de relance manuelle.
+        self.case_demarrer_apres = QCheckBox("Démarrer après répartition", colonne_droite)
+        self.case_demarrer_apres.setChecked(True)
+        self.case_demarrer_apres.setCursor(Qt.PointingHandCursor)
+        self.case_demarrer_apres.setToolTip("Coché : chaque profil réparti est démarré automatiquement sur son sAutoniax\n"
+                                            "dès qu'il est téléchargé et restauré (profil en échec : non démarré).")
+        ligne_telecharger.addWidget(self.case_demarrer_apres)
         layout_d.addLayout(ligne_telecharger)
 
         separation.addWidget(colonne_gauche)
@@ -34259,9 +34267,12 @@ class ProfilsKaggleScreen(QWidget):
              "profils": [{"slug": d["slug"], "nom_archive": d["nom_archive"], "nom_local": d["nom_archive"]} for d in v]}
             for i, v in sorted(repartition.items()) if v],
             "max_simultanes": int(self.spin_envois_simultanes.value()),
-            "delai_departs_s": int(self.spin_delai_departs.value())}
+            "delai_departs_s": int(self.spin_delai_departs.value()),
+            "demarrer_apres": bool(self.case_demarrer_apres.isChecked())}
         self.ajouter_journal(f"Telechargement : {len(choisis)} profil(s) sur {len(charge['repartition'])} sAutoniax (operation {self._operation_id}).")
         self.ajouter_journal(f"{charge['max_simultanes']} en parallele, departs echelonnes de {charge['delai_departs_s']} s minimum.")
+        if charge["demarrer_apres"]:
+            self.ajouter_journal("Demarrage automatique de chaque profil des qu'il est telecharge.")
         self.demande_kaggle_telecharger.emit(charge)
 
     def sur_progression_telechargement(self, id_operation: str, id_executant: str, nom_local: str, etape: str, pourcentage: int):
@@ -34583,18 +34594,32 @@ class ControleurKaggle(QObject):
             delai_departs_s = max(0.0, float(charge.get("delai_departs_s", DELAI_ENTRE_DEPARTS_DEFAUT_S)))
         except (TypeError, ValueError):
             delai_departs_s = float(DELAI_ENTRE_DEPARTS_DEFAUT_S)
+        demarrer_apres = bool(charge.get("demarrer_apres"))
         self._flux = FluxTelechargementKaggle(
             list(charge.get("repartition") or []),
             envoyer=lambda i, p: self._client.envoyer_ordre_kaggle(
                 "kaggle_telecharger_profils", i, id_operation,
                 profils=[{"slug": p["slug"], "nom_archive": p["nom_archive"],
                           "nom_local": p.get("nom_local") or p["nom_archive"]}]),
-            notifier=lambda i, n, ok, m: self._ecran.sur_resultat_telechargement(id_operation, i, n, ok, m),
+            notifier=lambda i, n, ok, m: self._apres_telechargement(id_operation, i, n, ok, m, demarrer_apres),
             terminer=lambda: self._ecran.terminer_operation(id_operation),
             max_simultanes=max_simultanes,
             delai_departs_s=delai_departs_s,
         )
         self._flux.demarrer()
+
+    def _apres_telechargement(self, id_operation, id_executant, nom_local, ok, message, demarrer_apres):
+        """PATCH : journalise le resultat, puis (case « Demarrer apres repartition ») demarre le profil qui vient d'etre
+        telecharge sur son sAutoniax -- meme relais que le bouton « Demarrer » de la liste des profils."""
+        self._ecran.sur_resultat_telechargement(id_operation, id_executant, nom_local, ok, message)
+        if not (ok and demarrer_apres) or id_operation != self._operation:
+            return
+        nom_sa = self._ecran._sautoniax.get(id_executant, id_executant)
+        try:
+            self._client.demander_demarrer_profil_isole(id_executant, nom_local)
+            self._ecran.ajouter_journal(f"{nom_sa} / {nom_local} : demarrage demande.")
+        except Exception as e:
+            self._ecran.ajouter_journal(f"{nom_sa} / {nom_local} : demarrage impossible ({e}).")
 
     def annuler_operation(self):
         """PATCH : bouton « Tuer la commande en cours ». Stoppe le flux cote pilote, envoie l'ordre d'annulation a
